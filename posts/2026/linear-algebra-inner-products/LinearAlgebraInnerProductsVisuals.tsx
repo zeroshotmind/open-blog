@@ -83,7 +83,7 @@ function Arrow({
   )
 }
 
-function useDrag(svgRef: React.RefObject<SVGSVGElement>, w = W, h = H) {
+function useDrag(svgRef: React.RefObject<SVGSVGElement | null>, w = W, h = H) {
   const getPoint = useCallback((e: MouseEvent | TouchEvent) => {
     const svg = svgRef.current
     if (!svg) return null
