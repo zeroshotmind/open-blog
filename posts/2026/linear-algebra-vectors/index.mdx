@@ -1,0 +1,113 @@
+---
+title: "Vectors: Direction, Magnitude, and the Geometry of Space"
+slug: "linear-algebra-vectors"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 1
+tags: ["linear-algebra", "vectors", "geometry", "math"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Vectors are the atoms of linear algebra — everything else is built on them. This post builds intuition for what a vector is, how addition and scaling work geometrically, and why norms give us a way to measure the world."
+---
+
+When a language model embeds the word "king" as a 768-dimensional vector, what does that actually mean? The model has assigned it a location in a high-dimensional space — a point whose coordinates encode something about meaning, context, and relationship to other words. When we say that "king" and "queen" are *close* in this space, we need a precise notion of close. Close by what measure? Straight-line distance? City-block distance? The maximum coordinate difference? These are not the same thing, and the choice shapes what the model learns.
+
+To answer questions like these, you need linear algebra. And linear algebra begins with vectors.
+
+## What Is a Vector?
+
+There are two ways to think about a vector, and both are true simultaneously.
+
+The **geometric view**: a vector is an arrow in space. It has a direction — the way it points — and a magnitude — how long it is. The arrow's starting point does not matter; what matters is its displacement. The vector from $(1, 2)$ to $(4, 5)$ is the same vector as the one from $(0, 0)$ to $(3, 3)$. We always anchor vectors at the origin as a convention.
+
+The **algebraic view**: a vector is an ordered tuple of numbers. In two dimensions, $\mathbf{v} = [3, 4]$ means "3 units in the $x$-direction, 4 units in the $y$-direction." In $n$ dimensions, a vector is just a list of $n$ real numbers: $\mathbf{v} = [v_1, v_2, \ldots, v_n] \in \mathbb{R}^n$.
+
+These views are the same thing. The arrow $[3, 4]$ starts at the origin and ends at the point $(3, 4)$. The numbers are coordinates; the arrow is the geometric object they describe. When you work with 768-dimensional word embeddings, you cannot draw the arrow, but every operation you perform is geometrically meaningful — you are just working in a space you cannot see.
+
+## Vector Addition
+
+Given two vectors $\mathbf{a} = [a_1, a_2]$ and $\mathbf{b} = [b_1, b_2]$, their sum is:
+
+$$\mathbf{a} + \mathbf{b} = [a_1 + b_1, \; a_2 + b_2]$$
+
+Geometrically, addition has a beautiful interpretation. Place $\mathbf{b}$'s tail at $\mathbf{a}$'s tip. The sum $\mathbf{a} + \mathbf{b}$ is the arrow from the origin to the new tip. This is the **tip-to-tail rule**. Equivalently, you can construct the **parallelogram**: draw $\mathbf{a}$ and $\mathbf{b}$ both from the origin, complete the parallelogram, and the diagonal from the origin to the far corner is $\mathbf{a} + \mathbf{b}$. Both constructions give the same result.
+
+For example, if $\mathbf{a} = [2, 1]$ and $\mathbf{b} = [1, 2]$, then $\mathbf{a} + \mathbf{b} = [3, 3]$. The sum points diagonally between the two original vectors — it is a compromise of directions, weighted by their magnitudes.
+
+<VectorAdditionViz />
+
+Try dragging the tips of **a** and **b** in the visualization. Watch how the purple sum vector always occupies the far corner of the parallelogram, and notice that addition is commutative: swapping **a** and **b** gives the same result.
+
+## Scalar Multiplication
+
+A **scalar** is just a number — no direction, only magnitude. When you multiply a vector $\mathbf{v}$ by a scalar $\lambda \in \mathbb{R}$, you scale it:
+
+$$\lambda \mathbf{v} = [\lambda v_1, \; \lambda v_2]$$
+
+Geometrically, $\lambda \mathbf{v}$ is a vector along the same line as $\mathbf{v}$, stretched or shrunk by a factor of $|\lambda|$. When $\lambda > 1$, the vector grows. When $0 < \lambda < 1$, it shrinks. When $\lambda = -1$, the vector flips to point in the exact opposite direction. When $\lambda = 0$, the result is the zero vector $\mathbf{0} = [0, 0]$ — a vector with no direction and no magnitude, sitting at the origin.
+
+For $\mathbf{v} = [2, 1]$ and $\lambda = 2.5$, we get $\lambda \mathbf{v} = [5, 2.5]$. Same direction, two-and-a-half times as long.
+
+<ScalarMultViz />
+
+Notice in the visualization that the original vector $\mathbf{v}$ appears as a gray ghost for reference. As you drag $\lambda$ below zero, the vector flips — it now points into the third quadrant while $\mathbf{v}$ points into the first.
+
+Together, vector addition and scalar multiplication are the two fundamental operations of a **vector space**. Every other concept in linear algebra — linear combinations, span, basis, linear maps — is built from these two operations.
+
+## Vector Norms
+
+A norm is a way of measuring the "size" or "length" of a vector. There is not one unique answer; different applications call for different notions of length, and they are all valid as long as they satisfy certain mathematical properties (non-negativity, the triangle inequality, and the requirement that only the zero vector has zero norm).
+
+The **L2 norm** (Euclidean norm) is the one you learn in school:
+
+$$\|\mathbf{v}\|_2 = \sqrt{v_1^2 + v_2^2 + \cdots + v_n^2}$$
+
+This is the straight-line distance from the origin to the tip of $\mathbf{v}$. For $\mathbf{v} = [3, 4]$, we get $\|\mathbf{v}\|_2 = \sqrt{9 + 16} = \sqrt{25} = 5$. This is the familiar Pythagorean theorem — the hypotenuse of a right triangle with legs 3 and 4 is 5. In ML, L2 is the default for measuring distances in embedding space, for computing gradient magnitudes, and for L2 regularization (weight decay), which penalizes large weights by their squared L2 norm.
+
+The **L1 norm** (Manhattan norm) counts distance as if you were navigating a city grid:
+
+$$\|\mathbf{v}\|_1 = |v_1| + |v_2| + \cdots + |v_n|$$
+
+For $\mathbf{v} = [3, 4]$, the L1 norm is $3 + 4 = 7$. You cannot cut diagonally; you must travel along axes. The L1 norm famously promotes sparsity in ML. Lasso regression penalizes the L1 norm of weights, which tends to push many weights exactly to zero — it is a way of making models prefer simple, sparse explanations. Comparing L1 to L2, L1 penalizes all nonzero components equally, while L2 penalizes large components much more harshly than small ones.
+
+The **L∞ norm** (Chebyshev norm) takes the worst-case coordinate:
+
+$$\|\mathbf{v}\|_\infty = \max(|v_1|, |v_2|, \ldots, |v_n|)$$
+
+For $\mathbf{v} = [3, 4]$, this is $\max(3, 4) = 4$. The L∞ norm asks: "what is the largest coordinate?" It appears in robustness settings — for example, adversarial attacks on neural networks are often constrained by L∞ budgets, meaning no single pixel can change by more than $\varepsilon$.
+
+A useful way to understand all three norms simultaneously is through their **unit balls** — the set of all vectors at distance exactly 1 from the origin. The L2 unit ball is the familiar circle. The L1 unit ball is a diamond (a square rotated 45°). The L∞ unit ball is an axis-aligned square.
+
+<NormViz />
+
+Drag the point and watch how its L1, L2, and L∞ values change independently. Toggle between norms to see how each unit ball is shaped. Notice that the L∞ ball is the largest, the L2 ball sits inside it, and the L1 ball is smallest — a consequence of the inequality $\|\mathbf{v}\|_\infty \leq \|\mathbf{v}\|_2 \leq \|\mathbf{v}\|_1$ (in 2D, $\|\mathbf{v}\|_2 \leq \sqrt{2}\|\mathbf{v}\|_\infty$).
+
+Once you have a norm, you can also define a **unit vector** — a vector of length exactly 1 pointing in the same direction as $\mathbf{v}$:
+
+$$\hat{\mathbf{v}} = \frac{\mathbf{v}}{\|\mathbf{v}\|_2}$$
+
+Dividing by the L2 norm strips out the magnitude and leaves only the direction. For $\mathbf{v} = [3, 4]$, $\hat{\mathbf{v}} = [3/5, 4/5] = [0.6, 0.8]$, and indeed $\sqrt{0.36 + 0.64} = 1$.
+
+## Distance Between Vectors
+
+Once you have a norm, you get distance for free: the distance between two vectors $\mathbf{u}$ and $\mathbf{v}$ is the norm of their difference:
+
+$$d(\mathbf{u}, \mathbf{v}) = \|\mathbf{u} - \mathbf{v}\|$$
+
+Each norm gives a different distance. L2 distance is straight-line distance. L1 distance is the sum of coordinate differences — how far you would travel on a grid. L∞ distance is the largest coordinate difference between the two vectors.
+
+This is where our opening question about word embeddings gets a real answer. If "king" is embedded at $\mathbf{k}$ and "queen" at $\mathbf{q}$, then $\|\mathbf{k} - \mathbf{q}\|_2$ tells you how far apart they are in Euclidean space. But there is a subtlety: for embeddings, *direction* often matters more than *magnitude*. Two embeddings might have very different L2 norms simply because one word appears more frequently than another, inflating its magnitude. The standard practice is to measure **cosine similarity** — essentially the angle between the two vectors — which ignores magnitude entirely.
+
+Cosine similarity is the subject of the next post in this series, where we will need the dot product. But you can already see the shape of the idea: cosine similarity compares unit vectors, so it is the L2 distance between $\hat{\mathbf{k}}$ and $\hat{\mathbf{q}}$ in disguise.
+
+## Wrapping Up
+
+When a language model tells you that "king" and "queen" are close in embedding space, it means: the 768-dimensional vectors representing these words are nearby under some notion of distance, usually cosine similarity but sometimes L2. The words exist as points in $\mathbb{R}^{768}$, and all of vector addition, scalar multiplication, and norms operate in that space exactly as they do in 2D — you just cannot draw them.
+
+That is what makes linear algebra the right language for ML. The geometry is real even when it is invisible.
+
+In the next post, we will add the **dot product** to our toolkit — the operation that measures how much two vectors point in the same direction, and the foundation of cosine similarity, attention mechanisms, and nearly everything else.
