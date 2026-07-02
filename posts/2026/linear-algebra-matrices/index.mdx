@@ -1,0 +1,205 @@
+---
+title: "Matrices as Linear Maps"
+slug: "linear-algebra-matrices"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 3
+tags: ["linear-algebra", "matrices", "linear-maps", "transformations", "geometry"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "A matrix is not just a grid of numbers — it's a function that transforms space. This post builds the geometric intuition for matrix-vector multiplication as rotation, scaling, and shearing."
+---
+
+import dynamic from 'next/dynamic'
+
+export const LinearMapViz = dynamic(
+  () => import('./LinearAlgebraMatricesVisuals').then(m => m.LinearMapViz),
+  { ssr: false }
+)
+
+export const TransformGallery = dynamic(
+  () => import('./LinearAlgebraMatricesVisuals').then(m => m.TransformGallery),
+  { ssr: false }
+)
+
+export const MatrixCompositionViz = dynamic(
+  () => import('./LinearAlgebraMatricesVisuals').then(m => m.MatrixCompositionViz),
+  { ssr: false }
+)
+
+Every time a transformer model computes attention, it performs a sequence of matrix multiplications. The query, key, and value matrices — $W_Q$, $W_K$, $W_V$ — transform token embeddings into new spaces where similarity can be measured. The attention weights are computed as:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V$$
+
+That $QK^\top$ is a matrix product. So is the projection $W_Q x$ that maps a token embedding $x$ into the query space. If you want to understand why transformers work the way they do, you need to understand what a matrix multiplication *does* to a vector — not just how to compute it, but what it means geometrically. A matrix is not a grid of numbers. It is a *function that transforms space*.
+
+## What Is a Linear Map?
+
+A **linear map** (also called a linear transformation) is a function $f: \mathbb{R}^n \to \mathbb{R}^m$ that satisfies two properties:
+
+**Additivity:** $f(\mathbf{u} + \mathbf{v}) = f(\mathbf{u}) + f(\mathbf{v})$
+
+**Homogeneity:** $f(\alpha \mathbf{u}) = \alpha f(\mathbf{u})$
+
+These two rules can be combined into a single condition: for any scalars $\alpha, \beta$ and vectors $\mathbf{u}, \mathbf{v}$,
+
+$$f(\alpha \mathbf{u} + \beta \mathbf{v}) = \alpha f(\mathbf{u}) + \beta f(\mathbf{v})$$
+
+This is called **superposition**. It says that linear maps respect the structure of vector addition and scalar multiplication. They do not bend, curve, or shift the origin — they can only stretch, rotate, and shear.
+
+Some examples of linear maps:
+- Rotating the plane by 30°
+- Projecting vectors onto the $x$-axis
+- Stretching every vector by a factor of 3
+- Reflecting across the $y$-axis
+
+Some things that are *not* linear maps:
+- Translating every vector by a fixed offset (it moves the origin)
+- Squaring: $f(x) = x^2$ (fails additivity)
+- Any function with $f(\mathbf{0}) \neq \mathbf{0}$ (homogeneity requires $f(\mathbf{0}) = \mathbf{0}$)
+
+The remarkable fact is that *every* linear map from $\mathbb{R}^n$ to $\mathbb{R}^m$ can be written as a matrix multiplication. Matrices are the language of linear maps.
+
+## Matrices as Linear Maps: The Column Picture
+
+Let $A$ be a $2 \times 2$ matrix:
+
+$$A = \begin{bmatrix} a & b \\ c & d \end{bmatrix}$$
+
+The product $A\mathbf{x}$ for $\mathbf{x} = [x_1, x_2]^\top$ is:
+
+$$A\mathbf{x} = \begin{bmatrix} a & b \\ c & d \end{bmatrix} \begin{bmatrix} x_1 \\ x_2 \end{bmatrix} = x_1 \begin{bmatrix} a \\ c \end{bmatrix} + x_2 \begin{bmatrix} b \\ d \end{bmatrix}$$
+
+This is a linear combination of the columns of $A$. The first column $[a, c]^\top$ is exactly where the standard basis vector $\mathbf{e}_1 = [1, 0]^\top$ lands:
+
+$$A\mathbf{e}_1 = \begin{bmatrix} a & b \\ c & d \end{bmatrix}\begin{bmatrix}1\\0\end{bmatrix} = \begin{bmatrix}a\\c\end{bmatrix}$$
+
+The second column $[b, d]^\top$ is where $\mathbf{e}_2 = [0, 1]^\top$ lands:
+
+$$A\mathbf{e}_2 = \begin{bmatrix} a & b \\ c & d \end{bmatrix}\begin{bmatrix}0\\1\end{bmatrix} = \begin{bmatrix}b\\d\end{bmatrix}$$
+
+This is the key insight: **the columns of a matrix tell you where the basis vectors go**. Once you know where $\mathbf{e}_1$ and $\mathbf{e}_2$ land, you know where everything lands — because every vector is a linear combination of the basis vectors, and linear maps preserve linear combinations.
+
+If $\mathbf{x} = x_1 \mathbf{e}_1 + x_2 \mathbf{e}_2$, then:
+
+$$A\mathbf{x} = A(x_1 \mathbf{e}_1 + x_2 \mathbf{e}_2) = x_1 A\mathbf{e}_1 + x_2 A\mathbf{e}_2$$
+
+The entire transformation is determined by where the basis lands.
+
+<LinearMapViz />
+
+Drag the sliders to change the matrix entries. Notice how the columns of the matrix correspond exactly to where the red and blue basis vectors land. The gray unit square deforms into a parallelogram — that parallelogram is the image of the square under the linear map.
+
+## Geometric Transformations in 2D
+
+Different matrix structures produce recognizable geometric effects.
+
+### Rotation
+
+To rotate vectors counterclockwise by angle $\theta$:
+
+$$R_\theta = \begin{bmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{bmatrix}$$
+
+For $\theta = 45°$:
+
+$$R_{45°} = \begin{bmatrix} \frac{\sqrt{2}}{2} & -\frac{\sqrt{2}}{2} \\[4pt] \frac{\sqrt{2}}{2} & \frac{\sqrt{2}}{2} \end{bmatrix} \approx \begin{bmatrix} 0.707 & -0.707 \\ 0.707 & 0.707 \end{bmatrix}$$
+
+The columns tell the story: $\mathbf{e}_1 = [1,0]^\top$ rotates to $[0.707, 0.707]^\top$ (pointing northeast), and $\mathbf{e}_2 = [0,1]^\top$ rotates to $[-0.707, 0.707]^\top$ (pointing northwest).
+
+### Scaling
+
+Scaling by factor $s_x$ in the $x$-direction and $s_y$ in the $y$-direction:
+
+$$S = \begin{bmatrix} s_x & 0 \\ 0 & s_y \end{bmatrix}$$
+
+Uniform scaling by factor 2: $S = \begin{bmatrix} 2 & 0 \\ 0 & 2 \end{bmatrix}$. Every vector doubles in length; the square becomes a larger square.
+
+### Shearing
+
+A horizontal shear shifts the $x$-coordinate by $k$ times the $y$-coordinate:
+
+$$H = \begin{bmatrix} 1 & k \\ 0 & 1 \end{bmatrix}$$
+
+For $k = 1$: $\mathbf{e}_1$ stays fixed at $[1,0]^\top$, but $\mathbf{e}_2 = [0,1]^\top$ moves to $[1,1]^\top$. The unit square tilts into a parallelogram. This is exactly what happens when you drag the top of a rectangle sideways while holding the bottom fixed.
+
+### Reflection
+
+Reflection across the $y$-axis flips the sign of the $x$-coordinate:
+
+$$F_y = \begin{bmatrix} -1 & 0 \\ 0 & 1 \end{bmatrix}$$
+
+$\mathbf{e}_1$ maps to $[-1,0]^\top$ (flipped left), $\mathbf{e}_2$ stays at $[0,1]^\top$.
+
+<TransformGallery />
+
+## Matrix-Matrix Multiplication as Function Composition
+
+If $A$ and $B$ are both linear maps, what is their composition $A \circ B$? The function that first applies $B$, then applies $A$?
+
+$$(A \circ B)(\mathbf{x}) = A(B\mathbf{x})$$
+
+The matrix that represents this composition is the **matrix product** $AB$:
+
+$$(AB)\mathbf{x} = A(B\mathbf{x})$$
+
+This is not just a notational convenience — it is the definition. Matrix multiplication is defined precisely so that it corresponds to function composition. To compute $AB$, the $j$-th column of $AB$ is $A$ applied to the $j$-th column of $B$:
+
+$$(AB)_j = A \cdot B_j$$
+
+For two $2 \times 2$ matrices:
+
+$$AB = \begin{bmatrix} a_{11} & a_{12} \\ a_{21} & a_{22} \end{bmatrix} \begin{bmatrix} b_{11} & b_{12} \\ b_{21} & b_{22} \end{bmatrix} = \begin{bmatrix} a_{11}b_{11}+a_{12}b_{21} & a_{11}b_{12}+a_{12}b_{22} \\ a_{21}b_{11}+a_{22}b_{21} & a_{21}b_{12}+a_{22}b_{22} \end{bmatrix}$$
+
+Each entry $(AB)_{ij}$ is the dot product of the $i$-th row of $A$ with the $j$-th column of $B$. But the deeper meaning is composition: first apply $B$, then apply $A$.
+
+## Why Order Matters: $AB \neq BA$
+
+Function composition is not commutative in general. "First rotate, then scale" is different from "first scale, then rotate" — actually, in this case they happen to be the same. But "first rotate, then shear" is genuinely different from "first shear, then rotate."
+
+Let $R$ be a 90° rotation and $H$ be a horizontal shear with $k=1$:
+
+$$R = \begin{bmatrix} 0 & -1 \\ 1 & 0 \end{bmatrix}, \quad H = \begin{bmatrix} 1 & 1 \\ 0 & 1 \end{bmatrix}$$
+
+Then:
+
+$$RH = \begin{bmatrix} 0 & -1 \\ 1 & 0 \end{bmatrix}\begin{bmatrix} 1 & 1 \\ 0 & 1 \end{bmatrix} = \begin{bmatrix} 0 & -1 \\ 1 & 1 \end{bmatrix}$$
+
+$$HR = \begin{bmatrix} 1 & 1 \\ 0 & 1 \end{bmatrix}\begin{bmatrix} 0 & -1 \\ 1 & 0 \end{bmatrix} = \begin{bmatrix} 1 & -1 \\ 1 & 0 \end{bmatrix}$$
+
+$RH \neq HR$. Applying shear then rotating is not the same as rotating then shearing. The unit square ends up in different positions depending on the order.
+
+<MatrixCompositionViz />
+
+When writing $(AB)\mathbf{x}$, remember: $B$ acts first, $A$ acts second. The matrix on the right acts first. This right-to-left reading order trips up many newcomers — it is a consequence of function composition notation.
+
+## Special Matrices
+
+### The Identity Matrix
+
+The identity matrix $I$ is the linear map that changes nothing:
+
+$$I = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}$$
+
+$I\mathbf{x} = \mathbf{x}$ for every $\mathbf{x}$. The columns are exactly the standard basis vectors — $\mathbf{e}_1$ stays at $\mathbf{e}_1$ and $\mathbf{e}_2$ stays at $\mathbf{e}_2$. For any matrix $A$, we have $AI = IA = A$. The identity is the matrix analogue of multiplying by 1.
+
+### The Zero Matrix
+
+The zero matrix $O$ sends every vector to the zero vector:
+
+$$O = \begin{bmatrix} 0 & 0 \\ 0 & 0 \end{bmatrix}, \quad O\mathbf{x} = \mathbf{0}$$
+
+Every column is zero: both basis vectors collapse to the origin. This is the most destructive linear map — it loses all information. For any matrix $A$, we have $OA = AO = O$.
+
+## Putting It Together
+
+The vocabulary of this post gives you the tools to read modern ML papers at a deeper level:
+
+- When a paper writes $W\mathbf{x}$, it means a linear map applied to $\mathbf{x}$ — $W$ rotates, scales, and shears the input into a new space.
+- When attention computes $QK^\top$, it is composing two linear maps to measure alignment between queries and keys.
+- When a network stacks layers $f_3(f_2(f_1(\mathbf{x})))$, the learned weight matrices compose like $W_3 W_2 W_1$ — the rightmost acts first.
+
+In the next post, we will ask: when can a linear map be undone? That is the question of invertibility, and answering it will lead us to determinants.
