@@ -1,0 +1,217 @@
+---
+title: "Eigenvalues and Eigenvectors"
+slug: "linear-algebra-eigenvalues"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 5
+tags: ["linear-algebra", "eigenvalues", "eigenvectors", "pca", "geometry"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Most vectors get rotated and scaled when multiplied by a matrix. Eigenvectors are the special directions that only get scaled — and their scaling factors, the eigenvalues, reveal everything about a matrix's long-term behavior."
+---
+
+import { EigenvectorViz, CharacteristicPolyViz, PowerIterationViz } from './LinearAlgebraEigenvaluesVisuals'
+
+When you run PCA on a dataset, you get back a set of directions called **principal components**. These are the axes of greatest variance in your data. But where do they come from?
+
+The answer: they are the **eigenvectors of the covariance matrix**. The variance along each direction is the corresponding **eigenvalue**.
+
+This post builds that intuition from the ground up — starting with the definition and ending with why eigenvectors are everywhere in applied math.
+
+---
+
+## The Core Idea
+
+Multiply any random vector by a matrix, and in general two things happen: the vector gets **scaled** and **rotated**. The direction changes.
+
+But some special vectors only get scaled — their direction is unchanged. These are **eigenvectors**.
+
+Formally, a nonzero vector $\mathbf{v}$ is an eigenvector of matrix $A$ if:
+
+$$A\mathbf{v} = \lambda \mathbf{v}$$
+
+The scalar $\lambda$ is the corresponding **eigenvalue**. The matrix $A$ acts on $\mathbf{v}$ purely as multiplication by $\lambda$ — a stretch or shrink (or flip, if $\lambda < 0$).
+
+Try it with the visualizer below. Fan out vectors in all directions and watch where $A$ maps each one. The eigenvector directions (highlighted in gold) are the ones that stay on the same line through the origin after transformation.
+
+<EigenvectorViz />
+
+---
+
+## Finding Eigenvalues
+
+We want to find all $\lambda$ such that $A\mathbf{v} = \lambda\mathbf{v}$ has a nonzero solution $\mathbf{v}$.
+
+Rearrange:
+
+$$A\mathbf{v} - \lambda\mathbf{v} = \mathbf{0}$$
+$$(A - \lambda I)\mathbf{v} = \mathbf{0}$$
+
+For this to have a nonzero solution, $A - \lambda I$ must be **singular** (non-invertible). That happens exactly when its determinant is zero:
+
+$$\det(A - \lambda I) = 0$$
+
+This is the **characteristic equation**. Expanding it gives a polynomial in $\lambda$ called the **characteristic polynomial** — its roots are the eigenvalues.
+
+### A 2×2 Example
+
+Let $A = \begin{pmatrix} 3 & 1 \\ 0 & 2 \end{pmatrix}$.
+
+$$A - \lambda I = \begin{pmatrix} 3 - \lambda & 1 \\ 0 & 2 - \lambda \end{pmatrix}$$
+
+$$\det(A - \lambda I) = (3 - \lambda)(2 - \lambda) - (1)(0) = \lambda^2 - 5\lambda + 6$$
+
+Setting this to zero: $(\lambda - 3)(\lambda - 2) = 0$, giving **$\lambda_1 = 3$** and **$\lambda_2 = 2$**.
+
+For a general symmetric 2×2 matrix $\begin{pmatrix} a & b \\ b & d \end{pmatrix}$, the characteristic polynomial is:
+
+$$p(\lambda) = \lambda^2 - (a + d)\lambda + (ad - b^2)$$
+
+The slider below lets you explore how the polynomial changes as you vary the matrix entries, and where the eigenvalues land on the $\lambda$-axis.
+
+<CharacteristicPolyViz />
+
+---
+
+## Finding Eigenvectors
+
+Once you have an eigenvalue $\lambda$, find its eigenvectors by solving:
+
+$$(A - \lambda I)\mathbf{v} = \mathbf{0}$$
+
+This is a homogeneous system — it always has the trivial solution $\mathbf{v} = \mathbf{0}$, but we want nonzero solutions.
+
+Continuing our example with $A = \begin{pmatrix} 3 & 1 \\ 0 & 2 \end{pmatrix}$:
+
+**For $\lambda_1 = 3$:**
+
+$$A - 3I = \begin{pmatrix} 0 & 1 \\ 0 & -1 \end{pmatrix}$$
+
+Row reduce: both rows say $v_2 = 0$. So $\mathbf{v}_1 = \begin{pmatrix} 1 \\ 0 \end{pmatrix}$ (any scalar multiple works).
+
+**For $\lambda_2 = 2$:**
+
+$$A - 2I = \begin{pmatrix} 1 & 1 \\ 0 & 0 \end{pmatrix}$$
+
+This says $v_1 + v_2 = 0$, so $v_1 = -v_2$. Eigenvector: $\mathbf{v}_2 = \begin{pmatrix} -1 \\ 1 \end{pmatrix}$.
+
+You can verify: $A\mathbf{v}_1 = \begin{pmatrix} 3 \\ 0 \end{pmatrix} = 3\mathbf{v}_1$ ✓ and $A\mathbf{v}_2 = \begin{pmatrix} -1 \\ 2 \end{pmatrix} = 2\mathbf{v}_2$ ✓.
+
+---
+
+## Geometric Intuition
+
+Think of a matrix transformation as a machine that distorts space. Most directions get bent — a vector pointing northeast might end up pointing northwest.
+
+**Eigenvectors are the invariant axes of the transformation.** Along these directions, the machine acts like a simple number line stretch. Everything else in the space is some linear combination of these special directions, so understanding what happens along eigenvectors tells you everything about the transformation.
+
+For a 2×2 matrix with two distinct eigenvectors $\mathbf{v}_1$ and $\mathbf{v}_2$, any vector $\mathbf{x}$ can be written as:
+
+$$\mathbf{x} = c_1 \mathbf{v}_1 + c_2 \mathbf{v}_2$$
+
+Applying $A$:
+
+$$A\mathbf{x} = c_1 \lambda_1 \mathbf{v}_1 + c_2 \lambda_2 \mathbf{v}_2$$
+
+The transformation just scales each component independently along its eigenvector axis. That's why diagonalizing a matrix (expressing it in the eigenvector basis) simplifies everything.
+
+---
+
+## Eigenvalues and Stability
+
+The magnitude of $\lambda$ tells you whether the transformation expands or contracts along that eigenvector direction:
+
+- $|\lambda| > 1$: **expansion** — vectors along this direction grow
+- $|\lambda| < 1$: **contraction** — vectors shrink toward zero
+- $|\lambda| = 1$: **neutral** — vectors maintain their length
+- $\lambda < 0$: **flip** — the direction reverses, then scales by $|\lambda|$
+- $\lambda = 0$: **collapse** — the entire eigenvector direction maps to zero
+
+This is the foundation of **dynamical systems** analysis. If you model a system as $\mathbf{x}_{t+1} = A\mathbf{x}_t$, the eigenvalues of $A$ determine whether the system eventually stabilizes, grows without bound, or oscillates.
+
+---
+
+## Power Iteration: How Eigenvalues Emerge Naturally
+
+Apply $A$ to a random vector $\mathbf{v}$ repeatedly:
+
+$$\mathbf{v}, \quad A\mathbf{v}, \quad A^2\mathbf{v}, \quad A^3\mathbf{v}, \quad \ldots$$
+
+Write $\mathbf{v} = c_1\mathbf{v}_1 + c_2\mathbf{v}_2 + \cdots$. Then:
+
+$$A^k\mathbf{v} = c_1\lambda_1^k\mathbf{v}_1 + c_2\lambda_2^k\mathbf{v}_2 + \cdots$$
+
+If one eigenvalue dominates — say $|\lambda_1| > |\lambda_j|$ for all $j \neq 1$ — then as $k \to \infty$, the $\lambda_1^k$ term swamps the rest. After normalization, the vector converges to $\mathbf{v}_1$, the **dominant eigenvector**.
+
+This is the **power iteration** algorithm. It's why gradient descent and PageRank work the way they do.
+
+<PowerIterationViz />
+
+---
+
+## Real-World Applications
+
+### Google PageRank
+
+The web can be modeled as a giant matrix $M$ where $M_{ij}$ represents the probability of jumping from page $j$ to page $i$. PageRank is defined as the **stationary distribution** of a random walk on this graph.
+
+Stationary distribution means: after multiplying by $M$ forever, the distribution doesn't change. That's exactly:
+
+$$M\mathbf{r} = \mathbf{r}$$
+
+So $\mathbf{r}$ is an eigenvector of $M$ with eigenvalue $\lambda = 1$. Google's original algorithm was literally power iteration on a billion-node matrix.
+
+### Principal Component Analysis (PCA)
+
+Given data matrix $X$ (mean-centered), the covariance matrix is $C = \frac{1}{n}X^TX$.
+
+PCA finds the directions of greatest variance in the data. These directions are the **eigenvectors of $C$**, and the variance along each direction is the corresponding **eigenvalue**.
+
+Why? Variance in direction $\mathbf{u}$ is $\mathbf{u}^T C \mathbf{u}$. To maximize this subject to $\|\mathbf{u}\| = 1$, use Lagrange multipliers — the optimal $\mathbf{u}$ satisfies $C\mathbf{u} = \lambda\mathbf{u}$. Eigenvalue equation, exactly.
+
+The first principal component is the eigenvector with the largest eigenvalue. It explains the most variance.
+
+---
+
+## Symmetric Matrices: A Special Case
+
+Symmetric matrices ($A = A^T$) have two remarkable properties:
+
+1. **All eigenvalues are real** — even if the matrix entries are real, some matrices have complex eigenvalues; symmetric matrices never do.
+2. **Eigenvectors for distinct eigenvalues are orthogonal** — the eigenvector axes are perpendicular to each other.
+
+**Proof of orthogonality:** Let $A\mathbf{u} = \lambda\mathbf{u}$ and $A\mathbf{v} = \mu\mathbf{v}$ with $\lambda \neq \mu$. Then:
+
+$$\lambda(\mathbf{u} \cdot \mathbf{v}) = (A\mathbf{u}) \cdot \mathbf{v} = \mathbf{u} \cdot (A^T\mathbf{v}) = \mathbf{u} \cdot (A\mathbf{v}) = \mu(\mathbf{u} \cdot \mathbf{v})$$
+
+Since $\lambda \neq \mu$, we need $\mathbf{u} \cdot \mathbf{v} = 0$. They're orthogonal.
+
+This leads to the **spectral theorem**: every symmetric matrix $A$ can be decomposed as:
+
+$$A = Q\Lambda Q^T$$
+
+where $Q$ is an orthogonal matrix (its columns are the eigenvectors) and $\Lambda$ is diagonal (the eigenvalues). Every symmetric transformation is just a rotation, independent scaling along axes, and rotation back. Clean, beautiful, and the foundation of SVD.
+
+The covariance matrix in PCA is symmetric — which is why PCA eigenvectors are orthogonal principal components.
+
+---
+
+## Summary
+
+| Concept | Key Fact |
+|---|---|
+| Eigenvector equation | $A\mathbf{v} = \lambda\mathbf{v}$ |
+| Finding eigenvalues | $\det(A - \lambda I) = 0$ |
+| Characteristic polynomial (2×2) | $\lambda^2 - \text{tr}(A)\lambda + \det(A) = 0$ |
+| $|\lambda| > 1$ | Expansion |
+| $|\lambda| < 1$ | Contraction |
+| $\lambda < 0$ | Direction flip |
+| Symmetric matrices | Real eigenvalues, orthogonal eigenvectors |
+| PCA | Eigenvectors of covariance matrix |
+| PageRank | Eigenvector with $\lambda = 1$ |
+
+**Next up:** Singular Value Decomposition — what happens when a matrix isn't square, and why SVD generalizes eigendecomposition to all matrices.
