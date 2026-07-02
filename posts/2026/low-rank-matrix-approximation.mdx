@@ -1,0 +1,188 @@
+---
+title: "Low-Rank Approximation: From SVD to LoRA and Beyond"
+slug: "low-rank-matrix-approximation"
+date: "2026-06-20"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ranking-and-rank"
+seriesOrder: 3
+tags: ["low-rank", "lora", "qlora", "fine-tuning", "model-compression"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Eckart–Young says the truncated SVD is the optimal low-rank approximation. This post turns that theorem into engineering — factorized layers, truncated-SVD compression, LoRA and its descendants QLoRA, DoRA, and GaLore, and nuclear-norm minimization for matrix completion."
+---
+
+The [previous post](/blog/svd-singular-value-decomposition) ended on a theorem and a promise: Eckart–Young
+guarantees that truncating the SVD to its top components gives the *optimal* low-rank approximation, and the
+measured singular-value spectra of trained networks show that their weight matrices are nearly low-rank to
+begin with. This post cashes that in. If the matrices we care about really do hide in small subspaces, then
+we should be able to store them, fine-tune them, and recover them while only ever touching a few directions.
+That single idea — replace a big matrix with a thin product of two small ones — is the common ancestor of
+model compression, parameter-efficient fine-tuning, and matrix completion, and it is the reason a curious
+hobbyist can fine-tune a seventy-billion-parameter model on a single consumer GPU.
+
+## Why weight matrices are approximately low-rank
+
+The empirical starting point is that the weight matrices inside trained transformers have rapidly decaying
+singular values, so their effective rank is far below their nominal dimension. More striking is what happens
+during fine-tuning. Aghajanyan, Zettlemoyer and Gupta (2021) measured the **intrinsic dimensionality** of
+fine-tuning — the smallest random subspace in which you can optimize and still reach good task performance —
+and found it shockingly small: a few hundred to a few thousand directions suffice to adapt a model with
+hundreds of millions of parameters. The pretrained representation already lives on a low-dimensional
+manifold, and the *change* you need to make to specialize it lives on an even smaller one. That second fact
+is the one LoRA exploits, and it is worth keeping separate from the first: the weights might be only mildly
+low-rank, but the *update* to the weights is dramatically so.
+
+## Pruning versus factorization
+
+There are two classical ways to shrink a matrix, and they make opposite bets. **Pruning** sets small entries
+to zero — unstructured pruning zeros individual weights, structured pruning removes whole rows, columns, or
+heads. It is simple and can be very aggressive, but unstructured sparsity destroys the dense matrix structure
+that GPUs are built to multiply quickly, so the parameter savings often fail to translate into speed.
+**Factorization** takes the other route: replace $W \in \mathbb{R}^{m \times n}$ by a product $AB$ with $A
+\in \mathbb{R}^{m \times r}$ and $B \in \mathbb{R}^{r \times n}$ for some small $r \ll \min(m, n)$. This
+keeps everything dense — two ordinary matrix multiplies in place of one — and the parameter count drops from
+$mn$ to $mr + rn = r(m + n)$, which is a large saving exactly when $r$ is small. Pruning throws away
+entries; factorization throws away *rank*. For the structure the SVD reveals, throwing away rank is the
+better bet, because the energy of the matrix is organized by rank, not by the magnitude of individual
+entries.
+
+## Truncated SVD for compression
+
+The most direct application of the previous post is to compress an existing layer. Compute the SVD of its
+weight matrix and keep the top $k$ components, $W \approx U_k \Sigma_k V_k^{\top}$. Fold the singular values
+into one factor — store $A = U_k \Sigma_k$ of shape $m \times k$ and $B = V_k^{\top}$ of shape $k \times n$ —
+and the layer becomes the product $AB$, computed as two cheaper multiplies. Eckart–Young tells you the
+reconstruction error in advance, $\lVert W - W_k \rVert_F = \sqrt{\sum_{i>k} \sigma_i^2}$, so the only real
+decision is choosing $k$. The standard heuristic is to keep a fixed fraction of the **spectral energy**:
+pick the smallest $k$ such that $\sum_{i \le k} \sigma_i^2 \big/ \sum_i \sigma_i^2$ exceeds, say, $0.90$,
+$0.95$, or $0.99$. A fast-decaying spectrum reaches $99\%$ energy at a tiny $k$; a flat one never does, which
+
+<SpectralEnergyRank />
+
+is the spectrum's honest way of telling you the matrix is genuinely high-rank and should be left alone.
+
+## LoRA: don't compress the weights, factorize the update
+
+The decisive move of **LoRA** (Low-Rank Adaptation, Hu et al., 2021) is to apply this thinking not to the
+weight but to the *change in the weight* during fine-tuning. Freeze the pretrained matrix $W_0$ entirely and
+write the adapted weight as the original plus a low-rank correction,
+
+$$
+W = W_0 + \Delta W = W_0 + BA
+$$
+
+with $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$ and $r \ll \min(d, k)$. Only $A$ and
+$B$ are trained; $W_0$ never receives a gradient. This is the intrinsic-dimensionality result turned into an
+architecture — if the update truly lives in an $r$-dimensional subspace, then parameterizing it as a rank-$r$
+product loses nothing while training $r(d + k)$ numbers instead of $dk$. Two details make it work in
+practice. The factors are initialized so the adapter starts as a no-op: $A$ is drawn from a small random
+Gaussian and $B$ is set to zero, so $\Delta W = BA = 0$ at step one and training begins from exactly the
+pretrained model rather than a perturbed one. And the update is scaled by $\alpha / r$, a constant that
+decouples the effective learning rate from the choice of rank, so that tuning $r$ up or down does not force
+you to retune everything else. Because the correction is just an additive low-rank term, after training you
+can compute $W_0 + BA$ once and **merge** it back into a single matrix, leaving inference with exactly zero
+overhead — the adapted model is structurally identical to the original.
+
+## Why LoRA works, in one sentence
+
+Connecting it back to the [SVD post](/blog/svd-singular-value-decomposition): fine-tuning needs to add a
+low-rank matrix to the weights, the SVD says low-rank matrices are exactly products of thin factors, and
+LoRA parameterizes that product directly instead of discovering it after the fact. The rank $r$ is the single
+knob trading capacity against cost. A useful diagnostic is to take the trained $\Delta W = BA$ and look at
+*its* singular values: if they themselves decay sharply, the effective rank of your update is below $r$ and
+you over-provisioned; if they are flat out to $r$, the update is straining against the ceiling and a larger
+$r$ might help. The companion post [SVD and Low-Rank Approximation: The Math Behind LoRA](/blog/math-llm-svd-lora)
+walks through this argument and the spectra in more detail.
+
+<LoRAParamSavings />
+
+
+## The family of variants
+
+LoRA spawned a small ecosystem, each member attacking a different bottleneck.
+
+
+<LoRAVariantsTable />
+
+**QLoRA** (Dettmers et al., 2023) goes after the memory of the *frozen* base model rather than the adapters.
+Since $W_0$ never receives gradients, it need not be stored in full precision, so QLoRA quantizes it to a
+4-bit format (NF4, a grid tuned for the roughly normal distribution of trained weights) while keeping the
+small LoRA adapters in bf16. The base is dequantized on the fly during each forward pass and gradients flow
+only into the tiny high-precision adapters — enough to fit a 65B-parameter model on a single 48 GB GPU with
+quality within a point or two of full-precision fine-tuning.
+
+**DoRA** (Liu et al., 2024) decomposes each weight into a magnitude and a direction, $W = \lVert W \rVert
+\cdot W / \lVert W \rVert$, and applies the LoRA update only to the direction while learning the magnitude
+separately. Decoupling "how big" from "which way" makes the optimization behave more like full fine-tuning
+and tends to stabilize training, especially at small ranks.
+
+**LoRA+** keeps the architecture but observes that the two factors should not share a learning rate; because
+$A$ and $B$ enter the product asymmetrically, using a higher learning rate for $B$ than for $A$ measurably
+speeds convergence at no extra cost.
+
+**GaLore** (Zhao et al., 2024) attacks a different memory hog. LoRA shrinks the trainable parameters, but
+full fine-tuning's real burden is often the optimizer state — Adam keeps two moments per parameter. GaLore
+keeps *all* weights trainable but projects the **gradients** into a low-rank subspace (found by periodic SVD
+of the gradient) before the optimizer sees them, so the moments are stored only in that small subspace. It
+reaches near-full-fine-tuning quality with optimizer memory even lower than LoRA's, at the cost of the
+periodic projections.
+
+## Choosing the rank
+
+The rank $r$ is the hyperparameter that matters most, and the typical menu is small: $4, 8, 16, 32, 64$.
+Higher $r$ buys expressiveness and more parameters but can converge more slowly and risks fitting noise.
+A workable rule of thumb is to start around $r = 8$ for narrow task adaptation, where the update really is
+tiny, and reach for $r = 64$ for broad domain adaptation, where you are reshaping the model more
+substantially. Then verify empirically: inspect the singular spectrum of the trained $\Delta W$ and, if it
+collapses well before $r$, you can safely shrink it. The point of the whole exercise is that you are not
+guessing in the dark — Eckart–Young gives you a principled way to read how much rank your update actually
+used.
+
+## Nuclear-norm minimization and matrix completion
+
+Low rank is also the right prior for a different problem: recovering a matrix from partial observations, as
+in collaborative filtering, where you see a sparse set of user–item ratings and want to fill the rest.
+Minimizing rank directly is computationally intractable — rank is a non-convex, discontinuous count of
+nonzero singular values — so the standard relaxation is to minimize the **nuclear norm**, the sum of the
+singular values,
+
+$$
+\lVert W \rVert_* = \sum_i \sigma_i
+$$
+
+which is the tightest convex surrogate for rank in the same way the $\ell_1$ norm is the convex surrogate for
+sparsity. Candès and Recht (2009) proved the relaxation is not just convenient but correct: under mild
+incoherence conditions you can recover a low-rank matrix *exactly* from a number of random entries that
+scales with its rank, by solving the convex nuclear-norm problem. It is the same low-rank assumption as LoRA,
+applied to filling in missing data rather than learning an update, and it is the theoretical backbone of
+modern recommender systems.
+
+## A worked example
+
+Put numbers to the savings on a single transformer weight matrix of size $4096 \times 4096$. Stored in full,
+that is
+
+$$
+4096 \times 4096 = 16{,}777{,}216 \approx 16.8\text{M parameters}
+$$
+
+A LoRA adapter at rank $r = 8$ replaces the trainable update with two factors of shapes $4096 \times 8$ and
+$8 \times 4096$:
+
+$$
+4096 \times 8 + 8 \times 4096 = 65{,}536 \text{ parameters}
+$$
+
+a compression of $16{,}777{,}216 / 65{,}536 = 256\times$. Bump the rank to $r = 64$ and the adapter grows to
+$4096 \times 64 \times 2 = 524{,}288$ parameters, still only $1/32$ of the full matrix — a $32\times$ saving.
+Across an entire model these factors of hundreds compound into the difference between a fine-tuning run that
+needs a cluster and one that runs on a single card overnight. The arithmetic is mundane; what makes it
+remarkable is that, thanks to the low intrinsic rank of the update, those few thousand numbers recover almost
+all of the quality of fine-tuning all sixteen million.
+
+That closes the loop the series opened. The [Bradley–Terry post](/blog/bradley-terry-elo) showed how we
+*rank* models by preference; these two posts showed how the *rank* of a matrix lets us compress and adapt
+them. Two meanings of one word, both quietly running underneath every modern language model.

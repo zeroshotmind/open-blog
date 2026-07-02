@@ -1,0 +1,133 @@
+---
+title: "Optimization for LLMs: Gradient Descent to Adam"
+slug: "math-llm-optimization"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 3
+tags: ["math", "optimization", "gradient-descent", "adam", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Training a neural network is an optimization problem: minimize a loss function over billions of parameters. The journey from vanilla gradient descent to Adam reveals why each step was necessary."
+---
+
+[Part 2](/blog/math-llm-probability) ended with a loss function — cross-entropy between the data and the
+model — and the promise that optimization would be the machinery to minimize it. That machinery starts with
+one idea: the gradient of the loss points in the direction in which the loss increases fastest, so to
+decrease the loss you step in the opposite direction.
+
+$$
+\theta_{t+1} = \theta_t - \alpha \, \nabla_\theta L(\theta_t)
+$$
+
+This is gradient descent, and the learning rate $\alpha$ sets how far each step goes; it is correct in
+theory but useless at scale as written, because $\nabla_\theta L$ here is the gradient over the *entire*
+training set, and computing that for a single update over a corpus of trillions of tokens is out of the
+question.
+
+The fix is to estimate the gradient from a small random mini-batch instead of the whole dataset, which
+gives stochastic gradient descent.
+
+$$
+g_t = \nabla_\theta L(\theta_t; B_t), \qquad \mathbb{E}[g_t] = \nabla_\theta L(\theta_t)
+$$
+
+The mini-batch estimate is noisy but unbiased — in expectation it equals the true gradient — and the noise
+turns out to be a feature rather than a bug: it discourages the optimizer from settling into sharp, brittle
+minima that generalize poorly, and it helps the trajectory shake loose from saddle points where the
+gradient nearly vanishes.
+
+Pure SGD still wastes effort when the loss surface is a long narrow valley, because the gradient keeps
+pointing across the valley rather than along it, and the parameters oscillate. Momentum cures this by
+accumulating a running average of past gradients and stepping along that average.
+
+$$
+m_t = \beta \, m_{t-1} + g_t, \qquad \theta_{t+1} = \theta_t - \alpha \, m_t
+$$
+
+Oscillations across the valley cancel out in the average while consistent progress along it adds up, so the
+optimizer accelerates in the directions that matter and damps the directions that do not; $\beta = 0.9$ is
+the standard choice, giving each step a memory of roughly the last ten gradients.
+
+Momentum still hands every parameter the same learning rate, and that is a problem because different
+parameters need different step sizes. The embedding for a rare token receives a gradient only on the rare
+steps where that token appears, so it needs a large effective rate to learn at all; a weight in a densely
+connected layer receives a large gradient on nearly every step and needs a small one to stay stable. The
+answer is to adapt the rate per parameter.
+
+The first adaptive method, AdaGrad, divides each parameter's step by the square root of its accumulated
+squared gradients, so parameters that have seen large gradients get throttled.
+
+$$
+v_t = v_{t-1} + g_t^2, \qquad \theta_{t+1} = \theta_t - \frac{\alpha}{\sqrt{v_t} + \epsilon} \, g_t
+$$
+
+This is exactly right for sparse problems but wrong for long training runs, because $v_t$ only ever grows,
+so the effective learning rate marches monotonically toward zero and the model stops learning long before
+it should.
+
+RMSProp keeps the per-parameter scaling but replaces the ever-growing sum with an exponential moving
+average, so $v_t$ tracks the *recent* magnitude of the gradients rather than their entire history.
+
+$$
+v_t = \beta_2 \, v_{t-1} + (1 - \beta_2) \, g_t^2
+$$
+
+Because old gradients decay out of the average, the learning rate no longer collapses to zero, and the
+optimizer stays responsive to the current shape of the loss surface for the whole run.
+
+Adam is the synthesis: momentum for the direction and RMSProp-style scaling for the magnitude, kept as two
+exponential moving averages — the first moment $m_t$ of the gradient and the second moment $v_t$ of its
+square.
+
+$$
+m_t = \beta_1 \, m_{t-1} + (1 - \beta_1) \, g_t, \qquad v_t = \beta_2 \, v_{t-1} + (1 - \beta_2) \, g_t^2
+$$
+
+Both averages start at zero, which biases them downward in the early steps, so Adam divides them by
+$1 - \beta_1^t$ and $1 - \beta_2^t$ to correct the bias before using them.
+
+$$
+\hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \qquad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}, \qquad \theta_{t+1} = \theta_t - \alpha \, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+<AdamOptimizer />
+
+Read this update as momentum's smoothed direction $\hat{m}_t$ rescaled by how variable each parameter's
+gradients have been: a parameter with consistently small gradients gets a relatively large step, one with
+wild gradients gets a small, cautious one, and the per-parameter $\sqrt{\hat{v}_t}$ is precisely the
+diagonal approximation to the curvature that connects back to the eigendecomposition view from [Part
+1](/blog/math-llm-linear-algebra).
+
+<BiasCorrection />
+
+There is one more correction that separates the optimizer modern LLMs actually use from textbook Adam, and
+it concerns weight decay. The naive way to regularize is to fold an L2 term into the gradient as
+$g_t \leftarrow g_t + \lambda \theta_t$, but inside Adam that term then gets divided by $\sqrt{\hat{v}_t}$
+along with everything else, so parameters with noisy gradients get *less* regularization exactly when you
+might want more. AdamW decouples the decay, applying it directly to the weights instead of routing it
+through the adaptive scaling.
+
+$$
+\theta_{t+1} = (1 - \alpha \lambda)\, \theta_t - \alpha \, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+Decoupled weight decay is now the default for essentially every large model, and the practical details of
+tuning it sit at the heart of the [transformer optimizer](/blog/transformer-training-optimizer) story.
+
+<OptimizerComparison />
+
+It is worth stepping back to ask why any of this works at all, because the loss surface of a large network
+is not convex. It is riddled with saddle points where the gradient vanishes without a minimum, sharp minima
+with high curvature that memorize the training set and generalize badly, and flat minima with low curvature
+that generalize well — and the remarkable thing is that the noise of SGD and the trajectory carved by
+momentum both bias the search toward those flat, well-generalizing basins. Good optimization, on a
+non-convex landscape, turns out to do more than minimize the loss; it implicitly selects the *kind* of
+solution you want.
+
+The optimizer answers how to minimize a loss. It says nothing about *which* loss, and that choice — the
+specification of what the model is actually being asked to learn — is the subject of [Part
+4](/blog/math-llm-loss-functions).

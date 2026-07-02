@@ -1,0 +1,96 @@
+---
+title: "Latent Diffusion: Why You'd Compress Before You Denoise"
+slug: "diffusion-latent"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "diffusion-models"
+seriesOrder: 4
+tags: ["diffusion", "latent-diffusion", "stable-diffusion", "vae"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Running DDPM in pixel space at 512×512 is expensive. Latent diffusion compresses the image into a small latent space first, runs the diffusion process there, and decodes back. The same quality, a fraction of the compute."
+---
+
+[DDIM](/blog/diffusion-ddim) cut the number of denoising steps, but it left each step exactly as
+expensive as before — a full U-Net forward pass over a full-resolution image. At 512×512 that resolution
+is the real cost, and the arithmetic is unforgiving: a 512×512 RGB image is $512 \times 512 \times 3 =
+786{,}432$ dimensions, and the U-Net has to process a tensor of that spatial size at every step of every
+sample. The problem is that almost none of those dimensions are doing generative work. Adjacent pixels
+are heavily correlated, photographic images live on a vanishingly thin manifold inside that huge space,
+and the human visual system barely registers a large fraction of the high-frequency detail those pixels
+encode. Spending the entire diffusion process at full pixel resolution means modeling perceptual
+redundancy at enormous expense.
+
+[Latent diffusion (Rombach et al., 2022)](/papers/latent-diffusion) separates the two jobs that pixel-space diffusion was conflating.
+First train a perceptual autoencoder that compresses images into a small latent space; *then* run the
+whole diffusion process in that space. A 512×512 image compressed by a factor of 8 in each spatial
+dimension becomes a $64 \times 64 \times 4$ latent — $16{,}384$ numbers instead of three-quarters of a
+million — and the U-Net now denoises a tensor two orders of magnitude smaller, with no change to the
+diffusion math from the earlier parts.
+
+The autoencoder is trained first and on its own, with an objective built to preserve what the eye cares
+about rather than raw pixel fidelity. An encoder $E$ maps an image to a latent and a decoder $D$ maps it
+back, and the loss combines a reconstruction term, a **perceptual** term that matches features of a
+pretrained VGG network rather than raw pixels, an adversarial term from a patch discriminator that pushes
+reconstructions to look real, and a light KL penalty that keeps the latent distribution close to a
+standard Gaussian so the diffusion model has a well-behaved space to work in.
+
+$$
+L_\text{VAE} = L_\text{rec} + \lambda_\text{perc}\, L_\text{perc} + \lambda_\text{adv}\, L_\text{adv} + \lambda_\text{KL}\, \mathrm{KL}\!\big(q(z \mid x)\,\|\,\mathcal{N}(0, I)\big)
+$$
+
+<VAELossDecomposition />
+
+The KL weight is deliberately tiny — this is an autoencoder that *reconstructs*, regularized just enough
+to be Gaussian-ish, not a VAE that prioritizes a clean prior over sharp output. Once it is trained, its
+weights freeze, and stage two trains the diffusion U-Net entirely on latents $z = E(x)$, with the
+familiar noise-prediction loss carried over unchanged from DDPM.
+
+<CompressionRatioExplorer />
+
+Splitting training in two is not a convenience; it is the reason the method works. Perceptual compression
+and generative modeling are genuinely different problems — the autoencoder's job is to decide *what
+information is worth keeping*, which is a question about human perception, while the diffusion model's job
+is to learn *the distribution of valid latents*, which is a question about the data. Forcing one network
+to do both at full resolution wastes capacity on perceptual redundancy that the autoencoder handles once,
+cheaply, and then never has to revisit.
+
+Working in the latent space also turned out to be the natural place to introduce general **conditioning**,
+and this is where latent diffusion stopped being a compute optimization and became the template for
+text-to-image. The U-Net is augmented with cross-attention layers: the conditioning input $y$ — a text
+prompt, a class label, a segmentation map — is run through a domain-specific encoder $\tau_\theta$ to
+produce an embedding, and at each spatial resolution the U-Net's features attend to it. The queries come
+from the spatial feature map, the keys and values from the conditioning embedding, and standard attention
+mixes the two.
+
+$$
+\mathrm{Attention}(Q, K, V) = \mathrm{softmax}\!\left(\frac{Q K^\top}{\sqrt{d}}\right) V, \qquad Q = W_Q\, \varphi(z_t),\;\; K = W_K\, \tau_\theta(y),\;\; V = W_V\, \tau_\theta(y)
+$$
+
+Because the conditioning enters through attention rather than being baked into the architecture, the same
+mechanism accepts any signal you can encode into a sequence of vectors — which is precisely the
+flexibility that text-to-image needs.
+
+**Stable Diffusion** is this architecture scaled up. It is a latent diffusion model with a CLIP text
+encoder playing the role of $\tau_\theta$, trained on the LAION-5B image–text dataset — the same design as
+the LDM paper, distinguished mainly by the scale of the training data and the choice of text encoder. The
+autoencoder in SD 1.x compresses 512×512 down to the $64 \times 64 \times 4$ latent described above; SD
+2.x keeps the same 8× spatial compression but swaps in a retrained encoder and a different CLIP variant.
+Everything downstream of the latent — the U-Net, the noise schedule, the DDIM sampler — is the machinery
+from the previous three parts, simply run in a smaller space.
+
+<PixelVsLatentCost />
+
+The catch is the autoencoder bottleneck, and it is a real one. Latent diffusion runs roughly four to
+eight times faster than pixel-space diffusion at matched quality, but anything the encoder discards is
+gone for good — the diffusion model can only ever generate latents, and the decoder can only reconstruct
+from what survived compression, so at aggressive compression ratios fine texture, small regular patterns,
+and crisp text tend to degrade in ways no amount of diffusion capacity can recover. Pixel-space systems
+like DALL·E 2 and Imagen avoid that ceiling and pay for it in compute, typically by generating at low
+resolution and then running separate diffusion *upsamplers*. The trade is the one this whole series has
+been circling: every step from score matching onward bought tractability by changing *where* the modeling
+happens — and latent diffusion makes the most aggressive version of that bargain, moving the entire
+process off the pixels and onto a learned code.

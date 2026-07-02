@@ -1,0 +1,132 @@
+---
+title: "What Each Transformer Component Actually Does"
+slug: "interp-transformer-components"
+summary: "Attention heads as information-routing circuits, MLP layers as key-value memories, and the residual stream as a shared communication bus."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - mechanistic-interpretability
+  - transformers
+  - attention-heads
+  - mlp-layers
+  - residual-stream
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "mechanistic-interpretability"
+seriesOrder: 2
+---
+
+The standard narrative — attention does long-range, MLP does local, residual connections help gradients — is true but almost useless for interpretability. What we actually need is a decomposition precise enough to assign causal responsibility: which component moved which piece of information to produce which output token. Elhage et al. (2021) provide that decomposition, and it reshapes how every transformer layer should be read.
+
+<ResidualStreamDemo2 />
+
+## The Residual Stream as Shared State
+
+Every token position carries a single vector through the network. That vector — the *residual stream* — starts as the token embedding (plus positional information) and accumulates additive updates from every subsequent attention head and MLP layer. Nothing overwrites; everything adds. The final residual stream is handed to the unembedding matrix to produce logits.
+
+This isn't merely an implementation convenience. The residual stream is the *only* communication substrate in the model. An attention head in layer 7 cannot directly read the output of an MLP in layer 3; it can only read the residual stream at layer 7, which happens to contain that MLP's contribution already mixed in. Layers interact exclusively by reading from and writing to this shared bus.
+
+The Elhage et al. (2021) "Mathematical Framework for Transformer Circuits" formalizes this: for a transformer with $L$ layers, the residual stream at position $i$ after all layers is
+
+$$
+x_i^{(L)} = x_i^{(0)} + \sum_{l=1}^{L} \left( \Delta^{\text{attn}}_l(x_i) + \Delta^{\text{MLP}}_l(x_i) \right),
+$$
+
+where $x_i^{(0)}$ is the embedding and each $\Delta$ term is the additive update from one component. Because the sum is over independent contributions, you can ask what each term adds — and subtract individual components to measure their causal effect.
+
+
+<QKOVCircuitDemo />
+
+## Attention Heads as Information Routers
+
+Each attention head computes a weighted average of value vectors from other positions and adds the result to the current position's residual stream. But the single head hides two distinct circuits that should be analyzed separately.
+
+**The QK circuit** determines *where to look*. The query $q_i = x_i W^Q$ and keys $k_j = x_j W^K$ together compute attention weights via $\text{softmax}(q_i k_j^T / \sqrt{d})$. The matrix $W^Q (W^K)^T$ — the "QK matrix" — encodes which source-destination token relationships this head finds important. A head with a strongly diagonal QK matrix tends to attend to itself; a head whose QK matrix activates on subject–verb patterns attends syntactically.
+
+**The OV circuit** determines *what to write*. Given that a head has decided to attend to position $j$, the value $v_j = x_j W^V$ is projected by $W^O$ into the residual stream. The composition $W^V W^O$ — the "OV matrix" — encodes what the head copies or transforms from the attended position into the output. A head whose OV matrix approximates an identity (in the unembedding basis) copies tokens; a head whose OV matrix selects specific features does something more structured.
+
+This decomposition turns attention heads from black boxes into two-part circuits with interpretable functions.
+
+### Induction Heads
+
+The clearest example of structured head behavior is the *induction head*, identified by Olsson et al. (2022). An induction head implements the pattern: given a sequence `[A][B]...[A]`, predict `[B]`. It does this via a two-head circuit: a *previous-token head* in an earlier layer copies token $A$'s identity into a "shifted" key, and then the induction head itself attends back to that key using the current token $A$ as a query, and writes $B$'s representation to the output.
+
+Induction heads appear in every transformer with more than one layer and are responsible for a significant fraction of the in-context learning capability measurable on held-out sequences. Their discovery demonstrated that nontrivial computational structure emerges at model scale and persists across architectures — they are not artifacts of specific training regimes.
+
+### Name-Mover Heads and Other Functional Classes
+
+Wang et al. (2022) analyzed GPT-2 small on the Indirect Object Identification (IOI) task: given "Mary gave the ball to John. She handed it to \_\_\_", the model should output "John". They identified a small circuit — roughly ten attention heads — responsible for the correct logit difference, and within it three functional classes:
+
+- **Name-mover heads** (late layers): attend to the indirect object name in context and copy it to the final token position via the OV circuit.
+- **Duplicate token heads** (early–mid layers): suppress repeated names, preventing the model from outputting the subject instead.
+- **S-inhibition heads** (mid layers): attend to the subject name and use their output to inhibit name-mover heads from attending to the subject.
+
+Beyond the IOI circuit, attention heads also fall into broader classes: *positional heads* (attend to fixed relative offsets, useful for n-gram statistics), *copying heads* (OV matrix ≈ identity in token space), and *key-value lookup heads* (QK selects a semantic category, OV extracts an associated attribute).
+
+
+<MLPKeyValueDemo />
+
+## MLP Layers as Key-Value Memories
+
+If attention routes information between positions, MLP layers transform it within a position. Geva et al. (2021) proposed a precise reading of this transformation: each MLP is a key-value memory store.
+
+A standard transformer MLP with one hidden layer computes
+
+$$
+\text{MLP}(x) = W_{\text{out}} \cdot \sigma(W_{\text{in}} \cdot x),
+$$
+
+where $W_{\text{in}} \in \mathbb{R}^{d_{\text{ff}} \times d}$, $\sigma$ is a nonlinearity (ReLU, GELU, or SwiGLU), and $W_{\text{out}} \in \mathbb{R}^{d \times d_{\text{ff}}}$. The Geva et al. reading:
+
+- Each row $k_i$ of $W_{\text{in}}$ is a **key**: a pattern detector. The inner product $k_i \cdot x$ measures how strongly the input matches pattern $i$.
+- The activation $\sigma(k_i \cdot x)$ is a **gate**: zero if the pattern doesn't match, positive if it does.
+- Each column $v_i$ of $W_{\text{out}}$ is a **value**: what is added to the residual stream if this pattern fires.
+
+The MLP's output is a weighted sum of value vectors, gated by how well the input matches each key. Empirically, Geva et al. found that the keys capture shallow linguistic patterns (lexical, positional) in lower layers and factual or semantic patterns in higher layers. Values, when projected through the unembedding matrix, correspond to coherent semantic clusters: a value vector might consistently boost tokens for European capitals, or for words associated with a specific profession.
+
+This framing predicts something testable: if factual knowledge is stored in MLP weights as key-value pairs, then factual associations should be editable by modifying individual $W_{\text{out}}$ columns — the premise behind model editing methods like ROME and MEMIT.
+
+## Layer Depth and Specialization
+
+The residual stream decomposition gives us a way to ask: *at which layer does a given piece of information enter the stream?* Probing experiments — training linear classifiers on intermediate residual stream states to predict linguistic properties — consistently show layerwise stratification:
+
+- **Early layers (0–3 in GPT-2 small)**: syntactic and positional features dominate. Part-of-speech, dependency relations, and token n-gram statistics are already linearly decodable.
+- **Middle layers**: semantic composition. Entity type, coreference, and sentence-level semantic roles peak here.
+- **Late layers**: task-specific output preparation. The residual stream shifts toward the prediction subspace; features become harder to interpret in terms of linguistic categories and easier to interpret in terms of next-token probabilities.
+
+This stratification is not absolute — some factual recall begins in middle layers, some syntactic structure persists to the end — but it gives a prior for where to look when analyzing a specific behavior.
+
+## Superposition in MLP Neurons
+
+Individual MLP neurons are not monosemantic. A neuron in GPT-2 that fires for "banana" also fires for "the color yellow" and "tropical weather" and "Carmen Miranda". This *polysemanticity* means that the natural analysis unit is not the neuron but a direction in the hidden activation space.
+
+This connects directly to the geometry of representation discussed in earlier posts in this series: the MLP hidden layer participates in superposition just as the residual stream does. If the model needs to represent $N$ features but has only $d_{\text{ff}} \ll N$ neurons, it encodes multiple features per neuron using nearly-orthogonal directions in the hidden space, tolerating small interference between them in exchange for representational capacity.
+
+The practical consequence for interpretability: neuron-level analysis of MLP layers is unreliable. A neuron that appears to encode "sentiment" in one context may encode something structurally unrelated in another. Feature-finding methods — sparse autoencoders, probing with structured priors — are required to recover interpretable units from MLP activations.
+
+
+## Why This Decomposition Enables Causal Interpretability
+
+The residual stream framing, the QK/OV head decomposition, and the key-value MLP reading all share a property: they are *linear*. The residual stream is a sum; the OV contribution is a matrix multiply; the MLP output is a weighted sum of value vectors. Linear contributions can be isolated and measured.
+
+This is what makes targeted interventions possible. If you hypothesize that head $l.h$ (layer $l$, head $h$) is a name-mover head, you can:
+
+1. **Ablate** it — zero out its contribution to the residual stream — and measure the drop in correct logit.
+2. **Patch** it — replace its output from one forward pass with its output from a counterfactual input — and measure how much the model's prediction shifts.
+3. **Project** its OV matrix into the unembedding basis and verify that it boosts the tokens you expect.
+
+Each intervention is interpretable because the linearity of the residual stream means head contributions don't interact in hidden, nonlinear ways before reaching the logits. The causal story is clean enough to test.
+
+This component-level understanding sets the foundation for circuit discovery — the methodology of identifying the minimal set of components responsible for a model behavior. That methodology, and how to execute it rigorously, is the subject of post 5 in this series.
+
+## References
+
+- Elhage, N., et al. (2021). "A Mathematical Framework for Transformer Circuits." *Transformer Circuits Thread*. [transformer-circuits.pub/2021/framework](https://transformer-circuits.pub/2021/framework)
+- Olsson, C., et al. (2022). "In-context Learning and Induction Heads." arXiv:2209.11895.
+- Wang, K., et al. (2022). "Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small." arXiv:2211.00593.
+- Geva, M., et al. (2021). "Transformer Feed-Forward Layers Are Key-Value Memories." arXiv:2012.14913.

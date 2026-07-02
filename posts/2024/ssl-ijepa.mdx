@@ -1,0 +1,78 @@
+---
+title: "I-JEPA: Self-Supervised Vision at Scale"
+slug: "ssl-ijepa"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ssl-world-models"
+seriesOrder: 5
+tags: ["ssl", "jepa", "i-jepa", "vision-transformers"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "I-JEPA applies the JEPA idea to images: predict the representations of target patches from a context region, without any view-level augmentations. The result transfers better to semantic tasks than pixel-level methods."
+---
+
+The cleanest way to put the [joint-embedding predictive idea](/blog/ssl-jepa-idea) to work on a single image is to stop asking the
+model to reconstruct anything and ask it instead to predict, in representation space, the parts of the image
+it cannot see. [Image-based JEPA (Assran et al., 2023)](/papers/i-jepa) takes one image, splits it into patches exactly as a Vision Transformer would,
+and then carves the patch grid into two roles: a single large *context* block, a contiguous region covering
+roughly half the image, and a handful of *target* blocks — four non-overlapping squares, each around 15% of
+the image, sampled from the patches the context block does not contain. The model never sees a second view, a
+crop, or a color-jittered copy. It sees one image, holds back most of it, and predicts the held-back parts from
+what is left.
+
+Three networks carry that prediction. The context encoder is a standard ViT that ingests only the visible
+context patches and produces a sequence of context embeddings $s_x$. The target encoder is an
+exponential-moving-average copy of the context encoder — its weights are never touched by gradient descent,
+only by a slow blend toward the context encoder's weights — and it processes the *full* image to produce the
+target embeddings $s_{y_i}$ that the predictor is asked to match. Between them sits the predictor, a narrow
+transformer that takes the context embeddings together with a set of learnable positional mask tokens, one per
+patch of each target block, and outputs a predicted embedding for every target patch.
+
+<IJEPAPredictionDemo />
+
+Training minimizes the squared error between what the predictor produces for each target block and what the
+target encoder actually computed there.
+
+$$
+\mathcal{L} = \frac{1}{M}\sum_{i=1}^{M}\bigl\lVert\, p_\theta(s_x, \text{pos}_i) - \operatorname{sg}(s_{y_i}) \,\bigr\rVert^2
+$$
+
+The stop-gradient $\operatorname{sg}(\cdot)$ on the target side is the load-bearing detail: without it, the
+fastest way to drive this loss to zero is for both encoders to map everything to the same constant vector, and
+the gradient block plus the EMA update are precisely what stop that collapse — the same asymmetry that the
+distillation-based methods earlier in this series used to avoid degenerate solutions.
+
+<EMAUpdateDemo />
+
+What makes the task hard enough to learn from is the *shape* of the masking, not just its quantity. The context
+is a single large square and each target is a contiguous square, never a scatter of random patches. That choice
+is deliberate. A [masked-autoencoder-style scheme](/blog/ssl-masked-autoencoders) that hides individual patches at random leaves so many visible
+neighbors around each hole that prediction collapses into local texture interpolation — copy the patch next door
+and you are usually close. Forcing the targets to be coherent blocks, sampled away from the context region, removes
+that crutch: to place a plausible representation on a 15% chunk of image it has never seen, the model has to reason
+about what the whole scene contains and where its parts sit relative to each other.
+
+The absence of augmentations is the philosophical payoff. Contrastive pretraining — the [SimCLR lineage](/blog/ssl-contrastive-learning) from
+earlier in this series — leans hard on a hand-tuned recipe of random crops, color jitter, grayscale, and Gaussian
+blur, and the invariances baked into that recipe are exactly the invariances the learned representation inherits.
+I-JEPA needs none of it. The signal comes entirely from predicting multiple held-out blocks of one image, so the
+representation is shaped by the structure of the data rather than by an engineer's guesses about which distortions
+should and should not change the answer.
+
+<IJEPAvsMAEComparison />
+
+The numbers say the trade is worth making. With a ViT-H/14 backbone, I-JEPA matches or beats masked autoencoders
+and data2vec on ImageNet linear probing while spending on the order of ten times less compute than an equivalent
+MAE, because predicting a few hundred target embeddings is far cheaper than reconstructing every pixel. The gap
+widens on low-level tasks. On object counting and monocular depth estimation — where you need to know *where* things
+are, not just *what* the image is of — I-JEPA outperforms contrastive models, which spend their invariances
+discarding exactly the spatial detail those tasks depend on.
+
+The boundary of what this buys you is set by the input. I-JEPA predicts the representations of patches inside a
+single static image; it has no axis along which anything moves, no notion that the same object can persist from one
+frame to the next, no way to learn that a falling cup will be lower a moment later. Everything it knows is spatial.
+[V-JEPA](/blog/ssl-vjepa) keeps the architecture almost unchanged and adds the one ingredient that static images
+cannot provide — time.

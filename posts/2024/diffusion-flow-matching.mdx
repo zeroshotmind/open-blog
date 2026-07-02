@@ -1,0 +1,119 @@
+---
+title: "Flow Matching: The Cleaner Generalization of Diffusion"
+slug: "diffusion-flow-matching"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "diffusion-models"
+seriesOrder: 7
+tags: ["diffusion", "flow-matching", "rectified-flow", "generative-models"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Diffusion models learn to reverse a specific noise process. Flow matching learns to transport any source distribution to any target distribution along straight paths — simpler math, faster sampling, and better training signal."
+---
+
+Step back from the machinery the series has accumulated and a question surfaces that the success of
+diffusion has been quietly papering over: why *this* noise process? [DDPM](/blog/diffusion-ddpm) fixed a
+particular forward corruption — Gaussian noise added over a thousand steps on a cosine schedule, with the
+network parameterized to predict the noise — and everything downstream inherited those choices. They
+work, and the [score-matching post](/blog/diffusion-score-matching) explained why they are even
+*coherent*: the reverse of that specific diffusion is exactly the sampler denoising score matching trains.
+But "coherent" is not "fundamental." The DDPM forward process is one path from data to noise out of
+infinitely many, chosen for analytical convenience, and once you see it that way the natural question is
+whether a different path would be easier to learn and faster to integrate.
+
+The general object underneath diffusion is a **continuous normalizing flow**. Define a time-dependent
+vector field $v_\theta(x, t)$ and let it transport a sample by integrating an ordinary differential
+equation, so that a point drawn from a simple base — a unit Gaussian — flows continuously into a point
+distributed like the data.
+
+$$
+\frac{dx}{dt} = v_\theta(x, t)
+$$
+
+The trouble with CNFs historically was training them: matching the flow's endpoint distribution to the
+data meant simulating this ODE *inside* the training loop and backpropagating through the integration, an
+expense steep enough to keep CNFs a curiosity rather than a workhorse. Flow matching is the trick that
+makes the vector field trainable without ever simulating it.
+
+The idea (Lipman et al., 2022; Liu et al., 2022) is to supervise the vector field directly instead of
+through its endpoint. Pick the two endpoints of a path — a data sample $x_0 \sim p_\text{data}$ and a
+noise sample $x_1 \sim \mathcal{N}(0, I)$ — and *define* a path between them whose required velocity you
+can write down in closed form, then regress $v_\theta$ onto that velocity. The simplest path is a
+straight line: linearly interpolate between the endpoints so the interpolant slides from the noise sample
+at $t = 0$ to the data sample at $t = 1$.
+
+$$
+x_t = (1 - t)\, x_1 + t\, x_0
+$$
+
+
+<StraightVsCurvedPath />
+
+Differentiating this in time is immediate and constant — the velocity along the line is just the
+displacement from noise to data, $u_t = x_0 - x_1$ — which means the regression target is something you
+already hold in your hands the moment you sample a $(x_0, x_1)$ pair. The **conditional flow matching**
+loss is therefore an ordinary squared error between the network's predicted velocity and that straight-line
+direction.
+
+$$
+\mathcal{L}_\text{CFM} = \mathbb{E}_{t,\, x_0,\, x_1} \Big[\, \big\| v_\theta(x_t, t) - (x_0 - x_1) \big\|^2 \,\Big]
+$$
+
+
+<CFMLossExplorer />
+
+There is no ODE solve in that expectation, no normalizing constant, and no Jacobian — just sample a data
+point, a noise point, and a time, form the interpolant, and ask the network to name the direction from
+noise to data. The remarkable fact Lipman et al. prove is that regressing on these *per-pair* conditional
+velocities recovers the correct *marginal* vector field, the one whose ODE actually transports the full
+Gaussian to the full data distribution, by the same averaging logic that let denoising score matching
+substitute a tractable conditional target for an intractable marginal one.
+
+The same straight-line construction was derived independently as **rectified flow** (Liu et al., 2022),
+and its framing adds something the loss alone does not. After training the velocity field once, you can
+use it to generate matched $(x_0, x_1)$ pairs — integrate noise to data, then treat the noise you started
+from and the image you produced as a coupled pair — and retrain on these. Each such *reflow* round
+straightens the transport: the pairing produced by an already-trained flow has less crossing and curvature
+than the random independent pairing you started with, so the optimal paths between the new pairs are
+closer to actually straight, and a straighter field can be integrated in fewer steps. The "rectified"
+name is this iterated straightening.
+
+Why straightness is the quantity worth chasing comes down to what an ODE solver does. DDPM's reverse
+trajectory through data space is *curved*, and integrating a curved path accurately requires many small
+steps because every large step cuts the corner and accumulates error — which is the structural reason
+sampling cost the thousand evaluations [DDIM](/blog/diffusion-ddim) worked so hard to cut down. A
+straight path has no corners to cut: a handful of Euler steps integrate it almost exactly, and in
+practice a well-trained flow-matching model in ten steps matches the sample quality a thousand-step DDPM
+produces, with the error not compounding because there is little curvature for it to compound along.
+
+
+<ReflowStraightening />
+
+That this should subsume diffusion rather than merely rival it is made precise by **stochastic
+interpolants** (Albergo & Vanden-Eijnden, 2023). The framework says that *any* interpolation between a
+noise sample and a data sample — straight line, cosine schedule, the specific variance-preserving path
+DDPM uses — defines a valid generative transport, and both DDPM's forward process and flow matching's
+straight line are special cases of the same construction with different interpolation functions plugged
+in. Seen from there, the thousand-step Gaussian diffusion was never the "right" path; it was one choice
+among a continuum, and the field had simply found it first.
+
+The newest production models act on exactly that conclusion. Stable Diffusion 3 and Flux both keep the
+transformer backbone from the [previous part](/blog/diffusion-dit) — specifically an MMDiT, where image
+tokens and text tokens run in separate weight streams but attend to each other jointly rather than text
+entering through one-directional cross-attention — and train it with flow matching instead of the DDPM
+objective. The straight-path formulation is what lets them sample in few steps, and it trains more stably
+at the high resolutions where the curved diffusion objective grows fragile.
+
+The arc this series has traced is one long search for the right way to frame generation as transport. The
+problem was always the same — move a simple distribution onto the complicated one the data lives on — and
+each part found a better frame for it. Score matching identified the object worth learning. DDPM was the
+breakthrough that turned it into a model that actually generates. DDIM made the generating fast. Latent
+diffusion made it cheap enough to scale. Classifier-free guidance made the conditioning strong enough to
+obey a prompt. DiT showed the backbone is a scaling problem, not an architecture problem. And flow
+matching made the underlying mathematics clean — straight lines where there used to be a thousand curved
+steps. None of these replaced its predecessor so much as clarified what the predecessor had been
+approximating all along, which is the usual shape of progress: not a sequence of overthrows, but a slow
+sharpening of a single good idea until you can finally see what it was the whole time.

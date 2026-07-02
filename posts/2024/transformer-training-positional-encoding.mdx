@@ -1,0 +1,192 @@
+---
+title: "Positional Encodings: From Sinusoids to RoPE"
+slug: "transformer-training-positional-encoding"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "transformer-training"
+seriesOrder: 4
+tags: ["transformers", "rope", "positional-encoding", "architecture"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Attention is permutation-invariant. Positional encodings break that symmetry. The choice of encoding method determines whether your model can generalize to longer sequences than it trained on."
+---
+
+Self-attention is a set operation. Strip away everything else and what an attention layer computes is
+a weighted sum over value vectors, where the weights come from dot products between queries and keys —
+and a dot product does not care where its operands sat in the sequence. Feed the model "The cat sat"
+and feed it "sat cat The," and if the token embeddings are the same, the attention output is the same.
+
+$$
+\text{Attn}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+Permute the rows of $Q$, $K$, and $V$ identically and every entry of that softmax matrix permutes with
+them, so the output is just a permutation of the unpermuted result — order carries no information on its
+own. A language model that cannot tell "dog bites man" from "man bites dog" is useless, so something has
+to inject position before the dot products are taken. That something is the positional encoding, and the
+forty years of choices behind it are the difference between a model that breaks at its training length
+and one that reads a book it has never seen.
+
+## Why not just use integers or binary?
+
+Before arriving at sinusoids, it helps to see what simpler schemes fail and why.
+
+**Integer embeddings** are the obvious first idea: assign each position its integer value, so position 0
+gets embedding 0, position 1 gets embedding 1, and so on. The problem is that norms explode as sequences
+grow longer. Position 1000 has a norm 1000× larger than position 1, and those enormous magnitudes create
+gradient instability during training — the signal from late positions floods the signal from early ones.
+Numbers grow without bound, and the model has no way to compare "500 away" with "501 away" on the same
+scale it used for "2 away" and "3 away."
+
+**Binary embeddings** fix the norm explosion by encoding each position as a fixed-length binary number.
+Position 5 becomes `0101`, position 6 becomes `0110`, position 13 becomes `1101` — every embedding has
+the same number of bits, so norms stay constant. But binary encodings are too jumpy. Adjacent positions
+like 7 (`0111`) and 8 (`1000`) share no bits at all: every single dimension flips at once. The model
+cannot learn that nearby positions are similar, because the encoding gives no smooth signal that "these
+two tokens are close together." Continuity is completely absent.
+
+**Sinusoids** solve both problems simultaneously. Each dimension is bounded in $[-1, 1]$, so norms are
+controlled regardless of sequence length. And adjacent positions differ by a continuous angular step —
+position $p$ and position $p+1$ are related by a smooth rotation in each dimension, not a sudden binary
+flip. That smoothness is precisely what lets the model learn the geometry of proximity: tokens close
+together produce similar positional vectors, tokens far apart produce dissimilar ones, and the signal
+degrades gracefully as distance grows.
+
+<PEEvolutionComparison />
+
+## Absolute positions: sinusoids and lookup tables
+
+The original transformer added a fixed sinusoidal signal to each token embedding before the first layer.
+Each dimension of the encoding is a sinusoid whose wavelength grows geometrically with the dimension
+index, so position $pos$ maps to a vector of alternating sines and cosines.
+
+$$
+PE(pos, 2i) = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \qquad PE(pos, 2i+1) = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)
+$$
+
+Low dimensions oscillate fast and high dimensions oscillate slowly, so the full vector is a kind of
+binary-clock fingerprint that is unique for every position and smooth between neighbors. The signal is
+not learned, which means in principle it is defined for any position — including positions longer than
+anything seen in training — but in practice extrapolation degrades quickly, because the model learns to
+read these features at the scales it actually saw and has no calibration for the rest.
+
+<SinusoidalHeatmap />
+
+The lazier alternative is to skip the math and learn a position embedding table indexed by slot, exactly
+as you would learn a token embedding. BERT does this, and it works fine inside the training window. The
+cost is that the table has a fixed number of rows: a model trained at 512 positions has no embedding for
+position 513, so it does not extrapolate at all — it simply has nothing to look up.
+
+## Relative positions: bias the logits, not the embeddings
+
+Both absolute schemes share a conceptual flaw. What a language model usually needs is not "this token is
+at absolute index 274" but "this token is three words to the left of that one." Shaw et al. acted on
+that directly by injecting a learned relative-position term into the attention logit itself, so the score
+between positions $i$ and $j$ depends on a vector keyed by their distance $i-j$.
+
+$$
+a_{ij} = \frac{(x_i W_Q)\,(x_j W_K + r_{i-j})^\top}{\sqrt{d_k}}
+$$
+
+The bias $r_{i-j}$ is indexed only by the gap between the two tokens, never by where either sits in the
+sequence, so the same learned pattern of "look three back" applies whether the pair is at the start of a
+paragraph or a thousand tokens in. ALiBi strips this idea to its bones: it adds no learned vector at all,
+just a linear penalty on distance.
+
+$$
+a_{ij} = \frac{q_i k_j^\top}{\sqrt{d_k}} - m \cdot |i - j|
+$$
+
+The slope $m$ is fixed per head — some heads get a steep penalty and attend locally, others get a shallow
+one and see far — and because the penalty is a closed-form function of distance, ALiBi extrapolates to
+longer sequences essentially for free, which was its original selling point.
+
+## RoPE: rotation as relative position
+
+The encoding that modern LLMs converged on takes the relative-position idea and hides it inside a rotation.
+[Rotary position embedding](/papers/rope) leaves the attention formula untouched and instead rotates each query and key
+vector by an angle proportional to its position, pairing up dimensions $(2i, 2i+1)$ and spinning each pair
+by $p\theta_i$ where the per-pair frequency is $\theta_i = 10000^{-2i/d}$.
+
+Additive positional encodings — the sinusoidal vectors added to token embeddings before the first layer —
+mix position and semantic content at the vector level. Once you add $PE(p)$ to the embedding $e(\text{token})$,
+the resulting vector carries both meanings entangled: the same semantic content appears at a different angle
+depending on which position it occupies, and gradient flow through the attention logit carries gradients back
+simultaneously to token content and position. The two signals are fused and cannot be disentangled downstream.
+
+RoPE takes a multiplicative path instead. Rather than adding anything to the query or key vectors, it
+rotates them — and rotation is an isometry, meaning it preserves norms exactly. The magnitude of $q$ and
+$k$ never changes; only their orientation does. This keeps semantic content (what the token means, encoded
+in the vector's length and coarse direction) strictly separated from positional content (where the token
+sits, encoded purely in the rotation angle). There are no "positional bits" added into the magnitude, no
+quiet distortion of the softmax temperature, and no entanglement of content and position gradients. Rotation
+changes the angle; it leaves the length alone.
+
+$$
+\tilde{q}_p = R(p\theta)\, q, \qquad \tilde{k}_k = R(k\theta)\, k
+$$
+
+<RoPERotationDemo />
+
+The reason this is exactly relative encoding, despite looking absolute, is a property of rotation matrices:
+composing two rotations subtracts their angles inside a dot product, so the rotated query at position $p$
+dotted with the rotated key at position $k$ depends only on the gap.
+
+$$
+(R(p\theta)\, q) \cdot (R(k\theta)\, k) = q^\top R\big((k - p)\theta\big)\, k
+$$
+
+The absolute positions $p$ and $k$ cancel and only $k - p$ survives, so RoPE delivers the relative-position
+behavior of Shaw or ALiBi without adding a single term to the logit — it is a transform applied to $q$ and
+$k$ before attention runs, and attention itself is none the wiser.
+
+Think of the dimension pairs as digits on a clock, ordered from fastest to slowest. The lowest-index pair
+(dimensions 0, 1) has frequency $\theta_0 = 10000^0 = 1$ — it rotates by a full radian per position step,
+completing many full cycles across a short context window. The highest-index pair (dimensions $d{-}2$,
+$d{-}1$) has frequency $\theta_{d/2-1} = 10000^{-1} = 0.0001$ — it barely moves across tens of thousands
+of positions. Fast-rotating dimensions are like seconds on a clock: they change with every token step and
+distinguish nearby positions within a local window. Slow-rotating dimensions are like hours: they barely
+move locally but accumulate across long ranges and let the model tell "beginning of document" from "end of
+document." When you extend context with NTK or YaRN, you leave the fast dimensions alone and scale only the
+slow ones — exactly like adjusting the hour hand without touching the second hand.
+
+That clean separation is why RoPE composes with grouped-query attention and the rest of the inference stack
+without special cases, and it is why LLaMA, Mistral, Qwen, Gemini, and DeepSeek all use it.
+
+<AttentionDecayComparison />
+
+## Implementation: shapes and broadcasting
+
+In practice, RoPE is applied as follows: for each attention head, the head dimension $d_\text{head}$ is
+split into pairs — $d_\text{head}/2$ rotation matrices of size $2 \times 2$, one per dimension pair. A
+single rotation matrix tensor of shape $[\text{seq\_len},\, d_\text{head}/2,\, 2,\, 2]$ is precomputed
+from the position indices and frequencies, then broadcast across
+$[\text{batch},\, \text{heads},\, \text{seq\_len},\, d_\text{head}/2,\, 2,\, 2]$ — the same rotation
+applies to every attention head and every item in the batch. This broadcast is cheap: the rotation matrix
+is computed once per forward pass and shared across all heads and batch elements, adding essentially no
+memory overhead beyond the precomputed angles.
+
+## Stretching the window after training
+
+The payoff that made RoPE indispensable is what it lets you do at inference. Because position enters only
+through a rotation angle, you can rescale the angle to pretend a longer sequence is shorter — position
+interpolation divides every position index by the ratio of target length to training length before rotating.
+
+$$
+p' = p \cdot \frac{L_\text{train}}{L_\text{target}}
+$$
+
+A model trained at 4096 positions and asked to run at 32k has its position indices compressed back into the
+$[0, 4096)$ range the rotations were tuned for, so the angles stay in distribution and the model degrades
+gracefully instead of falling off a cliff. Naive interpolation flattens the high-frequency dimensions that
+encode local order, so the production recipes — NTK-aware scaling, and YaRN — interpolate the low frequencies
+while leaving the high ones nearly untouched, extending context with a few hundred steps of fine-tuning
+rather than a full retrain. This is how LLaMA-2's 4k window stretched past 32k without anyone training a 32k
+model from scratch.
+
+Positional encoding is the layer that decides what your model knows about order, and whether that knowledge
+survives past the longest sequence it ever saw. The next post moves inside the attention heads themselves —
+MHA, MQA, GQA — where the binding constraint turns out not to be order but memory bandwidth.

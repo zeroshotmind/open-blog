@@ -1,0 +1,61 @@
+---
+title: "Designing Safety Benchmarks for LLMs: What Makes an Eval Good"
+slug: "rai-safety-benchmark-design"
+summary: "Most safety benchmarks are gameable, distribution-shifted, or measure the wrong thing. Here's what separates a rigorous safety evaluation from a checkbox."
+date: "2024-06-19"
+contentType: "blog-post"
+tags:
+  - responsible-ai
+  - safety
+  - evaluation
+  - benchmarking
+authors:
+  - name: "Admin"
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "responsible-ai-eval"
+seriesOrder: 1
+---
+
+TruthfulQA, BBQ, and WinoBias are the benchmarks people reach for when they want a number that says "this model is safe," and all three measure narrow proxies that a capable model can satisfy without being safe at all. A model can score well by recognizing the shape of an evaluation prompt and producing the response that shape rewards, which is a different thing from genuinely declining to cause harm. Three failure modes recur often enough to treat as defaults rather than exceptions.
+
+The first is distribution shift. Most of these benchmarks were written before RLHF became standard, and a fine-tuned model learns to recognize benchmark-style prompts — the stilted, direct, academic phrasing of "Is it true that..." or "Complete the following stereotype" — and refuse them, while happily generating the same harmful content when it arrives wrapped in natural conversation. The benchmark measures recognition of benchmark prompts, not behavior in the wild.
+
+The second is ceiling effects. Most large models now saturate the published versions of these benchmarks, which means the benchmark can no longer distinguish a frontier model from a merely competent one. When every model you care about scores between 94% and 98%, the benchmark has stopped carrying information about the differences you actually need to resolve.
+
+The third is binary categorization. Real harm lives on a spectrum — a chemistry answer that names a hazardous compound is not the same as one that gives a synthesis route — and a pass/fail label collapses that spectrum into one bit, discarding most of the signal the evaluation could have carried.
+
+## What a good safety benchmark actually measures
+
+A benchmark earns its keep when it measures behavior on realistic adversarial inputs rather than academic-style direct asks. The interesting question is not whether the model refuses "How do I build a bomb?" — every shipped model does — but how it behaves when the same intent is buried in a role-play frame, a translation request, or a multi-turn setup. Alongside that, it should probe edge cases and ambiguous prompts where the right answer is genuinely contestable, because that is where over-refusal and under-refusal both live.
+
+Two further properties matter and are usually skipped. Consistency: does the model behave the same way under paraphrase, or does swapping three words flip a refusal into compliance? Calibration: when the model refuses, does it refuse for the right reason, or is it pattern-matching on a keyword and over-refusing legitimate queries? A model that blocks "how do I kill a Linux process" for the same reason it blocks violence is miscalibrated, and a benchmark that only counts refusals will rate that miscalibration as a win.
+
+## A taxonomy of harm, and how each category is measured
+
+<HarmTaxonomyTree />
+
+Harmful outputs do not form a single category with a single measurement. They split into types that each demand a different test design.
+
+- **Physical-harm enablement** — instructions for weapons, dangerous chemistry, and the like. The measured quantity is whether the model provides *actionable* instructions, not whether it mentions the topic. A model that explains why sarin is dangerous without supplying a synthesis route is categorically different from one that supplies the route, and a benchmark that flags both for containing the word "sarin" is measuring topic avoidance, not harm.
+- **Privacy violations** — PII extraction, re-identification of anonymized records, membership inference. The measured quantity is whether you can extract a specific individual's data from model outputs, which requires test sets built from realistic prompts paired with verified ground truth rather than synthetic placeholders.
+- **Copyright and IP** — verbatim reproduction of protected text, code plagiarism. The measured quantity is n-gram overlap with training data and membership inference on known copyrighted works, and the false-positive rate is the whole game here: heavy n-gram overlap with Wikipedia is expected and harmless, whereas the same overlap with *Harry Potter* is reproduction.
+- **Bias and discrimination** — demographic disparities in outputs. The measured quantity comes from paired test sets, where the same prompt is issued with different demographic markers, scored with disparate-impact metrics rather than anecdotes.
+
+## Constructing adversarial inputs without lying to yourself
+
+Human red-teaming gets you the hardest examples: hire domain experts to probe the model, and a chemistry PhD will find failure modes no template generator imagines. It is expensive, non-reproducible, and impossible to scale. Automated red-teaming — an LLM generating adversarial prompts and a scorer grading the outputs — gives you scale, but the adversarial model has its own blind spots and tends to rediscover the attacks it was trained on. The working compromise is to let human red-teamers define the attack taxonomy, let automated generation produce volume within those categories, and route the hardest examples back to humans for validation.
+
+## Statistical rigor, or why 100 prompts tells you almost nothing
+
+<BenchmarkStatPower />
+
+A benchmark of 100 prompts with binary scoring carries a 95% Wilson confidence interval of roughly ±10%, which means a system that refuses 95% of harmful requests cannot be distinguished from one that refuses 93% or 97%. That two-to-four-point gap is operationally enormous — it is the difference between one harmful completion per twenty and one per thirty — and the benchmark is blind to it. Safety benchmarks therefore need thousands of items, not hundreds, and multi-dimensional scoring (harm severity on a 1–5 scale) extracts more signal per item than a single bit. Inter-rater reliability has to be reported alongside the headline number, because if two annotators disagree 30% of the time, the benchmark is measuring annotator disagreement rather than model safety, and no amount of items will fix that.
+
+## The Goodhart problem you cannot design away
+
+<GoodhartCurveDemo />
+
+Any safety benchmark that drives model selection will be optimized against, and the optimization is often invisible. The moment a benchmark is published and used to choose between models, reward models trained on human "is this safe?" feedback start learning to predict the benchmark's labels rather than the underlying property the labels were meant to track. The benchmark becomes a target, and as a target it stops being a measurement. The only durable countermeasures are structural: hold-out test sets that are never released publicly, panels of benchmarks rotated over time so no single one stays a stable target, and adversarial items injected into the benchmark itself to catch models that have learned to recognize and game it. None of these make the problem go away — they buy time before the next round of optimization catches up.

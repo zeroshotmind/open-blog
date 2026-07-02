@@ -1,0 +1,109 @@
+---
+title: "DDIM: Deterministic Sampling in Fewer Steps"
+slug: "diffusion-ddim"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "diffusion-models"
+seriesOrder: 3
+tags: ["diffusion", "ddim", "sampling", "generative-models"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "DDPM needs 1000 steps to generate a sample. DDIM reframes the reverse process as an ODE and gets the same quality in 50. The model weights are identical — only the sampling procedure changes."
+---
+
+The thousand-step sampling cost that ends [DDPM](/blog/diffusion-ddpm) looks like a property of the
+trained model, but it is not — it is a property of how that model is *used* at inference, and
+[DDIM (Song et al., 2021)](/papers/ddim) gets the same images in a fiftieth of the steps without
+retraining a single weight. The
+opening for this is hiding in plain sight in the training objective.
+
+Look at what the loss actually depended on. The simplified DDPM objective only ever saw pairs $(x_0,
+x_t)$, built from the closed-form marginal $q(x_t \mid x_0)$.
+
+$$
+L_\text{simple} = \mathbb{E}_{t,\, x_0,\, \epsilon}\!\left[\, \big\| \epsilon - \epsilon_\theta(x_t, t) \big\|^2 \,\right]
+$$
+
+Nowhere in that expectation does the Markov chain $q(x_t \mid x_{t-1})$ appear — only the marginals do.
+The trained network knows how to denoise $x_t$ at every level, but the *reverse process* that strings
+those denoisings together is a separate choice, made at inference time, and DDPM's particular Markovian
+reverse chain is just one option among many.
+
+DDIM exploits this by constructing a different forward process — a **non-Markovian** one. It defines a
+family of joint distributions $q_\sigma(x_{1:T} \mid x_0)$, indexed by a vector of parameters
+$\sigma_1, \dots, \sigma_T$, every one of which is engineered to have exactly the same marginals
+$q(x_t \mid x_0) = \mathcal{N}(\sqrt{\bar\alpha_t}\, x_0, (1 - \bar\alpha_t) I)$ as DDPM. Identical
+marginals is the whole point: since the network was trained only against those marginals, the same
+weights are optimal for the entire family, and $\sigma$ becomes a free dial that controls how much
+stochasticity the reverse process injects at each step — without invalidating the training.
+
+Turning the dial produces a concrete reverse step. At each step the network predicts the noise
+$\epsilon_\theta(x_t, t)$, from which a prediction of the clean image follows immediately by inverting
+the marginal; DDIM then re-noises that prediction toward the next timestep and, optionally, adds fresh
+randomness scaled by $\sigma_t$.
+
+$$
+x_{t-1} = \sqrt{\bar\alpha_{t-1}}\, \underbrace{\left(\frac{x_t - \sqrt{1 - \bar\alpha_t}\, \epsilon_\theta(x_t, t)}{\sqrt{\bar\alpha_t}}\right)}_{\text{predicted } x_0} + \sqrt{1 - \bar\alpha_{t-1} - \sigma_t^2}\; \epsilon_\theta(x_t, t) + \sigma_t z
+$$
+
+The three terms read left to right as a recipe: estimate where the clean image is, point back toward
+$x_{t-1}$ along the predicted noise direction, and sprinkle in $\sigma_t z$ of new noise. Choosing
+$\sigma_t$ to match DDPM's posterior variance recovers the original stochastic sampler exactly — so DDIM
+
+<EtaInterpolation />
+
+is a strict generalization, not a different model.
+
+Set $\sigma_t = 0$ for every step and the last term vanishes, leaving a sampler with no randomness at
+all: $x_{t-1}$ is a deterministic function of $x_t$ and the network's output. This is the DDIM sampler
+proper, and determinism changes the character of the process. There is no longer a stochastic walk that
+explores; there is a fixed trajectory, computed by a function, from a noise sample to an image.
+
+That trajectory has a clean continuous-time identity. As the step size shrinks, the deterministic DDIM
+update is the Euler discretization of the **probability flow ODE** — the ordinary differential equation
+whose solutions carry the same time-evolving marginals $p_t$ as the stochastic diffusion, but along
+smooth, non-random paths. (The probability-flow ODE and the broader score-SDE view of diffusion come
+from a separate, concurrent Song et al. paper,
+[*Score-Based Generative Modeling through SDEs*](https://arxiv.org/abs/2011.13456), distinct from the
+DDIM paper above.)
+
+$$
+\frac{dx}{dt} = f(x, t) - \tfrac{1}{2}\, g(t)^2\, \nabla_x \log p_t(x)
+$$
+
+The score $\nabla_x \log p_t(x)$ is exactly what the network estimates — so the trained denoiser *is* the
+right-hand side of an ODE that maps noise to data, and sampling is numerical integration of that ODE from
+
+<ProbabilityFlowODE />
+
+$t = T$ down to $t = 0$.
+
+Reading sampling as ODE integration is what unlocks the speed. A smooth ODE does not need a thousand tiny
+steps to integrate accurately; it needs enough steps to track the curvature of its trajectory, and
+because the probability-flow trajectories are smooth, you can take a coarse subset of timesteps — say 50
+or 20 out of the original 1000 — and skip the rest, treating each retained step as a larger integration
+stride. At 50 steps the samples are close to indistinguishable from full 1000-step DDPM; at 20 there is
+
+<DDIMStepComparison />
+
+visible degradation but often an acceptable trade, and this coarse-integration recipe is what nearly every
+production diffusion system runs at inference. The same network, integrated more coarsely, is the entire
+saving.
+
+Determinism buys a second thing that stochastic sampling cannot give: a stable correspondence between
+noise and image. With $\sigma = 0$ the map from the initial $x_T$ to the final $x_0$ is a fixed function,
+so the same seed always yields the same picture, and — more usefully — *nearby* seeds yield *related*
+pictures. Linearly interpolating between two noise vectors and decoding each produces a smooth morph
+between the two images, semantic interpolation done entirely in noise space. And because the ODE runs in
+both directions, you can integrate it *forward* from a real image to recover the noise that would
+generate it — **DDIM inversion** — which is the entry point for editing a given image by manipulating its
+latent code rather than generating from scratch.
+
+Fifty steps is a large improvement over a thousand, but every one of those steps still runs a U-Net over
+the full-resolution image, and at 512×512 that resolution is itself the dominant cost. The next part
+attacks the pixels rather than the steps: compress the image into a small latent space first, run the
+entire diffusion process there, and decode only at the end — that is
+[latent diffusion](/blog/diffusion-latent).

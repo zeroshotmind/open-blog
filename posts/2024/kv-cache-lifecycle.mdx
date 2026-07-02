@@ -1,0 +1,69 @@
+---
+title: "The Lifecycle of a KV Cache: From Prefill to Last Token"
+slug: "kv-cache-lifecycle"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+tags: ["inference", "systems", "llm"]
+authors:
+  - name: "Admin"
+    orcid: "0009-0009-0632-6830"
+summary: "A request-level walkthrough of how the KV cache is populated, grown, and read during LLM inference — covering prefill, decode, memory layout, and why decode is memory-bandwidth-bound."
+---
+
+Autoregressive generation produces one token per forward pass, and every pass needs to attend over the entire context produced so far. Done naively, that means recomputing the keys and values for all previous positions on every step — an $O(n^2)$ cost per token, $O(n^3)$ to finish a sequence. The keys and values for a position never change once that position is in the context, so there is no reason to recompute them. The KV cache stores them after the first time they are computed and reads them back on every subsequent step. That single decision splits inference into two phases with completely different performance characters.
+
+## Prefill: one big parallel pass
+
+Prefill processes the prompt. Given a prompt of length $P$, you run a single forward pass over all $P$ positions at once. At each layer $l$, the key and value projections are dense matrix multiplications against the layer's hidden states $X \in \mathbb{R}^{P \times d}$:
+
+$$
+K_l = X W_K^{(l)}, \qquad V_l = X W_V^{(l)}.
+$$
+
+Both projections cover all $P$ positions in one shot, which is why prefill saturates the GPU's matrix units instead of starving them. The resulting $K_l$ and $V_l$ are written into the cache with shape `[P, n_heads, head_dim]` per layer, and from this point on those numbers are never recomputed. Prefill is compute-bound: you are paying for $O(P^2 d)$ attention FLOPs and $O(P d^2)$ projection FLOPs, and the hardware runs near its roofline because the work is one large batched matmul — and [FlashAttention](/papers/flash-attention) keeps that $P \times P$ score matrix in on-chip SRAM rather than round-tripping it through HBM, which is what holds prefill's memory cost linear in $P$ instead of quadratic.
+
+## Decode: tiny matmul, enormous read
+
+Decode generates the continuation, one token at a time. For new token $t$ you compute $Q, K, V$ for that single position only — each of shape `[1, n_heads, head_dim]` — append the new $K$ and $V$ to the cache (which now holds $P + t$ positions), and attend the new query against the entire cache:
+
+$$
+\text{out}_t = \operatorname{softmax}\!\left(\frac{Q_t \, K_{\text{cache}}^\top}{\sqrt{d}}\right) V_{\text{cache}}.
+$$
+
+The query is a single row, so the matmuls are minuscule, but $K_{\text{cache}}$ and $V_{\text{cache}}$ span every token seen so far and must be streamed out of HBM in full. Decode is therefore memory-bandwidth-bound: the step is dominated not by arithmetic but by the time it takes to move the cache through the memory system.
+
+## What the cache actually weighs
+
+The cache is two tensors per layer, $K$ and $V$. Take LLaMA-2-70B: 80 layers, 8 key/value heads under grouped-query attention, head dimension 128, stored in fp16. The per-token footprint is
+
+$$
+2 \times 80 \times 8 \times 128 \times 2\ \text{bytes} = 327\,680\ \text{bytes} \approx 327\ \text{KB}.
+$$
+
+The leading factor of 2 is for $K$ and $V$; the trailing factor of 2 is bytes per fp16 element. At a context of 4096 tokens that is roughly $327\,\text{KB} \times 4096 \approx 1.3\ \text{GB}$ for a single sequence. Long context is expensive for exactly this reason — the cost is linear in sequence length and you pay it again for every concurrent request in the batch.
+
+<KVCacheMemoryGrowth />
+
+## Why decode lives below the roofline
+
+Consider the arithmetic intensity of a decode step: useful FLOPs divided by bytes moved. Attending one query over a 4096-token cache is on the order of $4 \times 10^7$ FLOPs, while reading the cache moves $\sim 1.3 \times 10^9$ bytes. That is an arithmetic intensity of roughly
+
+$$
+\frac{4 \times 10^7\ \text{FLOPs}}{1.3 \times 10^9\ \text{bytes}} \approx 0.031\ \text{FLOPs/byte}.
+$$
+
+An A100's ridge point — the intensity at which compute and bandwidth are balanced — sits near 156 FLOPs/byte (312 TFLOP/s fp16 over 2.0 TB/s of HBM bandwidth). At 0.031 FLOPs/byte you are far to the left of that ridge, squarely bandwidth-bound: the matrix units idle while the memory system does all the work.
+
+<PrefillDecodeComparison />
+
+## The prefill/decode gap, and why batching rescues throughput
+
+Prefill is a large parallel matmul with high utilization; decode is a sequence of tiny matmuls each gated on a full cache read, so per-step utilization is dismal. The fix is batching. Decode steps from different sequences read their own caches but share the same weight matrices, and stacking $B$ queries turns the per-step projection into a `[B, d] × [d, d]` matmul — real work for the compute units while the bandwidth cost of the weights is amortized across the batch. This is why serving throughput climbs steeply with batch size up to the point where the combined KV caches exhaust GPU memory. The cache footprint, not the compute, is usually what caps the batch.
+
+## When the cache fills
+
+Memory is finite, so a sequence cannot grow its cache forever. The simplest response is a hard maximum sequence length: once the cache reaches it, generation stops. Beyond that, eviction policies trade fidelity for headroom. A sliding window keeps only the most recent $w$ tokens' keys and values and drops the rest, bounding the cache at $w$ regardless of how long the sequence runs — at the cost of forgetting anything older than the window. [Attention-sink schemes](/papers/streaming-llm) keep the first few tokens plus a recent window, exploiting the empirical fact that early positions absorb a disproportionate share of attention mass. [More aggressive eviction](/papers/h2o) scores cached entries by accumulated attention weight and discards the least-attended, approximating full attention at a fraction of the memory. Every one of these is the same bet: the cache is the binding constraint, so spend accuracy to buy back bandwidth and space.
+
+<EvictionStrategyDemo />

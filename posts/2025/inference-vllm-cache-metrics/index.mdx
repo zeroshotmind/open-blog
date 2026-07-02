@@ -1,0 +1,168 @@
+---
+title: "vLLM Cache Metrics: KV Cache Usage, Prefix Cache Hit Rate, and the Block Pool"
+slug: "inference-vllm-cache-metrics"
+date: "2025-01-24"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 8
+tags: ["inference", "vllm", "kv-cache", "prefix-caching", "block-manager", "lru", "metrics"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Two numbers determine whether a vLLM deployment is healthy: KV cache usage and prefix cache hit rate. This post explains what they measure, how vLLM computes them from its block pool, and what the LRU evictor does when memory runs out."
+---
+
+When you deploy vLLM and look at its Prometheus metrics, two numbers tell you most of what you need to know about whether the deployment is healthy:
+
+```
+vllm:gpu_cache_usage_perc        0.72
+vllm:gpu_prefix_cache_hit_rate   0.38
+```
+
+The first says 72% of the KV cache block pool is occupied. The second says 38% of full blocks served from recent requests were reused from a previous request's cached KV tensors rather than recomputed. This post explains where those two numbers come from — the data structures that back them, the exact formulas, and what happens when memory fills up.
+
+## The block pool
+
+vLLM does not allocate and free GPU memory for KV tensors request by request. Instead, at startup it pre-allocates the entire KV cache as a fixed pool of **blocks**, where each block holds KV tensors for exactly `block_size` tokens (default: 16). The pool size is determined once and never changes:
+
+$$
+\text{bytes\_per\_block} = 2 \times B \times h_{kv} \times d_h \times \text{dtype\_bytes} \times L
+$$
+
+where $B$ is `block_size`, $h_{kv}$ is the number of KV heads, $d_h$ is the head dimension, and $L$ is the number of transformer layers. The factor of 2 is for K and V. The available memory after loading model weights is divided by this figure to get `num_gpu_blocks`:
+
+$$
+\text{num\_gpu\_blocks} = \left\lfloor \frac{(\text{GPU\_memory} \times \text{gpu\_memory\_utilization}) - \text{model\_weights}}{\text{bytes\_per\_block}} \right\rfloor
+$$
+
+<BlockMemoryCalculator />
+
+These blocks are the only KV cache memory vLLM uses. Every sequence consumes some number of them; every finished sequence returns them. The blocks flow through three states: **free**, **used**, and (when prefix caching is on) **cached**.
+
+## KV cache usage
+
+The free pool is a `collections.deque` of integer block IDs. Allocation is `popleft()`, freeing is `appendleft()` — both O(1):
+
+```python
+# vllm/core/block/naive_block.py
+self._free_block_indices: Deque[int] = deque(range(num_blocks))
+
+def allocate(self):
+    block_id = self._free_block_indices.popleft()   # O(1)
+    ...
+
+def free(self, block):
+    self._free_block_indices.appendleft(block.block_id)   # O(1)
+```
+
+The scheduler reads the free count after each scheduling step and computes usage:
+
+```python
+# vllm/core/scheduler.py
+gpu_cache_usage = 1.0 - (
+    self.block_manager.get_num_free_gpu_blocks() /
+    self.block_manager.get_num_total_gpu_blocks()
+)
+```
+
+This is what surfaces as `vllm:gpu_cache_usage_perc`. It is a real-time snapshot — it changes every scheduling step as sequences start and finish.
+
+<KVCacheUsageSimulator />
+
+## Prefix caching and the content hash
+
+When prefix caching is enabled (`--enable-prefix-caching`), vLLM can reuse a block from a previous request if its token content is identical. The key insight is that the hash of a block encodes the *entire prefix* up to that block, not just the block's own tokens. This is computed as a Merkle chain:
+
+```python
+# vllm/core/block/prefix_caching_block.py
+@staticmethod
+def _hash_block_tokens(
+    prev_block_hash: Optional[int],
+    cur_block_token_ids: Tuple[int, ...]
+) -> int:
+    return hash((prev_block_hash, *cur_block_token_ids))
+```
+
+Block 0 hashes its own tokens with `prev_block_hash=None`. Block 1 hashes its tokens together with block 0's hash. Block 2's hash includes block 1's hash, which already encodes block 0. So two requests with different prompts but the same first 48 tokens will produce the same hashes for their first three blocks (assuming `block_size=16`), and those blocks can be shared.
+
+Only **full** blocks get a `content_hash`. The last (partial) block in a sequence is never assigned one and is never eligible for caching — it contains a variable number of tokens and its content is not stable until the sequence finishes.
+
+**Hit tracking** counts every full-block lookup:
+
+```python
+# vllm/core/block/prefix_caching_block.py
+class CacheMetricData:
+    num_hits: int = 0
+    num_total: int = 0
+
+    def query(self, hit: bool):
+        self.num_total += 1
+        if hit: self.num_hits += 1
+
+    @property
+    def hit_rate(self) -> float:
+        return self.num_hits / self.num_total if self.num_total > 0 else 0.0
+```
+
+This runs on every `allocate_immutable_block()` call — when a sequence needs a block, the allocator first looks up its hash in a `content_hash → block_id` dictionary. If found, it increments `num_hits` and returns the existing block (with `ref_count` bumped). If not found, it increments `num_total` only and allocates a fresh block.
+
+The running ratio is what vLLM exposes as `vllm:gpu_prefix_cache_hit_rate`.
+
+<PrefixCacheDemo />
+
+The most common workload that benefits is multi-turn chat with a long system prompt: every request shares the same first $k$ tokens, and those blocks are cached after the first request. A shared system prompt of 512 tokens across 100 concurrent users means 32 blocks are computed once and reused 99 times — a prefix hit rate of 97% for those blocks alone.
+
+## The LRU evictor
+
+Cached blocks do not stay in the free deque — they are held by the **LRU evictor**, an `OrderedDict` keyed by block ID:
+
+```python
+# vllm/core/block/evictor_v2.py
+class LRUEvictor(Evictor):
+    def __init__(self):
+        self.free_table: OrderedDict[int, Block] = OrderedDict()
+
+    def add(self, block: Block):
+        self.free_table[block.block_id] = block
+
+    def evict(self) -> Tuple[int, Block]:
+        return self.free_table.popitem(last=False)   # O(1), removes oldest
+```
+
+When a sequence finishes, its full blocks (those with a `content_hash`) move into the evictor rather than back to the free deque. They remain there as long as memory is not under pressure. If a later request arrives with matching hashes, the block is removed from the evictor, `ref_count` is incremented, and it goes straight into the new sequence's block table — no HBM write needed.
+
+If a new sequence needs a block and the free deque is empty, the scheduler calls `evictor.evict()`. This pops the least-recently-used cached block (`popitem(last=False)` on the `OrderedDict`), clears its content hash, and puts the now-blank block ID back into circulation. The cached KV tensors that were in that block are effectively lost — a future request with that prefix will have to recompute from scratch.
+
+When a cached block is accessed (hit), it is re-inserted at the end of the `OrderedDict` via `move_to_end(block_id)`, making it the MRU and protecting it from imminent eviction.
+
+<BlockPoolExplorer />
+
+## Preemption — the other thing that happens when memory fills up
+
+Beyond evicting cached blocks, vLLM has a second response to memory pressure: preemption. If the free deque is empty and the evictor is also empty, vLLM cannot schedule new sequences. It may **preempt** an active sequence — either by swapping its blocks to CPU memory (if CPU KV cache is configured) or by dropping its blocks entirely and requiring recomputation from the prompt on a future step. Preemptions surface as `vllm:num_preemptions_total`.
+
+This is why `gpu_cache_usage_perc` approaching 1.0 is a warning: at full occupancy, every new token requires either an eviction from the prefix cache (hurting future hit rates) or a preemption (hurting active latency). The practical operating point for most deployments is around 85–90% — enough headroom that the evictor has room to hold recently finished sequences.
+
+## What these numbers tell you in production
+
+**Low KV cache usage** at high request rates usually means sequences are short, block_size is large (wasting space in partial blocks), or the model has few layers and small head dimensions. The fix is rarely to reduce block_size — partial block waste is bounded at one block per sequence. More often it means the GPU has room for a larger batch, and throughput is being left on the table.
+
+**Low prefix hit rate** despite a shared system prompt usually means prefix caching is off, the system prompt length is not a multiple of `block_size` (so the last system-prompt block is partial and never cached), or the cache is under too much eviction pressure. You can check the last case by watching whether `gpu_cache_usage_perc` stays near 1.0 while `gpu_prefix_cache_hit_rate` is low — the evictor is recycling prefix blocks before they can be reused.
+
+**High prefix hit rate** is generally good. The extreme case is a single long document served to many users for Q&A — the document blocks are computed once per GPU and then reused indefinitely, and the effective throughput per token is much higher than the roofline analysis from the previous post would suggest (because the KV tensors for those tokens are never recomputed).
+
+The three interactive components above map exactly to the three data structures vLLM maintains internally: the block pool deque (KV cache usage), the `content_hash` lookup table (prefix cache hits), and the LRU evictor (block lifecycle). Understanding how they interact is what makes it possible to read a vLLM Grafana dashboard and actually know which knob to turn.
+
+Source code pointers:
+
+| Component | File |
+|---|---|
+| Block pool (free deque) | [`vllm/core/block/naive_block.py`](https://github.com/vllm-project/vllm/blob/main/vllm/core/block/naive_block.py) |
+| Prefix caching + hash + hit tracking | [`vllm/core/block/prefix_caching_block.py`](https://github.com/vllm-project/vllm/blob/main/vllm/core/block/prefix_caching_block.py) |
+| LRU evictor | [`vllm/core/block/evictor_v2.py`](https://github.com/vllm-project/vllm/blob/main/vllm/core/block/evictor_v2.py) |
+| Block manager (top-level) | [`vllm/core/block_manager.py`](https://github.com/vllm-project/vllm/blob/main/vllm/core/block_manager.py) |
+| Scheduler (usage formula) | [`vllm/core/scheduler.py`](https://github.com/vllm-project/vllm/blob/main/vllm/core/scheduler.py) |
+| Block sizing (startup) | [`vllm/worker/cache_engine.py`](https://github.com/vllm-project/vllm/blob/main/vllm/worker/cache_engine.py) |
+| Prometheus metrics | [`vllm/engine/metrics.py`](https://github.com/vllm-project/vllm/blob/main/vllm/engine/metrics.py) |

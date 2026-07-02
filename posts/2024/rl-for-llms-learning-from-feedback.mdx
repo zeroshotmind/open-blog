@@ -1,0 +1,148 @@
+---
+title: "Learning from Feedback: RLHF, RLAIF, and Beyond"
+slug: "rl-for-llms-learning-from-feedback"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "rl-for-llms"
+seriesOrder: 3
+tags: ["rl", "rlhf", "alignment", "llm-training"]
+authors:
+  - name: "Admin"
+    url: "https://zeroshotmind.com"
+    affiliation: "Independent"
+summary: "RLHF is three steps: supervised fine-tuning, reward model training, and policy optimization. Each step has a specific failure mode. Here's the full picture."
+---
+
+The policy gradient gives you a way to optimize against a reward, but it does not tell you where the
+reward comes from. In RLHF the answer is a pipeline of three stages — the recipe
+[InstructGPT](/papers/instructgpt) established — each producing the precondition
+for the next: supervised fine-tuning makes the model coherent, a reward model turns human preference
+into a number, and PPO optimizes the model against that number. The stages are usually described as a
+recipe, but they are better understood by what breaks if you skip or botch any one of them.
+
+## Stage one: SFT, so there is something worth ranking
+
+The first stage is the supervised fine-tuning from the opening post — train the base model on
+high-quality demonstrations until it produces coherent, on-task responses. It is tempting to ask why
+this is necessary at all if RL is going to reshape the model anyway. The answer is about what the next
+stage needs as input. A base model's completions to an instruction are often incoherent or
+off-format, and you cannot get meaningful preference data out of comparisons between two pieces of
+garbage — a human asked "which of these is better?" about two incoherent responses gives you noise.
+SFT moves the model into a regime where its samples are at least good enough to disagree about. It
+sets the starting point for RL, and, as we will see, it also serves as the anchor the policy is not
+allowed to drift too far from.
+
+## Stage two: a reward model that scores preference
+
+<RewardModelTrainingDemo />
+
+Humans cannot assign an absolute score to a response — ask ten people to rate an answer from one to
+ten and you get ten different scales. What they can do reliably is compare: shown two responses to the
+same prompt, pick the better one — the comparison-based approach to reward learning introduced by
+[Christiano et al. (2017)](https://arxiv.org/abs/1706.03741). So preference data comes as triples $(x, y_w, y_l)$ — a prompt, a
+*chosen* response $y_w$, and a *rejected* one $y_l$ — and the reward model's job is to assign scalar
+scores $r_\phi$ that are consistent with those choices.
+
+The bridge from "which is better" to a trainable loss is the Bradley–Terry model, which posits that
+the probability a human prefers $y_w$ over $y_l$ is the logistic function of the difference in their
+underlying scores.
+
+$$
+P(y_w \succ y_l \mid x) = \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big)
+$$
+
+Only the *difference* of scores appears, which is why the reward model is identified only up to a
+constant — shifting every score by the same amount leaves every preference probability unchanged.
+Training maximizes the likelihood of the observed human choices, which is the same as minimizing the
+negative log of that probability over the dataset.
+
+$$
+\mathcal{L}_\text{RM}(\phi) = -\,\mathbb{E}_{(x, y_w, y_l)}\Big[ \log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big) \Big]
+$$
+
+Minimizing this pulls $r_\phi(x, y_w)$ above $r_\phi(x, y_l)$ by a margin that grows with how
+confidently humans preferred the winner. The result is a function that, given any response, returns a
+number standing in for "how much a human would like this" — the reward signal stage three optimizes.
+
+## Stage three: PPO, with a leash
+
+<PPOLeashDemo />
+
+Now the policy gradient from the last post has something to optimize. Initialize the policy
+$\pi_\theta$ from the SFT checkpoint, sample responses, score them with the reward model, and run PPO
+to push the policy toward high-scoring outputs. But optimizing $r_\phi$ alone is a trap, because
+$r_\phi$ is a learned approximation with blind spots, and an optimizer's entire job is to find the
+inputs that maximize its target — including the degenerate, out-of-distribution outputs where the
+reward model is simply wrong but happens to return a high number. Left unchecked, the policy discovers
+these and collapses onto them. This is reward hacking, and the standard guard is a penalty that keeps
+the policy close to the SFT model it started from.
+
+$$
+r(x, y) = r_\phi(x, y) - \beta\, \mathrm{KL}\big(\pi_\theta(\cdot \mid x)\,\|\,\pi_\text{SFT}(\cdot \mid x)\big)
+$$
+
+The KL term measures how far the current policy's distribution has moved from the SFT anchor, and
+subtracting it means every bit of reward the policy chases costs something if it requires drifting
+into strange territory. The coefficient $\beta$ sets the exchange rate: too small and the model
+reward-hacks freely, too large and it never improves beyond SFT. The anchor is why stage one mattered
+twice over — it is both the launch point and the tether.
+
+## Replacing humans: RLAIF and Constitutional AI
+
+The expensive ingredient in all of this is human preference labels. RLAIF — reinforcement learning
+from AI feedback — keeps the exact pipeline but replaces the human labeler in stage two with a model,
+usually a capable LLM prompted to judge which of two responses is better. Anthropic's
+[Constitutional AI](/papers/constitutional-ai) is the influential instance: instead of ad-hoc judgments, the labeling model evaluates each
+candidate response against an explicit list of written principles — a "constitution" — and uses those
+critiques to generate the preference signal. The pipeline is unchanged; only the source of the labels
+moves from people to a model, and the quality of the whole system inherits the judgment of whatever
+model is doing the labeling.
+
+## Skipping the reward model entirely: DPO
+
+<DPOvsRLHFComparison />
+
+Each stage above has machinery that can fail, and a natural question is whether the reward model and
+the RL loop are even necessary. Direct preference optimization shows they are not. The key observation
+is that the policy maximizing the KL-regularized RLHF objective has a closed form — the optimal policy
+reweights the reference by the exponentiated reward.
+
+$$
+\pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_\text{ref}(y \mid x)\, \exp\!\Big(\tfrac{1}{\beta}\, r(x, y)\Big)
+$$
+
+Because this can be inverted to express the reward in terms of the optimal and reference policies,
+the reward function cancels out of the Bradley–Terry preference loss, leaving an objective written
+entirely over the policy and the preference data — no separate reward model, no sampling loop, just a
+supervised-style loss on $(x, y_w, y_l)$ triples. The [DPO paper explainer](/papers/dpo) works the
+algebra through; the upshot is that you can often get most of RLHF's benefit with a fraction of its
+moving parts.
+
+## Trimming the RL loop: PPO versus GRPO
+
+DPO removes the reward model; a different simplification keeps the reward but removes the value
+network. PPO needs a learned value function to compute the advantage baseline from the last post,
+which means training a second network alongside the policy. [GRPO](/papers/grpo) drops it: for a given
+prompt it samples a whole *group* of responses, scores them all, and uses the group's mean and
+standard deviation to normalize each reward into an advantage. The baseline becomes the group average
+instead of a learned $V(s)$, which removes the value network entirely and works well when you can
+afford several samples per prompt — exactly the setting of verifiable-reward tasks like math and code.
+
+## Goodhart's law is always waiting
+
+Every variant in this post optimizes a proxy. The reward model is a proxy for human preference; the AI
+labeler is a proxy for a human; even a verifiable checker is a proxy for "actually good." Goodhart's
+law is the standing tax on all of them: when a measure becomes a target, it stops being a good
+measure. Push hard enough on any reward and the policy will find the gap between the proxy and the
+true objective, and beyond some point the [true quality degrades even as the reward keeps
+climbing](/papers/reward-hacking). The KL leash, early stopping, and better reward models all push
+that point further out, but none of them remove it — over-optimization is a property of optimizing a
+proxy at all.
+
+Which raises the question this whole pipeline has been quietly answering: the reward is not a detail
+bolted onto a fixed model — it *is* the specification of what the model becomes. Change what you
+reward and you change what capability gets learned, from a helpful assistant to a mathematician to a
+coding agent. The next post takes that idea seriously and looks at how the choice of reward signal
+determines the skill that emerges.

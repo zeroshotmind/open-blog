@@ -1,0 +1,190 @@
+---
+title: "SVD: The Geometry of Every Matrix"
+slug: "svd-singular-value-decomposition"
+date: "2026-06-20"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ranking-and-rank"
+seriesOrder: 2
+tags: ["svd", "linear-algebra", "pca", "low-rank", "dimensionality-reduction"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Every matrix, no matter how ugly, factors into a rotation, a scaling, and another rotation. That single fact — the singular value decomposition — is the engine behind PCA, image compression, latent semantic analysis, and the low-rank tricks that let us fine-tune giant models cheaply."
+---
+
+The [first post](/blog/bradley-terry-elo) in this series was about one meaning of the word *rank* — the
+ordering of competitors by strength. This post and the [next](/blog/low-rank-matrix-approximation) are about
+the other meaning, the rank of a matrix, and the bridge between the two is the most useful factorization in
+applied mathematics: the singular value decomposition. Its claim is audacious in its generality. Take *any*
+matrix at all — rectangular, singular, full of noise, it does not matter — and it can be written as a
+rotation, followed by a simple axis-aligned scaling, followed by another rotation. There are no exceptions
+and no fine print. Once you believe that, a surprising amount of machine learning stops looking like a bag
+of tricks and starts looking like consequences of one geometric picture.
+
+## The factorization
+
+For any real matrix $W \in \mathbb{R}^{m \times n}$, the SVD is
+
+$$
+W = U \Sigma V^{\top}
+$$
+
+where $U \in \mathbb{R}^{m \times m}$ and $V \in \mathbb{R}^{n \times n}$ are **orthogonal** — their columns
+are orthonormal, so they only rotate and reflect, never stretch — and $\Sigma \in \mathbb{R}^{m \times n}$ is
+**diagonal** with non-negative entries $\sigma_1 \geq \sigma_2 \geq \cdots \geq 0$ called the **singular
+values**, written in descending order. The columns of $U$ are the **left singular vectors** and the columns
+of $V$ are the **right singular vectors**. The defining relationship is beautifully clean: $W v_i = \sigma_i
+u_i$, so each right singular vector is mapped by $W$ onto the corresponding left singular vector, stretched
+by exactly its singular value.
+
+## Reading it as geometry
+
+The factorization is best understood by applying $W$ to a vector $x$ and watching the three stages in order,
+because $W x = U \Sigma V^{\top} x$ is evaluated right to left.
+
+First $V^{\top}$ **rotates** the input. Because $V$ is orthogonal, $V^{\top} x$ just re-expresses $x$ in the
+coordinate system whose axes are the right singular vectors; nothing is stretched, lengths and angles are
+preserved. Then $\Sigma$ **scales** along each of those new axes independently — the first coordinate is
+multiplied by $\sigma_1$, the second by $\sigma_2$, and so on — which is the only stage that changes the
+shape of things, turning the unit sphere into an ellipsoid whose axis lengths are the singular values.
+Finally $U$ **rotates** the stretched result into the output space. So the action of *any* linear map
+decomposes into rotate, stretch, rotate, and the singular values are the complete inventory of how much the
+map stretches space and the singular vectors tell you the directions in which it does so. The largest
+singular value $\sigma_1$ is literally the maximum factor by which $W$ can lengthen any unit vector, and the
+direction that gets stretched most is $v_1$.
+
+The **rank** of $W$ — the dimension of its output space, the number of independent directions it can
+produce — is simply the number of nonzero singular values. If $\sigma_{r+1}$ through the end are all zero,
+the map collapses everything onto an $r$-dimensional subspace, and the SVD has handed you that subspace
+explicitly as the first $r$ columns of $U$.
+
+<RotateScaleRotate />
+
+## Eckart–Young: truncation is optimal
+
+Here is the theorem that makes the SVD indispensable rather than merely elegant. Suppose you are forced to
+approximate $W$ by a matrix of rank at most $k$ — you only get to keep $k$ stretch directions. Which ones
+should you keep? The intuitive answer, "the biggest," is provably the best one. Form the **truncated SVD**
+by keeping only the top $k$ components,
+
+$$
+W_k = U_k \Sigma_k V_k^{\top}
+$$
+
+where $U_k$ and $V_k$ are the first $k$ columns of $U$ and $V$ and $\Sigma_k$ is the top-left $k \times k$
+block. The **Eckart–Young theorem** states that this is the best rank-$k$ approximation in the Frobenius
+norm — no other rank-$k$ matrix gets closer:
+
+$$
+W_k = \arg\min_{\operatorname{rank}(A) \leq k} \lVert W - A \rVert_F
+$$
+
+and it tells you exactly how much you give up, namely the energy in the discarded tail of the spectrum:
+
+$$
+\lVert W - W_k \rVert_F = \sqrt{\sum_{i > k} \sigma_i^2}
+$$
+
+The practical reading is that the approximation error is governed *entirely* by the singular values you
+throw away. If the spectrum decays fast — if $\sigma_1$ towers over $\sigma_{50}$ — then a handful of
+directions hold almost all the matrix's energy and the rest can be dropped almost for free. The whole edifice
+of low-rank approximation, the subject of the next post, rests on this one identity.
+
+## Connection to the eigendecomposition
+
+The SVD is not floating free of the rest of linear algebra; it is wired directly into eigenvalues. Form the
+symmetric matrix $W^{\top} W$ and substitute the factorization:
+
+$$
+W^{\top} W = V \Sigma^{\top} U^{\top} U \Sigma V^{\top} = V \Sigma^{\top} \Sigma V^{\top} = V \Sigma^2 V^{\top}
+$$
+
+using $U^{\top} U = I$. This is exactly the eigendecomposition of $W^{\top}W$: the **right singular vectors
+of $W$ are the eigenvectors of $W^{\top}W$, and the singular values are the square roots of its eigenvalues**.
+Symmetrically, the left singular vectors are the eigenvectors of $W W^{\top}$. This is more than a curiosity
+— it is one way the SVD is actually computed, and it explains why singular values are always real and
+non-negative even when $W$ is rectangular and has no eigenvalues of its own: $W^{\top}W$ is symmetric and
+positive semidefinite, so its eigenvalues are real and non-negative, and their square roots are the singular
+values. For a symmetric positive semidefinite matrix the SVD and the eigendecomposition coincide outright,
+which is what makes the worked example below come out so cleanly.
+
+## Numerical rank and the decay that makes everything work
+
+In theory a matrix is either rank-$r$ or it is not. In practice the distinction blurs, and that blur is
+exactly where the value lives. A matrix can be *technically* full rank — every singular value strictly
+positive — yet have a spectrum that falls off a cliff: $\sigma_1, \sigma_2, \sigma_3$ large, then a long
+tail of values near machine epsilon. Its **effective rank** is the number of singular values large enough to
+matter, and it can be a tiny fraction of the nominal rank. Plot the singular values of a weight matrix from
+a trained transformer and you typically see precisely this shape — a steep initial drop and a long flat
+tail — which says, in the language of Eckart–Young, that the matrix is *almost* low-rank, that most of what
+it does lives in a small subspace. That empirical fact is not a theorem and it is not guaranteed, but it
+holds often enough that the entire low-rank-adaptation literature is built on it.
+
+<SingularValueSpectrum />
+
+## Where it shows up
+
+The same factorization, repurposed, drives a remarkable range of methods. **Principal Component Analysis**
+is the SVD of the mean-centered data matrix: the top right singular vectors are the principal directions of
+variation, and projecting the data onto the top $k$ of them is the optimal $k$-dimensional linear summary —
+optimal, again, by Eckart–Young. **Image compression** stores $U_k$, $\Sigma_k$, and $V_k$ instead of the
+full pixel grid; because photographs have fast-decaying spectra, keeping a few dozen components reproduces an
+image that looks essentially identical at a fraction of the storage. **Latent Semantic Analysis** runs the
+SVD on a word–document matrix and reads the top components as latent topics, so that words appearing in
+similar contexts land near each other even when they never co-occur — the original "embeddings," decades
+before the term. And the case that motivates this series: **LLM weight matrices** have fast singular-value
+decay, which is precisely the structure that [LoRA](/blog/low-rank-matrix-approximation) exploits to adapt
+billion-parameter models by training a few million numbers.
+
+## Computing it at scale
+
+The classical algorithms compute the full SVD in roughly $O(mn\min(m, n))$ time, which is fine for modest
+matrices and ruinous for the enormous ones in modern ML, especially when you only want the top few singular
+directions and not the whole decomposition. The standard modern tool is **randomized SVD** (Halko, Martinsson
+and Tropp, 2011). The idea is disarmingly simple: multiply $W$ by a small random matrix to get a tall, thin
+sketch whose columns are random linear combinations of $W$'s columns. Because the action of $W$ is dominated
+by its top singular directions, that random sketch almost surely captures the dominant subspace; orthonormalize
+it, project $W$ onto it, and take an exact SVD of the resulting small matrix. The whole procedure costs about
+$O(mnk)$ for a rank-$k$ approximation and is the workhorse behind fast PCA and large-scale low-rank
+factorization. You trade an exact answer for an approximate one whose error, thanks to Eckart–Young, you can
+bound by the tail you did not bother to compute.
+
+## A worked example
+
+Take the symmetric matrix
+
+$$
+W = \begin{bmatrix} 2 & 1 & 1 \\ 1 & 2 & 1 \\ 1 & 1 & 2 \end{bmatrix}
+$$
+
+Because it is symmetric and positive definite, its SVD coincides with its eigendecomposition. Notice that
+$W = I + \mathbf{1}\mathbf{1}^{\top}$, the identity plus the all-ones matrix. The all-ones matrix has the
+single nonzero eigenvalue $3$ along the direction $v_1 = \tfrac{1}{\sqrt{3}}(1, 1, 1)^{\top}$, so $W$ has
+eigenvalue $1 + 3 = 4$ there — you can check directly that $W v_1 = (4, 4, 4)^{\top}/\sqrt{3} = 4 v_1$. Every
+direction orthogonal to $v_1$, such as $(1, -1, 0)^{\top}$, is left alone by the all-ones part and so has
+eigenvalue $1 + 0 = 1$. The singular values are therefore
+
+$$
+\sigma_1 = 4, \qquad \sigma_2 = 1, \qquad \sigma_3 = 1
+$$
+
+and the best **rank-1 approximation** keeps only the top component, $W_1 = \sigma_1 v_1 v_1^{\top}$. Since
+$v_1 v_1^{\top} = \tfrac{1}{3}\mathbf{1}\mathbf{1}^{\top}$ is one-third of the all-ones matrix,
+
+$$
+W_1 = 4 \cdot \tfrac{1}{3}\,\mathbf{1}\mathbf{1}^{\top} = \begin{bmatrix} 4/3 & 4/3 & 4/3 \\ 4/3 & 4/3 & 4/3 \\ 4/3 & 4/3 & 4/3 \end{bmatrix}
+$$
+
+Eckart–Young promises the error should be $\sqrt{\sigma_2^2 + \sigma_3^2} = \sqrt{1 + 1} = \sqrt{2}$, and the
+residual $W - W_1$ does indeed have Frobenius norm $\sqrt{2}$ — its energy is exactly the two singular values
+we discarded, no more and no less. That single number, the square root of the dropped tail, is the price of
+compression, and it is the quantity the next post spends in order to fit massive models on small machines.
+
+<SVDRankExplorer />
+
+For a longer treatment that goes straight from this factorization into the mechanics of LoRA, see the
+companion post [SVD and Low-Rank Approximation: The Math Behind LoRA](/blog/math-llm-svd-lora); the
+[next post in this series](/blog/low-rank-matrix-approximation) takes the wider view, surveying the full
+landscape of rank-reduction strategies from truncated SVD to QLoRA, DoRA, and nuclear-norm minimization.

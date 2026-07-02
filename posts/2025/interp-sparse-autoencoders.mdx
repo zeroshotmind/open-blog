@@ -1,0 +1,135 @@
+---
+title: "Sparse Autoencoders: Decomposing Neural Networks into Interpretable Features"
+slug: "interp-sparse-autoencoders"
+summary: "Dictionary learning for neural networks — how sparse autoencoders recover monosemantic features from polysemantic activations, and what Anthropic's scaling monosemanticity work found in Claude."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - mechanistic-interpretability
+  - sparse-autoencoders
+  - features
+  - superposition
+  - dictionary-learning
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "mechanistic-interpretability"
+seriesOrder: 4
+---
+
+A single neuron in GPT-2 layer 10 responds to "the token follows a possessive apostrophe," "the token is a German word ending in -ung," and "the current context is a Python import statement." Not three neurons — one. The same unit, indexed by a single integer, encodes three semantically unrelated features, each active in a different context. This is polysemanticity, and it is not a quirk of one model or one layer. It is the generic regime that neural networks operate in, driven by a fundamental constraint on representation capacity.
+
+The consequence for interpretability is immediate: you cannot understand what a neuron "does" because it does not have a single thing it does. The natural response is to stop asking what neurons mean and start asking what directions in activation space mean. Sparse autoencoders (SAEs) are the primary tool for extracting those directions.
+
+## Why superposition forces polysemanticity
+
+Suppose a model needs to represent $F$ features but its hidden dimension is only $d \ll F$. In the limit of one feature per neuron, it can represent at most $d$ features. But if features are sparse — most are zero for any given input — the model can represent far more than $d$ features by superposing them as nearly-orthogonal directions. The interference between features is kept small as long as co-activation is rare.
+
+Elhage et al. (2022) formalized this in the toy model of superposition: a network with $n$ ReLU hidden units can represent up to $O(n^2)$ features if feature importance decays and sparsity is high enough. The geometry that emerges is not the standard basis; the learned directions correspond to vertices of polytopes — arrangements like pentagons and hexagons inscribed in the hidden space. These are not aligned with any individual neuron.
+
+This analysis tells us both why polysemanticity happens (it is capacity-optimal) and what the ground truth we are looking for looks like (sparse, near-orthogonal feature directions). Dictionary learning is the classical signal-processing technique for recovering exactly this structure.
+
+<SuperpositionDemo />
+
+
+## The SAE architecture
+
+A sparse autoencoder consists of an encoder that maps activations to a high-dimensional sparse code, and a decoder that reconstructs the input from that code. Given a residual stream vector $x \in \mathbb{R}^d$ (or MLP output, or attention output — the same architecture applies to any intermediate), the encoder computes:
+
+$$z = \text{ReLU}(W_e (x - b_{dec}) + b_{enc})$$
+
+where $W_e \in \mathbb{R}^{m \times d}$, $b_{enc} \in \mathbb{R}^m$, and $m \gg d$ (typically $m = 4d$ to $16d$ or more). The decoder reconstructs via:
+
+$$\hat{x} = W_d z + b_{dec}$$
+
+with $W_d \in \mathbb{R}^{d \times m}$, and a normalization constraint $\|W_d[:, i]\|_2 = 1$ on each decoder column (applied after each gradient step). The bias $b_{dec}$ is subtracted before encoding and added back after decoding, which allows the encoder to operate on the mean-centered residuals.
+
+The training objective balances reconstruction fidelity against sparsity:
+
+$$\mathcal{L} = \|x - \hat{x}\|_2^2 + \lambda \|z\|_1$$
+
+The L1 penalty is the key design choice. It is the convex relaxation of the L0 "count of active features" penalty, and it encourages most entries of $z$ to be exactly zero rather than small. The hyperparameter $\lambda$ trades off reconstruction quality against sparsity: large $\lambda$ produces sparse but less faithful reconstructions; small $\lambda$ produces faithful but dense codes.
+
+
+<SAEReconstructionDemo />
+
+After training, each column $W_d[:, i]$ is a learned feature direction — a unit vector in the original activation space. The coefficient $z_i$ measures how much of feature $i$ is present in the current activation. An input activates feature $i$ if $z_i > 0$, and the magnitude $z_i$ quantifies the degree.
+
+## What the learned features look like
+
+The empirical picture from multiple groups is consistent. The features learned by well-trained SAEs on language model activations are:
+
+**Monosemantic.** Individual features activate consistently for one interpretable concept. You find features for "this is a base64-encoded string," "the current word is a chemical element symbol," "the previous token was an opening parenthesis in Python code," and "this passage discusses monetary policy." Each fires across semantically coherent examples with visible variation only in surface form.
+
+**Sparse per token.** For any given token in context, only a small fraction of the $m$ features are active — typically single-digit percentages. The distribution of activation counts is heavy-tailed: most features are inactive most of the time, and the few active ones carry dense semantic load.
+
+**Interpretable via top-activating examples.** The standard evaluation practice is to collect the top-$k$ dataset examples ranked by $z_i$ for each feature $i$, inspect them, and form a hypothesis about what the feature encodes. This process is informal but surprisingly consistent in producing clean interpretations for a majority of features.
+
+**Non-local.** The features do not correspond to individual neurons; a given neuron may contribute to many features, and a given feature may span many neurons. The overcomplete dictionary is the right decomposition level.
+
+## Anthropic's scaling monosemanticity findings
+
+Templeton et al. (2024) trained SAEs on the residual stream of Claude 3 Sonnet across all layers and extracted approximately 34 million features. Several findings stand out.
+
+Feature count scales with model capability: larger models encode more features, and those features tend to be more fine-grained. The smallest SAEs (16k features) capture broad thematic structure; the largest (16 million features per layer in some experiments) capture highly specific concepts.
+
+Many features are multimodal across languages and code. A single feature may activate for the word "deception" in English, its French translation "tromperie," the German "Täuschung," and code comments describing misleading variable names — the same semantic concept instantiated in different surface forms.
+
+Some features are strikingly abstract. Features were found that activate specifically during in-context learning (the model is being given few-shot examples), during chain-of-thought reasoning, and at points in the sequence where the model appears to be executing a plan rather than responding locally. These are not surface-level n-gram features; they reflect high-level processing states.
+
+One landmark demonstration: the "Golden Gate Bridge" feature. Activating at a scale of roughly $20\times$ its natural coefficient during inference produced a version of Claude (dubbed "Golden Gate Claude") that persistently described itself as the Golden Gate Bridge and inserted bridge-related content into responses across topics. This is interpretable feature steering — more surgical than raw activation addition because you are amplifying a specific dictionary atom rather than an arbitrary residual stream direction.
+
+## Connecting SAEs to feature steering
+
+The SAE decoder column $W_d[:, i]$ is a direction in activation space. Adding $\alpha \cdot W_d[:, i]$ to the residual stream at inference time is equivalent to treating the model as if feature $i$ is active with coefficient $\alpha$, regardless of the actual input. This is more principled than the steering vectors described in prior work (which are estimated as mean differences between contrastive activations) because the SAE feature directions are optimized to be linearly separable and to have the reconstruction property: they are the directions the model actually uses, not just arbitrary contrasts.
+
+
+<FeatureSteeringDemo />
+
+The magnitude $\alpha$ has a natural calibration: the typical active coefficient for feature $i$ is measurable from the training data. Steering at $\alpha = 2\bar{z}_i$ is a mild amplification; steering at $\alpha = 20\bar{z}_i$ is the extreme intervention used in the Golden Gate Bridge experiment.
+
+## Evaluating whether features are real
+
+The central methodological problem is that there is no ground truth. You cannot check that your SAE found the right features because the correct decomposition is not externally defined. Several evaluation strategies are in use.
+
+**Automated interpretability.** Bills et al. (2023) demonstrated that a language model can generate natural-language descriptions of what activates a given feature, and then the quality of those descriptions can be tested by asking the same model to predict, from the description alone, which new examples will activate the feature. The "fuzzing score" measures this predictive accuracy. High fuzzing scores indicate that the LLM-generated description is genuinely capturing the feature's behavior, not hallucinating.
+
+**Reconstruction loss and downstream task performance.** A well-trained SAE should faithfully reconstruct the original activations ($\|x - \hat{x}\|^2$ should be small relative to $\|x\|^2$). More importantly, if you replace $x$ with $\hat{x}$ in a forward pass and re-run the model, the output distribution should be similar to the original. This "zero-ablation substitution" test measures whether the SAE has captured the computationally relevant information.
+
+**Feature orthogonality and absorption.** Healthy dictionaries have features that are approximately orthogonal ($\langle W_d[:, i], W_d[:, j] \rangle \approx 0$ for $i \neq j$). Features with high cosine similarity may indicate that the dictionary has split one underlying concept into multiple correlated directions, or that it has failed to separate two related concepts.
+
+**Causal intervention.** The most rigorous test is to clamp a feature to zero ($z_i \leftarrow 0$) and measure the effect on model outputs for examples where the feature was active. If the feature is what you think it is, zeroing it should degrade performance on examples requiring that concept and have no effect on unrelated examples.
+
+## Alternative decomposition approaches
+
+SAEs are not the only way to decompose activation spaces. Non-negative matrix factorization (NMF) imposes non-negativity rather than sparsity and produces parts-based decompositions; it was used in early analysis of word embedding spaces. Independent component analysis (ICA) seeks statistically independent components rather than sparse ones; it applies under different generative assumptions but is less tractable at the scale of modern activations.
+
+Concept Activation Vectors (CAVs), introduced by Kim et al. (2018), define concept directions as the normal to a linear classifier trained to separate "examples containing concept C" from random examples. This requires labeled concept exemplars but produces directions that are explicitly defined relative to a human-specified concept. The advantage is that you get to choose the concept; the disadvantage is that you need labeled data for each concept you care about, which does not scale.
+
+SAEs with L1 have emerged as the dominant approach because the combination of overcomplete dictionary (you get to discover features without pre-specifying them), learned sparsity (the model's own representations determine what features matter), and scalability (trained with standard gradient descent on arbitrary activation caches) is difficult to match. The reconstruction objective also provides a natural quality measure that does not require human annotation.
+
+## Open problems
+
+Several fundamental questions remain unresolved.
+
+**Is the SAE decomposition privileged?** There are infinitely many overcomplete dictionaries that could reproduce the activations with some level of sparsity. The SAE finds one such dictionary, but it is not obvious that it is the decomposition the model is actually using internally. Two SAEs trained on the same activation cache with different random seeds may find different features. The relationship between SAE features and the circuits that compute them is not well understood.
+
+**Dead features.** A persistent failure mode is features that never activate on any input in the training distribution. Once a feature dies (its encoder weights are pushed to zero by the L1 penalty), it is essentially unreachable by gradient updates through the sparsity bottleneck. Several heuristics address this — periodic resampling, auxiliary losses — but it remains a training stability issue.
+
+**Feature → circuit coherence.** Even if individual SAE features are interpretable, it does not follow that the circuits connecting them are. Two features may be causally linked by an attention head whose function is not captured by either feature alone. Understanding the model's algorithm requires understanding both the dictionary and the wiring between features across layers — a problem that circuits analysis addresses separately.
+
+**Scaling limits.** Most SAE work to date covers residual stream positions in models up to about 7B parameters. Whether the same qualitative picture — clean monosemantic features, interpretable abstractions — holds in 70B or 700B models is an open empirical question.
+
+---
+
+**References**
+
+- Elhage et al. (2022). *Toy Models of Superposition*. Transformer Circuits Thread. [transformer-circuits.pub/2022/toy_model](https://transformer-circuits.pub/2022/toy_model)
+- Cunningham et al. (2023). *Sparse Autoencoders Find Highly Interpretable Features in Language Models*. arXiv:2309.08600.
+- Templeton et al. (2024). *Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet*. Transformer Circuits Thread. [transformer-circuits.pub/2024/scaling-monosemanticity](https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html)
+- Bills et al. (2023). *Language models can explain neurons in language models*. OpenAI. [openaipublic.blob.core.windows.net/neuron-explainer/paper/index.html](https://openaipublic.blob.core.windows.net/neuron-explainer/paper/index.html)
+- Kim et al. (2018). *Interpretability Beyond Classification: Quantitative Testing with Concept Activation Vectors (TCAV)*. arXiv:1711.11279.

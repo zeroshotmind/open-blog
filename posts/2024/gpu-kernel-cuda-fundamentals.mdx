@@ -1,0 +1,167 @@
+---
+title: "CUDA Fundamentals for ML Engineers"
+slug: "gpu-kernel-cuda-fundamentals"
+date: "2024-06-20"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "gpu-kernel-optimization"
+seriesOrder: 1
+tags: ["gpu", "cuda", "kernels", "inference", "optimization"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "CUDA exposes GPU parallelism through a three-level thread hierarchy: grid, block, and warp. Understanding how these map to hardware — SMs, register files, shared memory — is the prerequisite for writing fast kernels."
+---
+
+import { Callout } from '@/components/mdx-components'
+
+The [GPU architecture post](/blog/inference-gpu-architecture) established what the hardware looks like: HBM bandwidth, SRAM per SM, tensor cores, and the roofline that relates them. This series starts from the programming model that sits on top of that hardware and works down to the implementation patterns that make kernels fast. The destination is writing and profiling custom kernels for LLM inference — fused attention, quantized matmuls, custom reductions — but the path starts here, with how CUDA exposes parallelism.
+
+## The execution model
+
+When you launch a CUDA kernel you specify two numbers: a **grid** of **thread blocks**, and the size of each block in threads. Every thread runs the same code with a different index, and the hardware maps that index to a position in the output.
+
+```python
+# PyTorch equivalent of launching a kernel
+import torch
+
+# A 4096-element elementwise operation
+x = torch.randn(4096, device='cuda')
+y = torch.exp(x)   # compiled to a GPU kernel internally
+```
+
+What happens inside is:
+
+```c
+// The CUDA kernel the compiler generates (conceptually)
+__global__ void exp_kernel(float* out, const float* in, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < N) out[tid] = expf(in[tid]);
+}
+
+// Launch: 4096/256 = 16 blocks, 256 threads each
+exp_kernel<<<16, 256>>>(out, in, 4096);
+```
+
+The grid has 16 blocks; each block has 256 threads; each thread computes one element. The hardware assigns blocks to SMs in whatever order it chooses — you have no control over scheduling between blocks.
+
+## The three-level hierarchy
+
+<ThreadHierarchyExplorer />
+
+**Grid** — the top level. A grid is a 1D, 2D, or 3D array of blocks. The grid dimensions are chosen to cover the output: for a matrix of shape $(M, N)$ you might launch a grid of $(\lceil M/32 \rceil, \lceil N/32 \rceil)$ blocks each computing a $32 \times 32$ tile.
+
+**Thread block** — the unit of cooperation. Threads within a block can communicate via shared memory (SRAM) and synchronize with `__syncthreads()`. Threads in different blocks cannot communicate at all during a kernel launch. This is not a limitation — it is what allows blocks to run on any SM in any order, enabling the hardware to scale to hundreds of SMs without coordination.
+
+**Warp** — the unit of execution. The SM does not schedule individual threads; it schedules warps of 32 threads that execute in lockstep. All 32 threads in a warp execute the same instruction at the same cycle. If threads in the same warp take different branches, both paths execute sequentially with some threads masked off — this is **warp divergence** and costs throughput. The implication for ML kernels: branch on the warp ID or block ID (coarse-grained), not on the thread ID within a warp (fine-grained).
+
+The indexing formula that every kernel starts with:
+
+$$
+\text{global thread ID} = \texttt{blockIdx} \times \texttt{blockDim} + \texttt{threadIdx}
+$$
+
+For a 2D kernel (e.g., a matrix operation):
+
+```c
+int row = blockIdx.y * blockDim.y + threadIdx.y;
+int col = blockIdx.x * blockDim.x + threadIdx.x;
+```
+
+## How blocks map to hardware
+
+Each SM runs one or more blocks concurrently, subject to three resource constraints: the register file, shared memory, and the thread count limit. These constraints determine **occupancy** — the fraction of the SM's maximum warp capacity that is actually in use.
+
+The SM can hold up to 2048 threads (64 warps) on H100. If your block uses 64 registers per thread and has 256 threads, that block needs $64 \times 256 = 16{,}384$ registers. The SM's register file has 65,536 registers, so it can hold four such blocks simultaneously — $4 \times 8$ warps $= 32$ warps, giving 50% occupancy.
+
+Why does occupancy matter? When a warp stalls waiting for a memory load to return, the SM switches to another ready warp. If there are only two warps in flight and both are waiting, the SM sits idle. More warps in flight means more opportunities to hide latency. Low occupancy starves the SM of this flexibility.
+
+<OccupancyCalculator />
+
+The occupancy calculator shows how register count and shared memory per block determine how many blocks fit per SM — and therefore how many warps are in flight to hide memory latency.
+
+## Global memory and coalescing
+
+Global memory is HBM — the 80 GB main memory at 3.35 TB/s. Every load from global memory goes through the L2 cache and arrives in 128-byte cache line chunks. The memory controller coalesces requests from all 32 threads in a warp: if they access 32 consecutive 4-byte floats starting at a 128-byte-aligned address, the controller satisfies all 32 requests with a single 128-byte transaction. If the accesses are scattered, each lands in a different cache line and requires its own transaction.
+
+<MemoryCoalescingDemo />
+
+The rule for coalescing: **thread $t$ in a warp should access address $\text{base} + t \times \text{sizeof(element)}$**. Any permutation within the warp is still a single transaction (all addresses fall in the same 128 bytes); a stride of 2 requires two transactions; a fully random access pattern requires up to 32 transactions.
+
+For row-major matrices, the standard layout is cache-friendly for row access (threads read consecutive columns in the same row) but not for column access. This is why matrix transpositions, when unavoidable, use shared memory as a staging area to re-tile the data before writing.
+
+## Shared memory
+
+Shared memory is the 228 KB of SRAM per SM that threads in a block can read and write at ~19 TB/s with ~30-cycle latency — roughly 100× faster than HBM for uncached reads. The canonical use is tiled matrix multiplication: each block loads a tile of A and a tile of B from global memory into shared memory, synchronizes with `__syncthreads()`, then performs the dot products without touching HBM again.
+
+```c
+__global__ void tiled_matmul(float* C, const float* A, const float* B, int N) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    float acc = 0.f;
+
+    for (int t = 0; t < N / TILE; ++t) {
+        // Collaboratively load tiles into SRAM
+        As[threadIdx.y][threadIdx.x] = A[row * N + t * TILE + threadIdx.x];
+        Bs[threadIdx.y][threadIdx.x] = B[(t * TILE + threadIdx.y) * N + col];
+        __syncthreads();
+
+        // Compute partial dot product from SRAM
+        for (int k = 0; k < TILE; ++k) acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        __syncthreads();
+    }
+    C[row * N + col] = acc;
+}
+```
+
+The inner loop touches only SRAM — no HBM traffic. The outer loop amortises the HBM load of one tile of A and one tile of B across `TILE` dot products. A tile of 16×16 fp32 elements is $16 \times 16 \times 4 = 1\ \text{KB}$; two tiles use 2 KB of the 228 KB shared memory budget, leaving room for many warps.
+
+## Bank conflicts in shared memory
+
+Shared memory is divided into 32 banks, each 4 bytes wide, cycling through addresses: address $a$ maps to bank $a \% 32$. When two threads in a warp access different addresses in the same bank, the accesses are serialized — a **bank conflict**. A 2-way conflict doubles the latency of that shared memory access; a 32-way conflict serializes all 32 threads.
+
+<SharedMemoryBankDemo />
+
+The conflict pattern depends on the access stride. A stride of 1 (sequential access) maps thread $t$ to bank $t \% 32$ — all different banks, no conflicts. A stride of 16 maps thread $t$ to bank $(16t) \% 32$ — only 16 distinct banks, 2-way conflicts everywhere. The standard fix for strided access patterns (common in tiled matmul when reading column-major) is to pad the shared memory array by one element per row: change `__shared__ float As[TILE][TILE]` to `__shared__ float As[TILE][TILE+1]`, which shifts every row's bank alignment and breaks the repeating conflict pattern.
+
+## Thread block sizing heuristics
+
+Choosing block dimensions is a first-order optimization. The constraints are:
+
+- **Multiple of 32**: blocks with fewer threads than 32 waste a full warp's execution slot. Non-multiples of 32 create a partial warp where some threads are masked.
+- **At least 128–256 threads**: smaller blocks leave the SM under-occupied unless each thread uses very few resources. 128 or 256 is a common starting point.
+- **At most 1024 threads**: the hardware limit per block.
+- **Match the problem shape**: for 2D workloads, square blocks (16×16 or 32×32) are typical; for 1D reductions, tall narrow blocks (256×1) work well.
+
+The right choice depends on register and shared memory pressure — which is exactly what the occupancy calculator above measures. A block of 256 threads with 64 registers and 32 KB of shared memory on H100 hits the shared memory constraint before the register constraint; reducing shared memory or splitting the kernel into stages can recover occupancy.
+
+## Writing this in Triton
+
+The patterns above — indexing, coalescing, tiling into shared memory — all appear in CUDA C. Triton gives you the same control in Python, with the tile-level parallelism made explicit:
+
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def exp_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, tl.exp(x), mask=mask)
+
+# Launch
+grid = lambda meta: (triton.cdiv(N, meta['BLOCK']),)
+exp_kernel[grid](x_ptr, out_ptr, N, BLOCK=256)
+```
+
+`tl.program_id(0)` is the block index; `tl.arange(0, BLOCK)` generates all thread offsets within the block; `tl.load` and `tl.store` with masks handle boundary conditions. Triton compiles this to PTX, applies its own bank-conflict analysis and coalescing checks, and autotunes the `BLOCK` constant against a set of candidates. The next post works through a fused softmax in Triton — a kernel that reads input once, computes running max and sum for numerical stability, and writes the output without an intermediate HBM round-trip.
+
+<Callout title="Further reading">
+  [GPU memory hierarchy](/blog/inference-gpu-architecture) · [FlashAttention paper](/papers/flash-attention) · [Triton documentation](https://triton-lang.org) · [CUDA programming guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide)
+</Callout>

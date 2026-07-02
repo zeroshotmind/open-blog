@@ -1,0 +1,77 @@
+---
+title: "How Decoder-Only Transformers Evolved Since GPT-2"
+slug: "transformer-evolution-gpt2"
+summary: "GPT-2 established the decoder-only transformer as the dominant paradigm. What followed was six years of systematic improvements — in scale, efficiency, alignment, and reasoning. Here's the arc."
+abstract: ""
+date: "2024-06-19"
+version: ""
+contentType: "blog-post"
+tags:
+  - transformers
+  - gpt
+  - architecture
+  - history
+  - llm
+authors:
+  - name: "Admin"
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+image: ""
+canonicalUrl: ""
+doi: ""
+zenodoUrl: ""
+pdf: ""
+license: ""
+bibliography: ""
+citationKey: ""
+---
+
+The decoder-only transformer that runs every frontier model today is, structurally, the one OpenAI shipped in GPT-2 in 2019. Strip GPT-4 or LLaMA-3 down to its block diagram and you find the same loop GPT-2 ran: embed tokens, attend causally over the past, pass through a feed-forward layer, predict the next token. What changed across six years was not the idea but everything around it — the scale it was run at, the efficiency of each block, the objective it was trained against, and the data it was fed. The arc from GPT-2 to DeepSeek-R1 is the story of that everything-around-it, and it's worth tracing in order because each step was a direct reaction to the one before.
+
+<ModelEvolutionTimeline />
+
+## GPT-2 (2019) — the baseline
+
+GPT-2 at its largest was 1.5B parameters, a 1024-token context, Pre-LN, learned absolute position embeddings, and a GeLU feed-forward — a textbook [transformer](/papers/attention-is-all-you-need) decoder with nothing novel in the architecture itself. It was trained on WebText, roughly 40GB of outbound Reddit links filtered for quality. What made it matter was the output: the first model to generate paragraphs of coherent, on-topic prose that didn't fall apart after a sentence. OpenAI staged the release, withholding the full model for months out of concern it could be misused for spam and disinformation — the first time a lab treated a plain language model as something that needed handling. The architectural lesson was almost anticlimactic: nothing in the design was new, so the capability had to be coming from scale and data quality alone.
+
+## GPT-3 (2020) — scale as capability
+
+GPT-3 took the same architecture and multiplied it by roughly a hundred — 175B parameters, a 2048 context, the same Pre-LN decoder otherwise unchanged. Three behaviors appeared that GPT-2 hadn't shown. Few-shot learning: drop a handful of input-output examples into the prompt and the model generalizes the pattern with no weight updates. Latent reasoning: ask larger models to think step by step and they produce usable intermediate traces. Task generality: one model, prompted differently, handled translation, summarization, and question answering without a fine-tuned head per task. The scaling hypothesis crystallized here — capability looked like a smooth function of compute, data, and parameters, climbing steadily rather than waiting on the next architectural breakthrough.
+
+## Chinchilla (2022) — the compute-optimal correction
+
+<ChinchillaScalingLaw />
+
+[Hoffmann et al.](/papers/chinchilla) asked a sharper question: given a fixed compute budget, how should you split it between model size and training tokens? Fitting loss curves across hundreds of runs, they found that optimal compute splits roughly equally between model size and token count — for a compute budget $C$, both the parameter count $N$ and the token count $D$ scale as roughly $C^{0.5}$, growing in lockstep as the budget rises, with the key insight that most LLMs at the time were significantly undertrained. The implication landed hard: GPT-3 was badly undertrained — at its compute budget the optimal configuration was roughly a 70B model on 1.4T tokens, not a 175B model on 300B. Their Chinchilla model, 70B parameters trained on 1.4T tokens, matched or beat GPT-3 across benchmarks at 2.5× fewer parameters. Every serious model that followed took the token count as seriously as the parameter count.
+
+## LLaMA 1 (2023) — open and efficient, past the optimum
+
+Meta's response inverted Chinchilla's framing. Chinchilla minimizes training compute, but the cost that matters in deployment is inference, paid on every query for the model's lifetime. So LLaMA pushed past the compute-optimal point: LLaMA-7B trained on 1T tokens where Chinchilla-optimal would suggest roughly 200B, and LLaMA-65B on 1.4T. A model that's slightly more expensive to train but permanently cheaper to run is the better trade. LLaMA also folded in the architectural cleanups that had accumulated: Pre-LN with [RMSNorm](/papers/rmsnorm) in place of LayerNorm (see the [normalization post](/blog/transformer-training-normalization)), RoPE for positions, and SwiGLU feed-forwards. Released to researchers, it became the first frontier-quality open model and the substrate for an enormous amount of follow-on work.
+
+## LLaMA 2 (2023) — alignment at scale
+
+LLaMA-2 kept the architecture and added the alignment pipeline that turns a next-token predictor into an instructable assistant. The chat variants went through supervised fine-tuning, then a reward model trained on roughly a million human preference comparisons, then reinforcement learning against that reward with a KL penalty to keep the policy near the supervised model — the [PPO machinery](/papers/ppo) doing the optimization. The 70B adopted grouped-query attention to hold down its KV cache, the first time GQA appeared in the line (the [attention variants post](/blog/transformer-training-attention-variants) covers why), and context doubled to 4096. LLaMA-2 also introduced Ghost Attention, a fine-tuning trick that keeps a system instruction in force across many conversational turns instead of decaying after the first exchange. The open-weights alignment story starts here.
+
+## Mistral 7B (2023) — efficiency innovations
+
+Mistral squeezed more out of a fixed 7B budget with two changes. Sliding-window attention restricts each token to attend only over the last 4096 positions rather than the full context, capping the per-layer attention cost regardless of sequence length. Information still travels farther than one window because each layer's output feeds the next through the residual stream, so a stack of 32 layers with a 4096 window reaches an effective range far past 4096. The second change was using GQA at every model size rather than reserving it for the largest, as LLaMA-2 had. The combination let a 7B model beat LLaMA-2-13B across most benchmarks — a strictly smaller model winning on engineering rather than scale.
+
+## Mixtral 8×7B (2023) — MoE goes open
+
+<MixtralMoEDemo />
+
+Mixtral replaced each dense feed-forward with eight expert feed-forwards and a router that sends every token to its top two. Total parameters came to 47B, but only about 13B are active on any given token, so it runs at the inference cost of a 13B model while carrying the knowledge capacity of something much larger. It outperformed LLaMA-2-70B on most benchmarks at roughly 5× lower inference cost. The bet underneath is the one that now defines the frontier: total parameters govern how much a model can know, active parameters govern what it costs to run, and a sparse mixture-of-experts is the mechanism that pulls those two apart.
+
+## LLaMA 3 (2024) — data as the differentiator
+
+LLaMA-3 made almost no architectural moves — GQA, RoPE, SwiGLU, the same skeleton as LLaMA-2's 70B — and instead poured its effort into data, training on 15T tokens of aggressively filtered and deduplicated text, an order of magnitude more than LLaMA-1. The result argued a specific point: with enough high-quality data, you don't need architectural cleverness to close the gap with the closed frontier. LLaMA-3-70B matched GPT-4 on a wide range of benchmarks, and the distance between the best open and best closed models shrank from a chasm to a margin. The lever that moved most in this generation was the corpus, not the diagram.
+
+## DeepSeek-V2/V3/R1 (2024) — efficiency and reasoning
+
+DeepSeek pushed on two fronts at once. V2 introduced multi-head latent attention, compressing the KV cache into a low-rank latent and reconstructing per-head keys and values on demand, which made a 128k context affordable to serve. V3 scaled the recipe to 671B total parameters with 37B active, combining MLA with a fine-grained mixture-of-experts and training in FP8 mixed precision to hold the cost down. Then R1 changed the objective. Rather than the supervised-then-RLHF pipeline, it trained reasoning directly with [GRPO](/papers/grpo) against verifiable rewards — correct math, passing code — with no supervised chain-of-thought data at all. The model learned to produce long deliberate reasoning traces on its own, because traces that reached the right answer were the ones reinforced. A capable open reasoning model emerged from reward signal rather than imitation, and the closed labs no longer had the space to themselves.
+
+## The through-line
+
+Six years of change ran along three axes more than any one of them alone. Architectural efficiency: Post-LN gave way to Pre-LN, multi-head attention to grouped-query to latent attention, dense feed-forwards to sparse experts. Data: a 40GB scrape of Reddit links became 15T tokens of filtered multimodal web text. Objective: pure language modeling acquired a preference-tuning stage, then a reward model, then in R1-Zero's case a reinforcement loop with no imitation at all. Through every one of those shifts the load-bearing claim from GPT-2 held — that a decoder-only transformer trained to predict the next token, at sufficient scale, generalizes far past what its objective seems to promise. Each model since has been that same wager with better engineering wrapped around it.

@@ -1,0 +1,519 @@
+---
+title: "Cheatsheet: LLM Forward Pass Equations"
+slug: "cheatsheet-forward-pass"
+date: "2025-01-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "cheatsheets"
+seriesOrder: 6
+tags: ["cheatsheet", "architecture", "forward-pass", "transformers", "qwen3", "deepseek", "gpt2", "equations"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "The full forward pass, written out as equations, for GPT-2, Qwen3-8B, DeepSeek-V3, and GPT-OSS. Every matrix, every norm, every residual — in the order the computation actually happens."
+---
+
+import { Callout } from '@/components/mdx-components'
+
+The forward pass of a language model is a fixed sequence of matrix multiplications, normalizations, and nonlinearities applied to a token sequence. The high-level structure is identical across all modern decoder-only models — embedding → $L$ transformer blocks → final norm → LM head — but the internals of each block differ in exactly the ways that matter: which attention mechanism, which FFN, how many experts, how the position encoding is applied.
+
+This cheatsheet writes out the full forward pass for each model in the order it actually executes, using the exact constants from each model's published `config.json`. No prose — just equations.
+
+---
+
+## Qwen3-8B
+
+**Constants** (from [`config.json`](https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json) · [`modeling_qwen3.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py)):
+
+$$
+d = 4096,\quad L = 36,\quad h = 32,\quad h_{kv} = 8,\quad d_h = 128,\quad d_{\mathrm{ff}} = 12288
+$$
+
+**Input embedding:**
+
+$$
+X^0 = E[T]
+$$
+
+where $T$ is the sequence of token ids and $E \in \mathbb{R}^{151936 \times 4096}$ is the embedding matrix.
+
+**For each layer $\ell = 0, \dots, 35$:**
+
+*Pre-attention norm:*
+
+$$
+A^\ell = \operatorname{RMSNorm}(X^\ell)
+$$
+
+*QKV projections:*
+
+$$
+Q = A^\ell W_Q, \qquad K = A^\ell W_K, \qquad V = A^\ell W_V
+$$
+
+where $W_Q \in \mathbb{R}^{4096 \times 4096}$, $W_K, W_V \in \mathbb{R}^{4096 \times 1024}$ (32 Q heads, 8 KV heads, $d_h = 128$ each).
+
+*Per-head QK norm (Qwen3-specific):*
+
+$$
+Q = \operatorname{RMSNorm}_{\mathrm{head}}(Q), \qquad K = \operatorname{RMSNorm}_{\mathrm{head}}(K)
+$$
+
+*Rotary positional encoding applied to Q and K:*
+
+$$
+Q = \operatorname{RoPE}(Q), \qquad K = \operatorname{RoPE}(K)
+$$
+
+*GQA head repeat — each of the 8 KV heads is shared by 4 query heads:*
+
+$$
+K = \operatorname{repeat}_4(K), \qquad V = \operatorname{repeat}_4(V)
+$$
+
+*Scaled dot-product attention with causal mask:*
+
+$$
+S = \frac{Q K^\top}{\sqrt{128}} + M_{\mathrm{causal}}
+$$
+
+$$
+P = \operatorname{softmax}(S)
+$$
+
+$$
+O = P V
+$$
+
+*Output projection:*
+
+$$
+\operatorname{Attn}(X^\ell) = O\, W_O, \qquad W_O \in \mathbb{R}^{4096 \times 4096}
+$$
+
+*First residual:*
+
+$$
+Z^\ell = X^\ell + \operatorname{Attn}(X^\ell)
+$$
+
+*Pre-MLP norm:*
+
+$$
+M^\ell = \operatorname{RMSNorm}(Z^\ell)
+$$
+
+*SwiGLU MLP:*
+
+$$
+G = M^\ell W_{\mathrm{gate}}, \qquad U = M^\ell W_{\mathrm{up}}, \qquad W_{\mathrm{gate}}, W_{\mathrm{up}} \in \mathbb{R}^{4096 \times 12288}
+$$
+
+$$
+H = \operatorname{SiLU}(G) \odot U
+$$
+
+$$
+\operatorname{MLP}(Z^\ell) = H\, W_{\mathrm{down}}, \qquad W_{\mathrm{down}} \in \mathbb{R}^{12288 \times 4096}
+$$
+
+*Second residual:*
+
+$$
+X^{\ell+1} = Z^\ell + \operatorname{MLP}(Z^\ell)
+$$
+
+**After all 36 layers:**
+
+$$
+X_{\mathrm{final}} = \operatorname{RMSNorm}(X^{36})
+$$
+
+$$
+\mathrm{logits} = X_{\mathrm{final}}\, W_{\mathrm{lm}}, \qquad W_{\mathrm{lm}} \in \mathbb{R}^{4096 \times 151936}
+$$
+
+<Callout title="Qwen3-8B notes">
+  **Per-head QK norm** is a Qwen3 addition not present in Llama or GPT-2 — each query and key vector is RMSNorm'd per head before RoPE is applied. This stabilises attention logit scale across layers without needing attention softmax temperature tuning. **GQA ratio 4:1** — 32 query heads share 8 KV heads, reducing KV cache per layer from $2 \times \mathrm{seq} \times 32 \times 128$ to $2 \times \mathrm{seq} \times 8 \times 128$ (4× savings). **SwiGLU intermediate dim** is 12288, which is $3 \times d$ — slightly less than the $\frac{8}{3} d \approx 3.07 \times d$ you'd get from a strict parameter budget match, rounded to a multiple of 256 for hardware efficiency.
+</Callout>
+
+---
+
+## GPT-2 (1.5B / XL)
+
+**Constants** (from [`config.json`](https://huggingface.co/openai-community/gpt2-xl/blob/main/config.json) · [`modeling_gpt2.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py)):
+
+$$
+d = 1600,\quad L = 48,\quad h = 25,\quad d_h = 64,\quad d_{\mathrm{ff}} = 6400
+$$
+
+**Input embedding + positional encoding:**
+
+$$
+X^0 = E[T] + P[t]
+$$
+
+where $E \in \mathbb{R}^{50257 \times 1600}$ is the token embedding and $P \in \mathbb{R}^{1024 \times 1600}$ is the learned absolute positional embedding indexed by position $t$.
+
+**For each layer $\ell = 0, \dots, 47$:**
+
+*Pre-attention norm (LayerNorm):*
+
+$$
+A^\ell = \operatorname{LayerNorm}(X^\ell)
+$$
+
+*QKV — GPT-2 uses a single fused projection then splits:*
+
+$$
+[Q, K, V] = A^\ell W_{QKV}, \qquad W_{QKV} \in \mathbb{R}^{1600 \times 4800}
+$$
+
+$$
+Q, K, V \in \mathbb{R}^{n \times 25 \times 64}
+$$
+
+No RoPE, no GQA — standard MHA with 25 heads, $d_h = 64$.
+
+*Scaled dot-product attention with causal mask:*
+
+$$
+S = \frac{Q K^\top}{\sqrt{64}} + M_{\mathrm{causal}}
+$$
+
+$$
+P = \operatorname{softmax}(S)
+$$
+
+$$
+O = P V
+$$
+
+*Output projection:*
+
+$$
+\operatorname{Attn}(X^\ell) = O\, W_O, \qquad W_O \in \mathbb{R}^{1600 \times 1600}
+$$
+
+*First residual:*
+
+$$
+Z^\ell = X^\ell + \operatorname{Attn}(X^\ell)
+$$
+
+*Pre-MLP norm (second LayerNorm):*
+
+$$
+M^\ell = \operatorname{LayerNorm}(Z^\ell)
+$$
+
+*GELU MLP (two-matrix, no gating):*
+
+$$
+H = \operatorname{GELU}(M^\ell\, W_1), \qquad W_1 \in \mathbb{R}^{1600 \times 6400}
+$$
+
+$$
+\operatorname{MLP}(Z^\ell) = H\, W_2, \qquad W_2 \in \mathbb{R}^{6400 \times 1600}
+$$
+
+where GELU uses the tanh approximation: $\operatorname{GELU}(x) \approx x \cdot \sigma(1.702\,x)$.
+
+*Second residual:*
+
+$$
+X^{\ell+1} = Z^\ell + \operatorname{MLP}(Z^\ell)
+$$
+
+**After all 48 layers:**
+
+$$
+X_{\mathrm{final}} = \operatorname{LayerNorm}(X^{48})
+$$
+
+$$
+\mathrm{logits} = X_{\mathrm{final}}\, W_{\mathrm{lm}}, \qquad W_{\mathrm{lm}} = E^\top \in \mathbb{R}^{1600 \times 50257}
+$$
+
+The LM head is weight-tied to the embedding matrix $E$.
+
+<Callout title="GPT-2 notes">
+  **Absolute positional embeddings** — unlike RoPE, $P[t]$ adds position information at the input once; no per-layer rotation. This caps the effective context window at the training length (1024). **Two-matrix FFN** — GPT-2 uses $W_1, W_2$ without a gate branch; SwiGLU replaces this with three matrices ($W_{\mathrm{gate}}, W_{\mathrm{up}}, W_{\mathrm{down}}$). **No GQA** — 25 full Q/K/V heads means KV cache is $2 \times \mathrm{seq} \times 25 \times 64$ per layer. **LayerNorm not RMSNorm** — GPT-2 subtracts mean and divides by std with learned $\gamma, \beta$; RMSNorm (used by all later models here) drops the mean subtraction.
+</Callout>
+
+---
+
+## DeepSeek-V3 (671B MoE)
+
+**Constants** (from [`config.json`](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json) · [`inference/model.py`](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py)):
+
+$$
+d = 7168,\quad L = 61,\quad h = 128,\quad d_h^{\mathrm{nope}} = 128,\quad d_h^{\mathrm{rope}} = 64
+$$
+$$
+d_c^{KV} = 512,\quad d_c^Q = 1536,\quad E_{\mathrm{routed}} = 256,\quad E_{\mathrm{shared}} = 1,\quad k = 8,\quad d_{\mathrm{exp}} = 2048
+$$
+
+**Input embedding:**
+
+$$
+X^0 = E[T], \qquad E \in \mathbb{R}^{129280 \times 7168}
+$$
+
+**For each layer $\ell = 0, \dots, 60$:**
+
+*Pre-attention norm:*
+
+$$
+A^\ell = \operatorname{RMSNorm}(X^\ell)
+$$
+
+*MLA — Multi-head Latent Attention. Compress Q and KV into low-rank latents:*
+
+$$
+c^Q = A^\ell W^{DQ}, \qquad c^Q \in \mathbb{R}^{n \times 1536}
+$$
+
+$$
+c^{KV} = A^\ell W^{DKV}, \qquad c^{KV} \in \mathbb{R}^{n \times 512}
+$$
+
+*Decompress Q — split into NoPE and RoPE heads:*
+
+$$
+[Q^{\mathrm{nope}}, Q^{\mathrm{rope}}] = c^Q W^{UQ}
+$$
+
+$$
+Q^{\mathrm{rope}} = \operatorname{RoPE}(Q^{\mathrm{rope}})
+$$
+
+$$
+Q = [Q^{\mathrm{nope}},\; Q^{\mathrm{rope}}]
+$$
+
+*Decompress KV — split into NoPE key/value and RoPE key:*
+
+$$
+[K^{\mathrm{nope}}, V] = c^{KV} W^{UKV}
+$$
+
+$$
+K^{\mathrm{rope}} = A^\ell W^{KR}, \qquad K^{\mathrm{rope}} = \operatorname{RoPE}(K^{\mathrm{rope}})
+$$
+
+$$
+K = [K^{\mathrm{nope}},\; K^{\mathrm{rope}}]
+$$
+
+*At inference only $c^{KV}$ and $K^{\mathrm{rope}}$ are cached — 512 + 64 = 576 floats per token per layer, vs $128 \times 128 \times 2 = 32768$ for standard MHA.*
+
+*Scaled dot-product attention (128 heads):*
+
+$$
+S = \frac{Q K^\top}{\sqrt{192}} + M_{\mathrm{causal}}
+$$
+
+$$
+P = \operatorname{softmax}(S), \qquad O = P V
+$$
+
+$$
+\operatorname{Attn}(X^\ell) = O\, W_O
+$$
+
+*First residual:*
+
+$$
+Z^\ell = X^\ell + \operatorname{Attn}(X^\ell)
+$$
+
+*Pre-FFN norm:*
+
+$$
+M^\ell = \operatorname{RMSNorm}(Z^\ell)
+$$
+
+**FFN — depends on layer depth:**
+
+*Layers 0–2: dense SwiGLU FFN:*
+
+$$
+\operatorname{FFN}_{\mathrm{dense}}(M^\ell) = \bigl(\operatorname{SiLU}(M^\ell W_{\mathrm{gate}}) \odot M^\ell W_{\mathrm{up}}\bigr) W_{\mathrm{down}}
+$$
+
+*Layers 3–60: MoE FFN with 1 shared + top-8 of 256 routed experts:*
+
+$$
+s_i = \operatorname{sigmoid}(M^\ell w_{r,i}), \qquad i = 1, \dots, 256
+$$
+
+$$
+\mathcal{T} = \operatorname{top\text{-}8}(\{s_i\})
+$$
+
+$$
+\operatorname{FFN}_{\mathrm{MoE}}(M^\ell) = \operatorname{FFN}_{\mathrm{shared}}(M^\ell) + \sum_{i \in \mathcal{T}} s_i \cdot \operatorname{FFN}_i(M^\ell)
+$$
+
+where each expert FFN is a SwiGLU block with $d_{\mathrm{exp}} = 2048$ and scoring uses sigmoid (not softmax) with `routed_scaling_factor = 2.5` applied to the top-$k$ scores.
+
+*Second residual:*
+
+$$
+X^{\ell+1} = Z^\ell + \operatorname{FFN}(Z^\ell)
+$$
+
+**After all 61 layers:**
+
+$$
+X_{\mathrm{final}} = \operatorname{RMSNorm}(X^{61})
+$$
+
+$$
+\mathrm{logits} = X_{\mathrm{final}}\, W_{\mathrm{lm}}, \qquad W_{\mathrm{lm}} \in \mathbb{R}^{7168 \times 129280}
+$$
+
+<Callout title="DeepSeek-V3 notes">
+  **MLA KV cache math** — standard MHA would cache $K, V \in \mathbb{R}^{n \times 128 \times 128}$ per layer = 32768n elements. MLA caches $c^{KV} \in \mathbb{R}^{n \times 512}$ and $K^{\mathrm{rope}} \in \mathbb{R}^{n \times 64}$ = 576n elements — a 56× reduction. **Sigmoid router** — unlike most MoE models that use softmax, DeepSeek-V3 uses sigmoid scores (`scoring_func: "sigmoid"`), allowing scores to be independent across experts. **Aux-loss-free load balancing** — bias terms on router logits are adjusted dynamically instead of adding an auxiliary loss to the training objective. **MTP** — a separate multi-token prediction head predicts $t{+}1, t{+}2, \ldots$ as an auxiliary training signal; it is discarded at inference.
+</Callout>
+
+---
+
+## GPT-OSS-20B and GPT-OSS-120B
+
+**Constants** (from [`config.json` (120B)](https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json) · [`modeling_gpt_oss.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py)):
+
+$$
+d = 2880,\quad h = 64,\quad h_{kv} = 8,\quad d_h = 64,\quad w = 128
+$$
+$$
+\text{20B: } L = 24,\; E = 32 \quad\quad \text{120B: } L = 36,\; E = 128
+$$
+
+**Input embedding:**
+
+$$
+X^0 = E[T], \qquad E \in \mathbb{R}^{201088 \times 2880}
+$$
+
+**For each layer $\ell = 0, \dots, L{-}1$:**
+
+*Pre-attention norm:*
+
+$$
+A^\ell = \operatorname{RMSNorm}(X^\ell)
+$$
+
+*QKV projections with attention bias:*
+
+$$
+Q = A^\ell W_Q + b_Q, \qquad K = A^\ell W_K + b_K, \qquad V = A^\ell W_V + b_V
+$$
+
+where $W_Q \in \mathbb{R}^{2880 \times 4096}$, $W_K, W_V \in \mathbb{R}^{2880 \times 512}$ (64Q/8KV heads, $d_h = 64$). Note: GPT-OSS uses `attention_bias: true` — biases are present in the QKV and output projections.
+
+*YaRN-RoPE applied to Q and K ($\theta = 150000$):*
+
+$$
+Q = \operatorname{RoPE}(Q), \qquad K = \operatorname{RoPE}(K)
+$$
+
+*GQA head repeat — each of the 8 KV heads is shared by 8 query heads:*
+
+$$
+K = \operatorname{repeat}_8(K), \qquad V = \operatorname{repeat}_8(V)
+$$
+
+*Attention type alternates by layer:*
+
+**Even layers ($\ell = 0, 2, 4, \dots$) — full causal attention:**
+
+$$
+S = \frac{Q K^\top}{\sqrt{64}} + M_{\mathrm{causal}}
+$$
+
+**Odd layers ($\ell = 1, 3, 5, \dots$) — sliding window attention, window $w = 128$:**
+
+$$
+S = \frac{Q K^\top}{\sqrt{64}} + M_{\mathrm{sliding}}
+$$
+
+where $M_{\mathrm{sliding}}$ masks out positions $j < t - 128$ in addition to future positions.
+
+*Both layer types:*
+
+$$
+P = \operatorname{softmax}(S), \qquad O = P V
+$$
+
+$$
+\operatorname{Attn}(X^\ell) = O\, W_O + b_O
+$$
+
+*First residual:*
+
+$$
+Z^\ell = X^\ell + \operatorname{Attn}(X^\ell)
+$$
+
+*Pre-MLP norm:*
+
+$$
+M^\ell = \operatorname{RMSNorm}(Z^\ell)
+$$
+
+*MoE FFN — router selects top-4 of $E$ experts:*
+
+$$
+s_i = \operatorname{softmax}(M^\ell w_{r,i}), \qquad i = 1, \dots, E
+$$
+
+$$
+\mathcal{T} = \operatorname{top\text{-}4}(\{s_i\})
+$$
+
+$$
+\operatorname{FFN}_{\mathrm{MoE}}(M^\ell) = \sum_{i \in \mathcal{T}} s_i \cdot \operatorname{FFN}_i(M^\ell)
+$$
+
+*Each expert is a clamped SwiGLU block:*
+
+$$
+G_i = M^\ell W_{\mathrm{gate},i}, \qquad U_i = M^\ell W_{\mathrm{up},i}
+$$
+
+$$
+H_i = \operatorname{clamp}\!\bigl(\operatorname{SiLU}(G_i),\; -7,\; 7\bigr) \odot U_i
+$$
+
+$$
+\operatorname{FFN}_i(M^\ell) = H_i\, W_{\mathrm{down},i}
+$$
+
+where the clamp at $\pm 7$ is the `swiglu_limit` parameter — a training stability constraint specific to GPT-OSS not present in other models.
+
+*Second residual:*
+
+$$
+X^{\ell+1} = Z^\ell + \operatorname{FFN}_{\mathrm{MoE}}(Z^\ell)
+$$
+
+**After all layers:**
+
+$$
+X_{\mathrm{final}} = \operatorname{RMSNorm}(X^L)
+$$
+
+$$
+\mathrm{logits} = X_{\mathrm{final}}\, W_{\mathrm{lm}}, \qquad W_{\mathrm{lm}} \in \mathbb{R}^{2880 \times 201088}
+$$
+
+<Callout title="GPT-OSS notes">
+  **Alternating attention** — the `layer_types` list in `config.json` encodes exactly which layers are `"sliding_attention"` vs `"full_attention"`, alternating from layer 0. This is structurally different from other MoE models: the attention pattern itself varies per layer, not just the FFN. **`swiglu_limit: 7.0`** — clamps the SiLU gate output to $[-7, 7]$ before the element-wise product. Not present in Qwen3 or DeepSeek. **`attention_bias: true`** — GPT-OSS includes bias terms in Q, K, V, and O projections; most models since LLaMA have set `attention_bias: false`. **Active params** — with top-4 of 32 experts (20B) or 128 experts (120B), active params per token are ~3.6B and ~5.1B respectively.
+</Callout>
+
+<Callout title="Further reading">
+  [Architecture block diagrams and comparison table](/blog/cheatsheet-architectures) · [Attention equations and GQA](/blog/cheatsheet-attention) · [KV cache lifecycle](/blog/kv-cache-lifecycle) · [DeepSeek-V3 inference model.py](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py)
+</Callout>

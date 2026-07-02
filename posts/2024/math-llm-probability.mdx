@@ -1,0 +1,119 @@
+---
+title: "Probability for LLMs: Distributions, Entropy, and KL Divergence"
+slug: "math-llm-probability"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 2
+tags: ["math", "probability", "information-theory", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "A language model is a probability distribution over sequences. Training it means pushing that distribution toward the data distribution. The math of how you measure and minimize that gap is what this post covers."
+---
+
+[Part 1](/blog/math-llm-linear-algebra) treated the model as a machine that transforms vectors, but it
+never said what those vectors are *for*. They are for assigning probabilities, because a language model is,
+formally, a probability distribution over sequences of tokens. Using the chain rule of probability, the
+probability it assigns to a whole sequence factors into a product of next-token probabilities.
+
+$$
+p_\theta(x) = \prod_{t=1}^{T} p_\theta(x_t \mid x_{<t})
+$$
+
+Every sequence — every sentence, every document, every continuation — receives a number under this
+distribution, and training is the search for parameters $\theta$ that make $p_\theta(x)$ large for the
+sequences that actually occur in real text and small for the ones that do not.
+
+<SequenceProbabilityChain />
+
+To make that idea precise we need a way to quantify uncertainty, and the foundational quantity is entropy:
+the average surprise of a distribution, where surprise is measured as $-\log p(x)$.
+
+$$
+H(p) = -\sum_x p(x) \log p(x)
+$$
+
+A uniform distribution over a vocabulary of $V$ tokens has entropy $\log V$, the maximum possible — every
+token is equally likely, so each one is maximally surprising — while a distribution that places all its
+mass on a single token has entropy zero, because nothing it produces is ever a surprise. English text sits
+somewhere well below the maximum; Shannon's 1951 estimate put the entropy of English at roughly 10 to 11
+bits per word, and a model's *perplexity* is just the exponential of the cross-entropy it achieves, a
+direct reading of how surprised the model is, on average, by real text.
+
+Entropy measures one distribution against itself; cross-entropy measures the cost of using the wrong one.
+It is the average surprise you incur when the data truly comes from $p$ but you encode it as though it came
+from $q$.
+
+$$
+H(p, q) = -\sum_x p(x) \log q(x)
+$$
+
+This is not a side quantity — it *is* the training loss. The standard language-modeling objective is the
+cross-entropy between the data distribution and the model, which is identical to the negative
+log-likelihood of the data, so minimizing the loss and maximizing the probability the model assigns to real
+text are the same thing said two ways.
+
+$$
+L = -\mathbb{E}_{x \sim p_\text{data}}[\log p_\theta(x)]
+$$
+
+What cross-entropy does not tell you on its own is how *far apart* two distributions are, because it bundles
+in the irreducible entropy of the data. Subtracting that off leaves the Kullback–Leibler divergence, the
+number of extra bits you pay for using $q$ in place of the true $p$.
+
+$$
+\mathrm{KL}(p \,\Vert\, q) = \sum_x p(x) \log \frac{p(x)}{q(x)} = H(p, q) - H(p)
+$$
+
+By Gibbs' inequality this quantity is always at least zero and is zero only when $p$ and $q$ are identical,
+which makes it the natural measure of a gap between distributions — but it is not symmetric, and the
+asymmetry has teeth. Forward KL, $\mathrm{KL}(p \,\Vert\, q)$, is mode-covering: it punishes $q$ for putting
+low probability anywhere $p$ has mass, so it spreads $q$ out to cover everything. Reverse KL,
+$\mathrm{KL}(q \,\Vert\, p)$, is mode-seeking: it lets $q$ ignore parts of $p$ entirely and concentrate on
+one mode. This distinction is not academic — in RLHF the penalty $\beta \cdot \mathrm{KL}(\pi_\theta
+\,\Vert\, \pi_\text{ref})$ keeps the fine-tuned policy from drifting too far from the reference model, and
+which direction of KL you use shapes whether the policy hedges across many behaviors or commits hard to a
+few.
+
+<KLDirectionDemo />
+
+All of this presumes the model can produce a valid distribution in the first place, and the mechanism that
+turns raw logits into probabilities is the softmax. It exponentiates each logit and divides by the sum, so
+the outputs are positive and sum to one.
+
+$$
+p(x_i) = \frac{\exp(z_i)}{\sum_j \exp(z_j)}
+$$
+
+The denominator is the partition function, the normalizer that makes the whole thing a probability
+distribution rather than just a set of scores, and a single knob — temperature — reshapes it: dividing the
+logits by $\tau$ before exponentiating, $p(x_i) = \exp(z_i/\tau) / \sum_j \exp(z_j/\tau)$, makes the
+distribution peakier and more confident as $\tau \to 0$ until it collapses to the argmax of greedy
+decoding, and flatter and more uniform as $\tau \to \infty$ until sampling becomes purely random. This is
+the same softmax that turns attention scores into attention weights, which is why the geometry of [Part
+1](/blog/math-llm-linear-algebra) and the probability of this post are really one continuous story.
+
+<SoftmaxTemperature />
+
+Underneath the next-token prediction is conditional probability, the probability of one event given
+another, defined as the joint divided by the marginal.
+
+$$
+p(A \mid B) = \frac{p(A, B)}{p(B)}
+$$
+
+The model computes exactly this — $p_\theta(x_t \mid x_{<t})$, the next token given the context — and the
+same definition, rearranged, gives Bayes' theorem, $p(\theta \mid \text{data}) \propto p(\text{data} \mid
+\theta)\, p(\theta)$. Maximum likelihood estimation drops the prior and maximizes $p(\text{data} \mid
+\theta)$ alone, which is what plain cross-entropy training does; adding L2 weight regularization quietly
+reintroduces a Gaussian prior on $\theta$ and turns the procedure into maximum-a-posteriori estimation —
+the same weight decay whose correct implementation we will return to in [Part
+3](/blog/math-llm-optimization).
+
+Probability gives us the vocabulary of distributions and a precise way to measure the distance between the
+model and the data. What it does not give us is the machinery to actually close that distance over billions
+of parameters — that machinery is optimization, and it is where [Part 3](/blog/math-llm-optimization) goes
+next.

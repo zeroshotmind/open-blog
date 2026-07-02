@@ -1,0 +1,181 @@
+---
+title: "Cheatsheet: Soft Metrics"
+slug: "cheatsheet-soft-metrics"
+date: "2025-01-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "cheatsheets"
+seriesOrder: 3
+tags: ["cheatsheet", "perplexity", "entropy", "cross-entropy", "nll", "metrics", "evaluation"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Perplexity, negative log-likelihood, entropy, KL divergence, and cross-entropy annotated term-by-term — what each measures, how they relate, and what values to expect during training."
+---
+
+import { Callout } from '@/components/mdx-components'
+
+These metrics appear throughout pre-training, evaluation, and alignment. They are closely related — perplexity is a transformation of NLL, NLL is per-token cross-entropy, entropy is cross-entropy of a distribution with itself — but each has a distinct interpretation. This cheatsheet annotates all of them and shows the relationships explicitly.
+
+---
+
+## Negative log-likelihood (NLL)
+
+$$
+\text{NLL} = -\log P_\theta(x_1, \ldots, x_T) = -\sum_{t=1}^{T} \log P_\theta(x_t \mid x_{<t})
+$$
+
+The negative log-probability the model assigns to the observed sequence. Lower is better — a model that confidently predicts each token correctly has high $P_\theta(x_t \mid x_{<t})$ and thus low NLL.
+
+**Why the chain rule factorisation?** The joint probability of a sequence factors exactly as the product of conditional probabilities — no approximation. An autoregressive LM computes exactly this: it predicts each token given all previous ones.
+
+**Units:** nats (when using natural log) or bits (when using $\log_2$). The convention in PyTorch and most ML papers is nats, which is what `F.cross_entropy` returns.
+
+**NLL vs loss:** what `F.cross_entropy` returns during training is the average NLL per token — so training loss ≈ mean per-token NLL. See [NLLPerplexityCurve](/blog/log-likelihood-to-perplexity).
+
+---
+
+## Cross-entropy
+
+$$
+H(p, q) = -\sum_x p(x) \log q(x)
+$$
+
+The expected negative log-probability under $q$ when samples are drawn from $p$. In LLM training, $p$ is the empirical data distribution (one-hot over the true next token) and $q = \pi_\theta$:
+
+$$
+H(p_{\text{data}}, \pi_\theta) = -\mathbb{E}_{x \sim p_{\text{data}}}\!\left[\log \pi_\theta(x)\right]
+$$
+
+Since $p_{\text{data}}$ is one-hot, this collapses to the NLL of the true token — exactly what `F.cross_entropy` computes. The name "cross-entropy loss" and "NLL loss" refer to the same quantity in language modelling.
+
+**Relation to entropy:**
+
+$$
+H(p, q) = H(p) + D_{\text{KL}}(p \| q)
+$$
+
+Cross-entropy = entropy of $p$ + KL divergence from $p$ to $q$. Minimising cross-entropy is equivalent to minimising KL divergence when $H(p)$ is fixed (which it is, since the data distribution doesn't change during training). See [CrossEntropyDecomposition](/blog/log-likelihood-to-perplexity).
+
+---
+
+## Entropy
+
+$$
+H(p) = -\sum_x p(x) \log p(x) = -\mathbb{E}_{x \sim p}\!\left[\log p(x)\right]
+$$
+
+The expected surprise under the distribution itself — how uncertain $p$ is. A uniform distribution over $V$ tokens has maximum entropy $\log V$; a delta distribution (always the same token) has entropy 0.
+
+**Entropy of an LLM's next-token distribution:**
+
+$$
+H(\pi_\theta(\cdot \mid x_{<t})) = -\sum_{v=1}^{V} \pi_\theta(v \mid x_{<t}) \log \pi_\theta(v \mid x_{<t})
+$$
+
+This is what the PPO/GRPO entropy bonus maximises — it prevents the policy from collapsing to a single deterministic token sequence.
+
+**What entropy values mean in practice:**
+
+| Entropy (nats) | Interpretation |
+|---|---|
+| ~0 | Effectively deterministic — model is certain |
+| ~2–4 | Typical for well-trained LLMs on fluent continuations |
+| ~$\log V$ ≈ 10–11 | Uniform over vocabulary — model has learned nothing |
+
+High entropy at inference = uncertain or incoherent output. Low entropy = confident, possibly repetitive. Entropy collapse during RL training (entropy → 0) is the canonical sign of mode collapse. See [EntropyCollapseDemo](/blog/ppo-full-training-step).
+
+---
+
+## Perplexity
+
+$$
+\text{PPL} = \exp\!\left(\frac{1}{T} \sum_{t=1}^{T} -\log P_\theta(x_t \mid x_{<t})\right) = \exp(\text{mean per-token NLL})
+$$
+
+Perplexity is the exponential of mean per-token NLL. A model with perplexity $k$ is, on average, as uncertain about each token as a uniform distribution over $k$ options.
+
+**Why exponentiate?** NLL accumulates over sequence length — a 1000-token sequence has 1000× the NLL of a single token. Per-token NLL normalises for length, and the exponential converts from log-space back to a "number of equally-likely choices" that has an intuitive interpretation.
+
+**Reading perplexity values:**
+
+| PPL | Interpretation |
+|---|---|
+| ~1 | Perfect prediction — impossible in practice |
+| ~10–20 | Strong language model on its training domain |
+| ~50–100 | Reasonable model or out-of-domain text |
+| ~$V$ ≈ 50,000 | Uniform over vocabulary — random baseline |
+
+**Perplexity is not comparable across tokenisers.** A model with a 32K vocabulary and a model with a 100K vocabulary will have different perplexities on the same text, because the token boundaries are different — each "token" covers a different amount of linguistic content. Always compare perplexity numbers produced by the same tokeniser. See [PerplexityUnitConverter](/blog/log-likelihood-to-perplexity).
+
+**Relationship to NLL:**
+
+$$
+\text{PPL} = e^{\text{NLL}/T} \qquad \Leftrightarrow \qquad \text{NLL} = T \cdot \log(\text{PPL})
+$$
+
+A drop in training loss of 0.1 nats/token corresponds to a multiplicative change in perplexity of $e^{-0.1} \approx 0.905$ — roughly a 10% reduction. Early in training (high loss), the same absolute loss drop produces much larger perplexity reductions than late in training (low loss).
+
+---
+
+## KL divergence
+
+$$
+D_{\text{KL}}(p \| q) = \sum_x p(x) \log \frac{p(x)}{q(x)} = \mathbb{E}_{x \sim p}\!\left[\log \frac{p(x)}{q(x)}\right]
+$$
+
+The expected log-ratio of $p$ to $q$ under samples from $p$. Measures how much information is lost when using $q$ to approximate $p$. Always $\geq 0$; equals 0 iff $p = q$.
+
+**KL is asymmetric:** $D_{\text{KL}}(p \| q) \neq D_{\text{KL}}(q \| p)$ in general. The direction matters:
+
+- **Forward KL** $D_{\text{KL}}(p \| q)$: penalises $q$ for assigning zero probability anywhere $p$ has mass — $q$ must *cover* all of $p$'s support. Used in GRPO's KL penalty because it prevents the policy from ignoring modes of the reference.
+- **Reverse KL** $D_{\text{KL}}(q \| p)$: penalises $q$ for putting mass anywhere $p$ does not — $q$ tends to *seek* a mode of $p$. Used in variational inference (ELBO).
+
+See [KLDirectionDemo](/blog/math-llm-probability) for an interactive comparison.
+
+**KL from reference in RL training:**
+
+$$
+D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) = \mathbb{E}_{o \sim \pi_\theta}\!\left[\log \pi_\theta(o) - \log \pi_{\text{ref}}(o)\right]
+$$
+
+In practice estimated per-token and averaged. A healthy RL run keeps this below ~5 nats; above ~10 is a sign of reward hacking in progress. See [KLPenaltyTradeoff](/blog/llm-alignment-pipeline).
+
+---
+
+## Bits per character / bits per byte
+
+$$
+\text{BPB} = \frac{\text{NLL (nats)}}{\ln 2 \cdot \text{num\_bytes}} = \frac{\text{NLL (bits)}}{\text{num\_bytes}}
+$$
+
+BPB (bits per byte) normalises by the number of UTF-8 bytes rather than the number of tokens, making it comparable across tokenisers. A model predicting English text well achieves roughly 1.0–1.3 BPB. Shannon estimated the entropy of written English at about 1.0 bit/character — BPB near 1.0 means the model is approaching the theoretical limit of compressibility for that text.
+
+BPC (bits per character) is the same metric when normalising by character count rather than byte count — equivalent for ASCII, different for multi-byte Unicode.
+
+---
+
+## How they relate
+
+$$
+\underbrace{H(p, q)}_{\text{cross-entropy}} = \underbrace{H(p)}_{\text{entropy of data}} + \underbrace{D_{\text{KL}}(p \| q)}_{\text{model gap}}
+$$
+
+$$
+\text{PPL} = e^{H(p_{\text{data}}, \pi_\theta) / T}
+$$
+
+$$
+\text{NLL} = T \cdot H(p_{\text{data}}, \pi_\theta) \quad \text{(summed, not averaged)}
+$$
+
+$$
+\text{BPB} = H(p_{\text{data}}, \pi_\theta) / \ln 2 \quad \text{(in bits, per byte)}
+$$
+
+A single forward pass computes the cross-entropy loss. From that scalar you can immediately derive perplexity (exponentiate), NLL (multiply by sequence length), and BPB (divide by $\ln 2$ and by byte count). They are all the same quantity, just scaled and transformed for different readability purposes.
+
+<Callout title="Further reading">
+  [NLL to perplexity walkthrough](/blog/log-likelihood-to-perplexity) · [KL divergence explorer](/blog/math-llm-loss-functions) · [Entropy in PPO](/blog/ppo-full-training-step) · [Probability and information theory](/blog/math-llm-probability)
+</Callout>

@@ -1,0 +1,155 @@
+---
+title: "Circuits: How Transformers Implement Algorithms"
+slug: "interp-circuits"
+summary: "How to identify the minimal subgraph of attention heads and MLP layers that implements a specific behavior — and what we've learned from the indirect object identification circuit in GPT-2."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - mechanistic-interpretability
+  - circuits
+  - activation-patching
+  - indirect-object-identification
+  - transformers
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "mechanistic-interpretability"
+seriesOrder: 5
+---
+
+GPT-2 small reliably completes "When Mary and John went to the store, John gave a drink to ___" with "Mary." The model has 12 layers, 12 attention heads per layer, and 117 million parameters. A natural question is: which of those 144 attention heads actually do the work? Wang et al. (2022) found that a handful of heads — fewer than 26 — account for nearly all the performance on this task. The rest are irrelevant, or actively harmful when their contribution is removed. This is a circuit: a minimal subgraph of the model that implements a specific algorithm.
+
+The circuits framework treats a transformer not as a monolithic function but as a wiring diagram — a directed graph of components, each transforming information, connected by the residual stream. Mechanistic interpretability's goal is to reverse-engineer that wiring diagram, behavior by behavior, until the full diagram is understood. The indirect object identification (IOI) task became the canonical example because it is simple enough to reverse-engineer completely and complex enough to require multiple interacting components.
+
+## What is a circuit?
+
+Formally, a circuit is a pair $(S, E)$ where $S$ is a set of model components (attention heads, MLP layers, embedding operations) and $E$ is a set of directed edges specifying which components' outputs feed into which other components' inputs. The circuit should satisfy two properties:
+
+**Faithfulness**: replacing the outputs of all components not in $S$ with their mean activations (over the data distribution) should not significantly degrade the model's performance on the target task. The circuit alone reproduces the behavior.
+
+**Minimality**: no proper subset of $S$ is faithful. Every component in the circuit is necessary; remove any one and performance drops.
+
+Real circuits rarely satisfy both properties perfectly. Models often have redundant components — multiple heads doing similar jobs as a robustness mechanism — and the definition of "significant degradation" is a threshold choice. In practice, researchers look for circuits that are both tight (small $|S|$) and account for a large fraction of the performance gap between the model and a random baseline.
+
+The broader circuits hypothesis, articulated in Elhage et al. (2021), is that transformers compose many such sub-circuits: the full model is a superposition of circuits implementing primitive operations (copying, pattern matching, inhibition, counting), and complex behaviors emerge from their interaction through the residual stream.
+
+## The IOI circuit
+
+
+<IOICircuitWalkthrough />
+
+The IOI task probes a specific competency: identifying which name in a sentence appears only once (the "indirect object") versus twice (the "subject"). Given "When Mary and John went to the store, John gave a drink to ___," the model must:
+
+1. Detect that "John" appears at two positions in the sequence.
+2. Detect that "Mary" appears at only one position.
+3. Move "Mary" to the output position.
+
+Wang et al. (2022) identified three functional groups of heads:
+
+**Duplicate token heads** (e.g., heads 0.1, 0.10, 3.0) attend from the second occurrence of a repeated name back to its first occurrence. They write positional information about the earlier occurrence into the residual stream at the later position, flagging "this token is a repeat."
+
+**S-inhibition heads** (e.g., heads 7.3, 7.9, 8.6, 8.10) read the output of the duplicate token heads and suppress the repeated name at the "to ___" output position. When they see that "John" is flagged as a repeat, they suppress the signal that would otherwise copy "John" to the output.
+
+**Name mover heads** (e.g., heads 9.6, 9.9, 10.0) implement a copying operation: they attend to names in the context and copy them to the output position. Without inhibition, they would copy the highest-salience name, which happens to be "John" (it appears twice, boosting its attention weight). With S-inhibition suppressing the "John" signal, the name mover heads copy "Mary" instead.
+
+There are additional supporting components — **induction heads** that assist with pattern matching, **backup name mover heads** that provide partial redundancy — but the three-group structure captures the essential algorithm. The circuit explains roughly 90% of the logit difference between the correct ("Mary") and incorrect ("John") predictions on the IOI distribution.
+
+The fact that this algorithm is legible is non-trivial. The same model, on the same hardware, under the same training procedure, learned to implement name disambiguation with a recognizable structure: detect repeats, inhibit them, copy the remainder. The circuit did not have to look this way; gradient descent could have produced any function with the same input-output behavior. That it is both correct and interpretable at the mechanism level is the empirical foundation of the circuits research program.
+
+## Activation patching: the core tool
+
+
+<ActivationPatchingDemo />
+
+Identifying which components matter requires a method that provides causal, not just correlational, evidence. The tool is **activation patching** (also called causal tracing or causal intervention).
+
+The setup requires two runs:
+- A **clean run** on an input where the model behaves correctly (e.g., the Mary/John sentence produces "Mary").
+- A **corrupted run** on a modified input where the model fails (e.g., names are replaced with random tokens, producing an incorrect output).
+
+For each component $c$ in the model, you run a **patched forward pass**: execute the corrupted run normally, but at component $c$, replace the corrupted activation with the clean activation. Then measure performance.
+
+Define the logit difference $\text{LD}$ as the log probability of the correct answer minus the log probability of the incorrect answer. The **patch effect** at component $c$ is:
+
+$$\Delta_c = \text{LD}(\text{clean}) - \text{LD}(\text{patch at } c)$$
+
+Wait — the convention matters. More commonly, patch effect is reported as how much of the clean behavior is restored by the patch:
+
+$$\text{recovery}_c = \frac{\text{LD}(\text{patch at } c) - \text{LD}(\text{corrupted})}{\text{LD}(\text{clean}) - \text{LD}(\text{corrupted})}$$
+
+A recovery of 1 means that patching component $c$ alone fully restores the clean behavior; component $c$ is causally sufficient. A recovery near 0 means the component carries no causally relevant information for the task.
+
+The overhead is one forward pass per component, per position. For a 12-layer, 12-head-per-layer model on a 20-token sequence, this is $O(12 \times 13 \times 20)$ forward passes — expensive but tractable. For large models (70B+), activation patching requires careful implementation with activation caching.
+
+Meng et al. (2022) applied this method (under the name "causal tracing") to factual recall — "The Eiffel Tower is in ___" → "Paris" — and found that factual associations are stored predominantly in MLP layers at the last-subject-token position. This led directly to the ROME editing method, which patches factual associations by modifying a targeted MLP weight matrix.
+
+## Path patching: precision at a cost
+
+Activation patching identifies that a component matters, but not *why* it matters or which of its information sources it depends on. A head might carry relevant information that it received from a different head, or from the embedding, or from its own previous-layer residual. To identify the information-flow path, you need **path patching**.
+
+A path is a directed edge from the output of component $A$ to the input of component $B$ — specifically, the contribution of $A$'s output that enters $B$'s computation. Patching a path means: run the corrupted forward pass, but replace only the input to $B$ that arrived from $A$ with the corresponding clean value (holding all other inputs to $B$ fixed).
+
+This is mechanistically cleaner than node patching because it isolates individual communication channels. The IOI analysis used path patching to establish that S-inhibition heads receive their "this name is repeated" signal specifically from the duplicate token heads at the subject positions, not from the embedding or earlier MLP layers.
+
+The computational cost is higher: each path patch requires re-running the model with a carefully constructed activation hook. Automated tools for path patching (such as `transformer_lens` with hook functions) have made this practical, but the number of possible paths scales as $O(L^2 H^2 T^2)$ in the number of layers, heads, and token positions, so in practice you patch a focused set of candidate paths rather than exhaustively searching.
+
+## Automatic circuit discovery
+
+Manual circuit analysis requires a researcher to hypothesize which components matter, run activation patches to test those hypotheses, iterate on the circuit design, and verify faithfulness and minimality. This is slow and does not scale.
+
+Conmy et al. (2023) introduced ACDC (Automatic Circuit DisCovery), which automates the activation patching loop. The algorithm starts with the full model (all edges present), iterates through edges from output to input layers, and prunes any edge whose removal changes task performance by less than a threshold $\tau$. The result is a sparse circuit graph obtained without human-directed hypothesis testing.
+
+ACDC successfully recovered the known IOI circuit and discovered circuits for several other tasks (greater-than comparisons, docstring completion, induction) that align with manually discovered circuits. The main limitation is computational cost: pruning requires many forward passes, and the greedy top-down algorithm may miss some optimal circuits.
+
+Edge Attribution Patching (EAP) approximates path patching with gradients rather than forward passes. Instead of running a separate forward pass for each path, you compute $\partial \mathcal{L} / \partial a_{A \to B}$ — the gradient of the task loss with respect to the activation flowing along edge $A \to B$ — and use this as a proxy for the path patch effect. This reduces the number of forward passes from $O(E)$ (one per edge) to $O(1)$ (a single backward pass), making it practical for large models and long sequences, at the cost of some approximation error.
+
+## A taxonomy of discovered circuits
+
+The circuits literature has characterized a small but coherent set of recurring computational primitives.
+
+**Induction circuits** (Olsson et al., 2022) are two-head compositions that implement the pattern "if token A was followed by token B earlier in the context, then predict B after seeing A again." A first head ("previous token head") shifts a copy of each token's representation one position forward; a second head ("induction head") attends back to positions where the current token appeared previously, weighted by the previous-token-head's output. This is the mechanism underlying in-context few-shot learning.
+
+**Greater-than circuits** (Hanna et al., 2023) implement ordinal comparison in GPT-2 small: given "From 1986 to 19__," the model predicts years greater than 86. The circuit involves MLP neurons that activate specifically for decades above a threshold, composed with attention heads that read the relevant year tokens.
+
+**Docstring circuits** implement template completion: given an incomplete Python docstring, predict the argument name. The circuit closely mirrors the IOI structure — a copying mechanism guided by inhibition of already-mentioned arguments.
+
+The common structural theme across all these cases is small circuits of recognizable function: heads that copy, heads that inhibit, MLP neurons that implement threshold functions. The model is not a uniform mass of interacting parameters; it is a composition of small, legible computational units.
+
+## Faithfulness, completeness, and the limits of circuit analysis
+
+
+<FaithfulnessMinimality />
+
+The practical difficulty with circuits is that "faithfulness" depends heavily on the choice of corrupted baseline. Mean ablation (replacing a component's output with its average over the dataset) is the most common choice, but it conflates "the component is doing nothing useful" with "the component is doing something that averages to zero." Patching with noisy activations or random inputs changes the measured recovery.
+
+Completeness is also fragile to task definition. The IOI circuit was discovered on a specific template ("When NAME1 and NAME2 went to the store, NAME2 did X to ___"). Whether the same circuit generalizes to less stylized indirect object constructions — "Mary told John to pass the salt to ___" — is an empirical question, and in practice circuits found on narrow task prompts often do not transfer cleanly to the full task distribution.
+
+Superposition complicates the picture further. If individual components are polysemantic, then a circuit's behavior on one task may entangle with its behavior on other tasks. Ablating an MLP layer to test its role in the IOI circuit may inadvertently ablate its role in dozens of other computations that happen to use the same neurons. The circuit paradigm implicitly assumes components with relatively clean functional roles, and that assumption is at best an approximation.
+
+Scaling is the largest open question. Almost all published circuit analysis is on GPT-2 small (117M parameters) or similarly small models. There are theoretical reasons to expect similar circuit structure in larger models — induction heads have been found in models up to 13B parameters — but comprehensive circuit-level analysis of GPT-4 or Claude 3 does not exist. Whether the same small-circuit picture holds, or whether larger models distribute computation more diffusely across components, is genuinely unknown.
+
+## What circuits buy for alignment
+
+The value of circuit analysis goes beyond academic curiosity. If you know which heads implement a behavior, you can:
+
+**Localize edits.** Model editing methods (ROME, MEMIT) use causal tracing to find where to write a fact. Without that localization, you would have to modify all weights equally, destroying unrelated behavior.
+
+**Interpret failures.** When a model fails at a task, activation patching can identify whether the failure is in information encoding (the relevant feature is not in the residual stream), information routing (the feature exists but is not being read by the right head), or computation (the feature is read but the wrong operation is applied). These correspond to different interventions.
+
+**Verify safety properties.** If a behavior known to be undesirable is implemented by an identifiable circuit, you can test whether that circuit is active before responding, or surgically ablate it. This is more precise than fine-tuning, which affects the whole network.
+
+**Predict generalization.** A circuit that is compositionally simple (a handful of heads performing recognizable operations) is more likely to generalize cleanly than one that appears to rely on large fractions of the network with no interpretable structure.
+
+---
+
+**References**
+
+- Elhage et al. (2021). *A Mathematical Framework for Transformer Circuits*. Transformer Circuits Thread. [transformer-circuits.pub/2021/framework](https://transformer-circuits.pub/2021/framework)
+- Wang et al. (2022). *Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small*. arXiv:2211.00593.
+- Olsson et al. (2022). *In-context Learning and Induction Heads*. arXiv:2209.11895.
+- Meng et al. (2022). *Locating and Editing Factual Associations in GPT* (ROME). arXiv:2202.05262.
+- Conmy et al. (2023). *Towards Automated Circuit Discovery for Mechanistic Interpretability* (ACDC). arXiv:2304.14997.

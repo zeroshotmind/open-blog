@@ -1,0 +1,122 @@
+---
+title: "Classifier-Free Guidance: Steering Diffusion with a Signal"
+slug: "diffusion-cfg"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "diffusion-models"
+seriesOrder: 5
+tags: ["diffusion", "classifier-free-guidance", "conditioning", "generative-models"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Conditioning a diffusion model on text gives you text-to-image generation. Classifier-free guidance makes that conditioning much stronger — at the cost of some diversity."
+---
+
+A text-conditioned diffusion model that you train naively will disappoint you, and the way it
+disappoints is specific. The [latent diffusion post](/blog/diffusion-latent) showed how a caption enters
+the network: the prompt is encoded once and the U-Net's cross-attention layers read from it at every
+denoising step, so the conditioning signal $c$ is available everywhere it could matter. Yet when you
+sample, the images come out only loosely related to the prompt — recognizably in the right
+neighborhood, but soft, generic, hedged. Ask for "a red cube on a blue table" and you get something
+cube-adjacent on a surface-adjacent thing, the model spreading its bets rather than committing. The
+conditioning is present; it is just not *strong* enough.
+
+The reason is baked into what the model was trained to do. A diffusion model fits $p(x \mid c)$ by
+maximum likelihood, and maximum likelihood rewards covering the data — a model that puts a little
+probability everywhere the real images live pays a smaller penalty than one that commits hard and
+occasionally misses. So the learned conditional distribution is broad, and broad means the typical
+sample sits in a high-density but unremarkable region where the prompt is satisfied only on average.
+What you actually want at generation time is not a typical sample from $p(x \mid c)$ but a sample from
+a *sharpened* version of it, one that concentrates on the images most strongly characteristic of $c$.
+Guidance is the machinery for that sharpening.
+
+The first version of it came from an external classifier. **Classifier guidance**
+([Dhariwal & Nichol, 2021](/papers/diffusion-beats-gans)) starts from Bayes' rule applied to the score — recall from the
+[score-matching post](/blog/diffusion-score-matching) that diffusion's learned object is
+$\nabla_{x_t} \log p(x_t)$, and the conditional score decomposes cleanly.
+
+$$
+\nabla_{x_t} \log p(x_t \mid y) = \nabla_{x_t} \log p(x_t) + \nabla_{x_t} \log p(y \mid x_t)
+$$
+
+The unconditional score is what the base model already estimates, and the second term is the gradient
+of a classifier that reads the noisy image $x_t$ and reports how class-$y$ it looks, so you can buy a
+stronger conditional by training that classifier separately and adding its gradient — scaled by a
+guidance weight $w$ — to the sampler's drift.
+
+$$
+\tilde{s}(x_t \mid y) = \nabla_{x_t} \log p(x_t) + w \, \nabla_{x_t} \log p(y \mid x_t)
+$$
+
+Pushing $w$ above one over-counts the classifier term, steering each step harder toward regions the
+classifier is confident belong to $y$ and producing samples that adhere far more tightly to the
+condition than the base model alone would. The price is a second model that nobody wanted to train: a
+classifier that operates on *noisy* images across every noise level, which cannot be an off-the-shelf
+ImageNet network and must be retrained from scratch for every new kind of conditioning you invent —
+class labels today, text embeddings tomorrow, segmentation maps after that.
+
+**Classifier-free guidance** ([Ho & Salimans, 2021](/papers/classifier-free-guidance)) gets the same steer without the classifier by
+noticing that the extra term is implicit in the difference between two things the diffusion model can
+already produce. Rearrange the Bayes decomposition and the implicit classifier gradient is just the
+conditional score minus the unconditional one, $\nabla_{x_t} \log p(y \mid x_t) =
+\nabla_{x_t} \log p(x_t \mid y) - \nabla_{x_t} \log p(x_t)$, so if a single network can evaluate both
+scores there is no separate classifier to train. You arrange exactly that during training by randomly
+dropping the conditioning: with some probability $p$ — around ten percent works — you replace the real
+caption embedding with a fixed null token $\varnothing$, so the same weights learn both the conditional
+noise prediction $\epsilon_\theta(x_t, c)$ and the unconditional $\epsilon_\theta(x_t, \varnothing)$.
+At sampling time you run the network twice and extrapolate along the line from unconditional to
+conditional.
+
+$$
+\tilde{\epsilon}(x_t, c) = \epsilon_\theta(x_t, \varnothing) + w \, \big( \epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \varnothing) \big)
+$$
+
+The bracket is the direction the caption *adds* to the prediction, and $w$ controls how far past the
+plain conditional model you travel along it.
+
+<GuidanceScaleExplorer />
+
+Reading off the value of $w$ tells you the whole behavior. At $w = 0$ the conditional term vanishes and
+you sample unconditionally, ignoring the prompt; at $w = 1$ the expression collapses to
+$\epsilon_\theta(x_t, c)$, the ordinary conditional model with no sharpening; and at $w > 1$ you
+*extrapolate* beyond the conditional, amplifying whatever the caption contributed and suppressing
+everything the unconditional model would have produced on its own. In practice the useful range for
+text-to-image is roughly $w = 7$ to $10$, which yields crisp, prompt-faithful images, while pushing to
+$w = 15$ and beyond keeps tightening adherence until the samples turn garish — oversaturated, contorted,
+unmistakably aligned to the prompt and unmistakably unnatural — because nothing in the objective
+promised that the sharpened distribution stays on the manifold of real images.
+
+That failure is the visible end of a tradeoff that is present at every setting. Raising $w$ trades
+diversity for fidelity: the sampler is pulled toward the mode of the conditional distribution, so two
+runs with the same prompt and different seeds drift toward the same "platonic" rendering of the caption
+rather than exploring the genuinely different images that all satisfy it. Low guidance gives you variety
+and weak prompts; high guidance gives you obedience and sameness; the right operating point depends on
+whether you are generating one hero image or a varied gallery, and there is no setting that escapes the
+exchange because the sharpening that creates fidelity is the same operation that collapses diversity.
+
+<FidelityDiversityTradeoff />
+
+The construction also generalizes past a single null token, and the generalization is the feature
+everyone now uses without naming it. Replace $\varnothing$ with a second, *negative* embedding
+$c_\text{neg}$ — "blurry, extra fingers, watermark" — and the same extrapolation now points away from
+$c_\text{neg}$ and toward the positive prompt $c_\text{pos}$.
+
+$$
+\tilde{\epsilon} = \epsilon_\theta(x_t, c_\text{neg}) + w \, \big( \epsilon_\theta(x_t, c_\text{pos}) - \epsilon_\theta(x_t, c_\text{neg}) \big)
+$$
+
+<NegativePromptingDemo />
+
+Because the baseline is no longer the generic unconditional model but a specific thing you want to
+avoid, every step actively repels the named failure modes while pulling toward the prompt, which is why
+negative prompting is so effective at scrubbing artifacts and unwanted styles that are otherwise hard to
+forbid with positive words alone.
+
+Classifier-free guidance is the step that turns conditioning from a soft suggestion the model is free to
+half-ignore into a hard steer you control with a single knob, and it is the reason text-to-image went
+from "vaguely on topic" to "follows the prompt." It does all of this without touching the backbone that
+does the predicting. The next part changes that backbone: it replaces the U-Net that every model so far
+has used with a transformer, and finds that diffusion scales with size the way language models do — that
+is [DiT](/blog/diffusion-dit).

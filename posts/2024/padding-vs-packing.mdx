@@ -1,0 +1,115 @@
+---
+title: "What Actually Happens to Padding Tokens During LLM Pretraining"
+slug: "padding-vs-packing"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+tags: ["training", "data", "systems"]
+authors:
+  - name: "Admin"
+    orcid: "0009-0009-0632-6830"
+summary: "Padding wastes GPU compute. Sequence packing eliminates it — but introduces cross-document attention contamination unless you explicitly mask it. Here's what the attention mask actually looks like."
+---
+
+Take a batch of four sequences with lengths $[512, 128, 256, 64]$. To stack them into a single tensor
+the framework pads each one out to the longest, $512$, filling the gaps with a reserved pad token. The
+real tokens number $512 + 128 + 256 + 64 = 960$; the padded batch holds $4 \times 512 = 2048$
+positions. Roughly 53% of the positions in this batch are padding, and the GPU runs attention and
+feed-forward math on every one of them. Scale that ratio across a trillion-token training run and you
+are spending hundreds of billions of FLOPs producing activations you immediately throw away.
+
+## What the pad token does and doesn't touch
+
+<PaddingWasteDemo />
+
+Two separate masks govern a pad token, and conflating them is the usual source of confusion. The
+**loss mask** zeros out pad positions so they contribute no gradient — the model is never trained to
+predict a pad token, and a pad token's own (garbage) prediction never enters the loss. That part is
+unambiguous.
+
+The **attention mask** is where the misconception lives. In many standard implementations padding
+tokens are *not* blocked from the attention computation: a pad position still has a query, still
+attends, and can still be attended to. What saves correctness is the causal mask. Under causal
+attention a real token at position $t$ can only see positions $\le t$, and because pad tokens are
+appended at the *end* of each sequence, every real token sits before every pad token and therefore
+never attends to one. The pad tokens attend to real tokens and to each other, produce hidden states,
+and those states are then discarded by the loss mask. Quality is fine; compute is wasted. The padding
+problem is an efficiency problem, not a correctness one.
+
+## Packing: stop padding, start concatenating
+
+Sequence packing removes the waste by abandoning one-sequence-per-row. Instead you concatenate
+documents end to end into a single stream and cut it at the context length, so a packed row looks like
+$[\text{doc}_1 \mid \text{doc}_2 \mid \text{doc}_3 \mid \dots]$ filled almost exactly to `max_len`
+with real tokens and essentially zero padding. One detail is mandatory: the position IDs must **reset
+to 0 at each document boundary** rather than counting monotonically across the row, because RoPE and
+other positional schemes encode distance, and you do not want the model to believe the first token of
+$\text{doc}_2$ is thousands of positions after the start of $\text{doc}_1$.
+
+## The contamination that packing introduces
+
+<PackingContaminationDemo />
+
+Packing trades the padding problem for a subtler one. The standard causal mask lets token $t$ attend
+to every earlier position $0 \dots t-1$, and in a packed row those earlier positions include the
+entire previous document.
+
+$$
+\text{mask}[i, j] = \begin{cases} 1 & j \le i \\ 0 & j > i \end{cases}
+$$
+
+So the first token of $\text{doc}_2$ attends across the boundary into all of $\text{doc}_1$, treating
+an unrelated document as its prefix. This is spurious context the model never sees at inference, where
+a prompt arrives clean with no random preceding document bolted to its front. Train on enough of it
+and the model learns to condition on cross-document junk, degrading exactly the behavior you care
+about.
+
+## The fix: mask attention to document boundaries
+
+<AttentionMaskComparison />
+
+The repair is to forbid attention from crossing into a different document by intersecting the causal
+condition with a same-document condition, using a `doc_id` array that labels which document each
+position belongs to.
+
+$$
+\text{mask}[i, j] = \big(j \le i\big) \;\wedge\; \big(\text{doc\_id}[i] = \text{doc\_id}[j]\big)
+$$
+
+A token may attend to an earlier position only when that position is causal *and* lives in the same
+document. FlashAttention's varlen mode implements this without ever materializing the full mask: you
+pass `cu_seqlens`, the cumulative-sequence-lengths array marking each document's start offset, and the
+kernel restricts every query's attention to its own segment.
+
+## What the mask looks like
+
+Make it concrete with a packed row of two documents, $\text{doc}_1$ of length 3 and $\text{doc}_2$ of
+length 4, for 7 positions total. A plain causal mask is a single lower-triangular block over all 7
+positions, letting $\text{doc}_2$'s rows reach back into $\text{doc}_1$'s columns. The document-masked
+version is **block-diagonal**: a $3 \times 3$ lower-triangular block for $\text{doc}_1$ in the
+top-left, a $4 \times 4$ lower-triangular block for $\text{doc}_2$ in the bottom-right, and zeros
+everywhere off the diagonal so the two documents are attention-isolated.
+
+$$
+\underbrace{\begin{bmatrix}
+1 & 0 & 0 & 0 & 0 & 0 & 0 \\
+1 & 1 & 0 & 0 & 0 & 0 & 0 \\
+1 & 1 & 1 & 0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 1 & 0 & 0 & 0 \\
+0 & 0 & 0 & 1 & 1 & 0 & 0 \\
+0 & 0 & 0 & 1 & 1 & 1 & 0 \\
+0 & 0 & 0 & 1 & 1 & 1 & 1
+\end{bmatrix}}_{\text{block-diagonal: no cross-document attention}}
+$$
+
+The top-right $3 \times 4$ quadrant is all zeros — that quadrant is exactly the cross-document
+attention the plain causal mask would have allowed, and zeroing it is the entire fix.
+
+## The payoff
+
+For corpora dominated by short documents — instruction-tuning examples, Q&A pairs, chat turns — most
+sequences are far shorter than the context window, so padding dominates and packing moves effective
+GPU utilization from around 60% to roughly 98%. You stop paying for thrown-away pad activations, and as
+long as the attention mask is block-diagonal you pay nothing in quality for it. Packing without the
+document mask is the trap: you recover the compute and quietly corrupt the model's notion of context.

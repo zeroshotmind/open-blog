@@ -1,0 +1,83 @@
+---
+title: "Continuous Batching: How vLLM Serves Thousands of Requests"
+slug: "inference-continuous-batching"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 2
+tags: ["inference", "vllm", "batching", "systems"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Static batching wastes GPU capacity whenever sequences finish at different times. Continuous batching fixes this by treating the decode loop as a queue — adding new requests the moment a slot opens up."
+---
+
+Decode throughput climbs with batch size, so the entire game in serving is keeping the batch full. Static batching cannot do this: it locks a set of requests together at the start and releases them together at the end, and real requests do not finish together. The gap between a batch that empties gradually and a GPU that bills you continuously is where most naive serving throughput goes to die.
+
+## What static batching wastes
+
+
+<StaticVsContinuousBatching />
+
+In static batching a batch of $B$ requests begins as a unit and ends as a unit. If request 1 stops after 20 tokens while request 2 runs to 200, request 1's slot spends 180 decode steps processing a padding token that produces nothing — the GPU is paid for compute that lands on the floor. Utilization collapses exactly when sequence lengths vary, and in production they always vary.
+
+The waste has a closed form. For sequence lengths drawn uniformly from $[20, 200]$, the batch runs until its longest member finishes, so the fraction of useful slot-steps is the mean length over the max length,
+
+$$
+\frac{\mathbb{E}[\text{length}]}{\max\ \text{length}} = \frac{110}{200} = 55\%,
+$$
+
+meaning nearly half the GPU's decode cycles generate padding. Widen the length distribution, as instruction-following traffic does, and the figure gets worse.
+
+## Iteration-level scheduling
+
+
+<BatchUtilizationTimeline />
+
+Continuous batching, introduced in Orca (Yu et al., 2022), removes the assumption that a batch is an atomic unit. The scheduler intervenes at every decode step rather than every request: after each token is generated it checks which sequences have finished — hit an end-of-sequence token or their length cap — and immediately replaces them with requests waiting in the queue. The batch's membership churns on every iteration instead of surviving until its slowest sequence drains.
+
+What makes this free is the structure of decode itself. The model already processes exactly one token per sequence per step, so a sequence joining mid-batch adds no wasted work — the computation was per-token, never per-sequence. The newcomer first needs its prompt prefilled to populate its cache, and a real scheduler interleaves or chunks that prefill so it does not stall the in-flight decode steps, but once it is warm it simply occupies a slot that would otherwise have been padding.
+
+## The loop in miniature
+
+Stripped to its core, the scheduler is a queue feeding a fixed-width decode step:
+
+```python
+running = []      # sequences currently in decode
+waiting = Queue() # incoming requests
+
+while True:
+    # Evict finished sequences, admit new ones
+    running = [s for s in running if not s.finished]
+    while len(running) < max_batch and not waiting.empty():
+        seq = waiting.get()
+        seq.prefill()           # populate KV cache
+        running.append(seq)
+
+    # One decode step for all running sequences
+    next_tokens = model.decode_step(running)
+    for seq, token in zip(running, next_tokens):
+        seq.append(token)
+        seq.finished = (token == EOS or len(seq) >= max_len)
+```
+
+vLLM's real scheduler wraps this with preemption — evicting a sequence and recomputing or swapping its cache when memory runs short — plus chunked prefill and priority queues, but the admit-evict-step rhythm at the center is exactly this.
+
+## Why the KV cache, not compute, caps concurrency
+
+
+<KVCacheCalc2 />
+
+The ceiling on `max_batch` is not arithmetic; it is memory. Every running sequence holds a KV cache proportional to its current length,
+
+$$
+\text{bytes} = 2 \times n_\text{layers} \times n_\text{kv-heads} \times d_\text{head} \times \ell \times \text{dtype\_size},
+$$
+
+and for LLaMA-3-8B (32 layers, 8 KV heads, $d_\text{head}=128$, fp16) this works out to $2 \times 32 \times 8 \times 128 \times 2 \approx 128\ \text{KB}$ per token. An 80 GB A100 spends $\sim 16$ GB on weights and leaves $\sim 64$ GB for cache, room for roughly 500K tokens in flight; at an average sequence length of 512 tokens that is on the order of a thousand concurrent sequences before the cache, not the compute, forces the scheduler to start evicting. How vLLM packs that cache without fragmenting it — treating it as paged virtual memory rather than contiguous slabs — is the subject of [PagedAttention](/papers/pagedattention), and it is what makes the thousand-sequence figure achievable in practice rather than on paper.
+
+## What it buys, in practice
+
+The payoff shows up directly in sustained tokens per second. As an illustrative example, a well-tuned vLLM serving LLaMA-3-8B on a single A100 might turn roughly 8,000 TPS under static batching at batch 32 and sequence length 512 into roughly 18,000 TPS under continuous batching on the same hardware (illustrative; actual gains vary by model size and hardware). The $2.25\times$ does not come from a faster kernel or a smaller model; it comes entirely from never letting a finished sequence's slot sit idle behind a slower neighbor.

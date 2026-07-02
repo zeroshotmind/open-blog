@@ -1,0 +1,133 @@
+---
+title: "Open Problems in Mechanistic Interpretability"
+slug: "interp-open-problems"
+summary: "Faithfulness vs. plausibility, scaling to frontier models, the composition problem, automated interpretability, and what it would take to actually understand a large language model."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - mechanistic-interpretability
+  - open-problems
+  - ai-safety
+  - interpretability
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "mechanistic-interpretability"
+seriesOrder: 8
+---
+
+The field of mechanistic interpretability has produced genuine results: induction heads, the IOI circuit, knowledge neurons, sparse autoencoder features that cleanly decompose concepts. These are not artifacts. They are reproducible, they predict model behavior under interventions, and they have already informed practical techniques like knowledge editing and activation steering. The honest question is what remains unsolved — and whether the unsolved parts are merely hard or whether they require conceptual frameworks that don't yet exist.
+
+## The Scaling Gap
+
+<ScalingGapDemo />
+
+Most published circuit-level work is on GPT-2 small (117M parameters). The IOI circuit (Wang et al., 2022), the Docstring circuit (Heimersheim & Janiak, 2023), the indirect object identification work that defined the methodology — all on a model small enough to enumerate heads and approximate the full computation graph. The number of attention heads in GPT-2 small is 96 (12 layers × 8 heads). GPT-3 has 9,600 (96 layers × 100 heads). Llama 3 405B has over 50,000 attention heads.
+
+The combinatorial problem is not just scale; it is composition. Circuits in large models don't just have more components — they are likely to have more cross-layer interactions, more shared subcomponents, and more context-dependent routing. A circuit that implements subject-object agreement in GPT-2 small may be implemented by a different set of components in each 7B model, and there may be redundant implementations that activate under different conditions.
+
+Elhage et al. (2022) demonstrate in "In-context Learning and Induction Heads" that induction heads appear consistently across model sizes — they are among the few circuits with known universal presence. But induction is a simple pattern-completion task. More complex behaviors, like multi-step reasoning or consistent factual recall across paraphrases, have not been traced to stable circuits at frontier scale. The tools that work for GPT-2 small — exhaustive ablations, hand-enumerated circuit candidates, manual hypothesis testing — do not scale to models with tens of billions of parameters and emergent capabilities that don't exist in small models at all.
+
+## The Faithfulness-Plausibility Gap
+
+An explanation of a neural network computation is *faithful* if it accurately describes what the model does. It is *plausible* if it looks correct to a human reader. These are independent properties, and most interpretability explanations are evaluated only on plausibility.
+
+When a researcher says "attention head 8.5 copies the previous token," that claim is tested by ablating the head and measuring output degradation. If the metric moves in the expected direction, the explanation is flagged as faithful. But this tests only the *effect* of the component, not the full mechanism. The head might implement copying for the test inputs while doing something entirely different for inputs outside the test distribution. Circuits are almost never tested on out-of-distribution inputs in a systematic way.
+
+Formal faithfulness tests like ROAR (Removing And Retraining) require retraining, which is prohibitively expensive at scale. The alternative — interventional tests on the fixed model — are cheaper but leave open the question of completeness: is the circuit you identified the full explanation, or is there a parallel circuit doing the same job that your ablations didn't touch?
+
+The completeness problem is particularly acute for redundant computation. Large models appear to implement the same capability through multiple pathways. Ablating one pathway degrades performance modestly; the model routes around it via another. A faithful circuit explanation must account for all the pathways. Nobody has a systematic method for finding all the circuits that implement a given behavior.
+
+## The Composition Problem
+
+<CompositionProblemDemo />
+
+Circuit analysis assumes — at least implicitly — that the contribution of a circuit to the full model output is separable from the contributions of other circuits. The residual stream addition rule makes this look tractable:
+
+$$
+x^{(L)} = x^{(0)} + \sum_{l=1}^{L} \bigl( \Delta^{\text{attn}}_l + \Delta^{\text{MLP}}_l \bigr)
+$$
+
+Each component's contribution is a separate additive term. But the contributions are not independent. Each attention head's output depends on the residual stream it reads, which contains all previous components' outputs. MLP layers read the same stream and can amplify, suppress, or reinterpret what attention heads wrote. The causal graph is not a simple sum of independent circuits — it is a deep interdependence mediated through the shared residual stream.
+
+Superposition sharpens the problem. Because features are not orthogonal — they are packed into the model's activation space using near-orthogonal directions — different circuits' representations interfere. A feature from circuit A projected onto a direction shared with circuit B will cause circuit B to activate spuriously on inputs where only circuit A should be relevant. The interference is small for any individual pair of features but accumulates across thousands of features packed into a 4096-dimensional vector.
+
+Understanding circuit A and circuit B individually tells you very little about their composed behavior. The composed behavior is determined by the superposition structure of the features they write and read, which is a global property of the model's representations, not a local property of either circuit.
+
+## Automated Interpretability at Scale
+
+Human annotation of SAE features is the current state of the art for feature labeling: a researcher looks at the top-activating inputs for a feature, guesses what it represents, and verifies by generating inputs that should or shouldn't activate it. Anthropic's scaling monosemanticity work (Templeton et al., 2024) ran this process on Claude 3 Sonnet's residual stream and found hundreds of thousands of interpretable features. Human annotation at that scale required automation.
+
+The automated pipeline uses a language model — Claude itself, in Anthropic's case — to generate labels for features based on their top-activating inputs, then tests those labels by asking the same model to generate inputs that should activate the feature and checking whether they do. This is promising and has produced useful results. It is also circular in a way that matters: the explainer model may have the same blind spots as the explained model. If both models have learned to associate certain surface features with certain concepts in the same biased way, the automated pipeline will produce explanations that look correct but are unfaithful in the same systematic direction.
+
+Burns et al. (2023) "Weak-to-Strong Generalization" address a related problem: using weaker models to supervise stronger ones. The interpretability version of this problem is whether automated interpretability can work when the model being explained is substantially more capable than the model generating the explanations. At frontier scale, this becomes the central question.
+
+The deeper issue is that even if automated feature labeling works well, feature labeling is not circuit discovery. Knowing that feature 14,823 in Claude 3 Sonnet represents "references to infectious diseases" tells you something about what the model knows; it tells you nothing about how that knowledge is retrieved and combined to produce outputs. The gap between feature inventories and mechanistic understanding is large and currently unbridged at scale.
+
+## Superposition as a Fundamental Barrier
+
+<SuperpositionBarrierDemo />
+
+Sparse autoencoders decompose the residual stream into a large dictionary of approximately monosemantic features. This is the best current approach to recovering features in superposition. But it rests on assumptions that may not hold.
+
+The core assumption: features are sparse. Each input activates only a small fraction of the dictionary features. Under this assumption, the overcomplete dictionary can represent more features than the ambient dimension because most features are never simultaneously active. SAE training exploits this via an $L_1$ sparsity penalty.
+
+What if features are not sparse? Some computations may require dense combinations of many features simultaneously — not because the model couldn't represent them sparsely but because the training dynamics drove the model toward dense representations for certain tasks. The SAE would then fail to recover these features, or recover distorted proxies.
+
+A more fundamental problem: there may be no unique decomposition. The space of valid feature dictionaries that reconstruct the residual stream is not a singleton. Different SAE trainings with different initialization or different sizes can recover different feature dictionaries that are individually coherent but not related by any simple transformation. Which one is the "true" decomposition? The model may not be computing in terms of any human-interpretable features at all — the "features" found by SAEs may be artifacts of the decomposition method rather than genuine computational units.
+
+This is the deepest open question in the field. The empirical success of SAEs — the features that match human concepts, the features that respond to interventions in expected ways, the steering experiments that work — suggests the decomposition has real content. But it doesn't establish uniqueness, and uniqueness is what you'd need to make strong claims about what the model is "actually" computing.
+
+## What "Understanding" Would Actually Mean
+
+The field lacks consensus on what success looks like. Proposed criteria for saying a model is understood:
+
+**Behavioral prediction without execution.** You can predict the model's output on a novel input without running the model, using only your mechanistic description. This is the gold standard — it's what physicists mean when they say they "understand" a system. No current interpretability work approaches this for any non-trivial input class.
+
+**Error explanation.** You can explain every significant model failure in mechanistic terms: this error occurred because circuit X was activated by spurious feature Y and overrode circuit Z's correct output. Currently achievable for toy failure modes in small models; not achievable systematically for frontier models.
+
+**Safety verification.** You can verify that the model does not engage in deceptive reasoning or exhibit behavioral divergence under distribution shift, by inspecting its computational structure rather than sampling its behavior. This is the AI safety motivation for the field. The interpretability tools required don't exist yet.
+
+None of these is currently achievable at frontier scale. The pessimist reads this as evidence that mechanistic interpretability is a scientific dead end for large models. The optimist reads it as a description of hard problems that are now better-defined than they were five years ago, which is progress.
+
+## What Is Tractable Now
+
+Despite the above, several concrete applications work today and are in production use:
+
+**Knowledge editing.** ROME (Meng et al., 2022) and MEMIT locate factual associations in MLP layers via causal tracing and edit them with targeted weight updates. This works reliably for simple factual updates and has been extended to larger models, though generalization to complex multi-hop facts remains limited.
+
+**Steering vectors.** Activation steering (adding a direction in residual stream space to shift model behavior) works for style, tone, refusal behavior, and some factual properties. It is a practical application of representation geometry understood from mechanistic work.
+
+**Probing for dangerous knowledge.** Linear probes on intermediate activations can detect whether a model's internal state encodes knowledge relevant to dangerous capabilities, even when the model's output doesn't reveal it. This is actively used in model evaluations.
+
+**Interpretability-guided fine-tuning.** Knowing which components encode which capabilities allows targeted fine-tuning that preserves desired capabilities while modifying specific behaviors. The alternative — fine-tuning the whole model — is more expensive and has less predictable effects.
+
+These applications are useful even before the grand theory is complete. The field can be valuable in practice while remaining scientifically incomplete in theory.
+
+## The Path Forward
+
+Automated circuit discovery at scale is the most tractable near-term direction. ACDC (Conmy et al., 2023) automated the hypothesis-testing loop for small models. Scaling this to frontier models requires algorithmic improvements and likely new tools that can work with circuits distributed across many layers and components.
+
+Better faithfulness metrics that don't require retraining would unlock systematic evaluation of explanations. Current interventional tests are necessary but not sufficient; they test component effect, not mechanism.
+
+Architectures designed for interpretability could sidestep some of the fundamental barriers. If circuits in superposition are the problem, train models with architectural constraints that enforce sparse activation or orthogonal features. This is a live research direction, though it introduces questions about capability-interpretability trade-offs.
+
+The realistic 5-year outlook: the field will produce reliable mechanistic explanations for specific, bounded capabilities in frontier models — factual recall, certain reasoning patterns, specific refusal behaviors. It will not produce a complete account of any frontier model's computation. The gap between partial mechanistic understanding and full transparency will close slowly, constrained by the scaling gap and the superposition barrier.
+
+The pessimist's case for doubt: large models may be computing in a fundamentally different regime from small models, where circuits are so distributed and context-dependent that enumerable descriptions are impossible in principle. The optimist's case: the concepts developed on small models — circuits, superposition, features, attention head roles — transfer qualitatively to large models even when they can't be enumerated, and the automated tools being built now will change what's enumerable in five years.
+
+The field is useful, incomplete, and moving. That is the honest description.
+
+## References
+
+- Bereska, L., & Gavves, E. (2024). Mechanistic Interpretability for AI Safety — A Review. *arXiv:2404.14082*.
+- Conmy, A., Mavor-Parker, A. N., Lynch, A., Heimersheim, S., & Garriga-Alonso, A. (2023). Towards Automated Circuit Discovery for Mechanistic Interpretability. *arXiv:2304.14997*.
+- Meng, K., Bau, D., Andonian, A., & Belinkov, Y. (2022). Locating and Editing Factual Associations in GPT. *arXiv:2202.05262*.
+- Templeton, A., et al. (2024). Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet. *Transformer Circuits Thread*. https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html
+- Elhage, N., et al. (2022). Toy Models of Superposition. *Transformer Circuits Thread*. https://transformer-circuits.pub/2022/toy_model
+- Wang, K., et al. (2022). Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small. *arXiv:2211.00593*.
+- Burns, C., et al. (2023). Weak-to-Strong Generalization: Eliciting Strong Capabilities With Weak Supervision. *arXiv:2312.09390*.

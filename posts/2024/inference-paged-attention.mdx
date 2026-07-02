@@ -1,0 +1,113 @@
+---
+title: "PagedAttention: Virtual Memory for the KV Cache"
+slug: "inference-paged-attention"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 6
+tags: ["inference", "vllm", "paged-attention", "kv-cache", "systems"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Contiguous KV cache allocation wastes GPU memory through fragmentation and over-reservation. PagedAttention fixes this by treating the KV cache as paged virtual memory — small fixed-size blocks assigned on demand, freed immediately, and reused without copying."
+---
+
+The [continuous batching post](/blog/inference-continuous-batching) established why the KV cache, not arithmetic, caps the number of sequences a serving engine can hold. What it did not address is a subtler problem: even when the GPU has free memory, it may not be usable. The culprit is fragmentation, and it is the same problem operating systems solved forty years ago with virtual memory.
+
+## The fragmentation problem
+
+In a naive serving engine, the KV cache for each sequence is a contiguous block of GPU memory allocated at request time. For a sequence that might generate up to $L_{\max}$ tokens, the engine reserves $L_{\max}$ slots up front — even though the sequence will almost certainly terminate early. If $L_{\max} = 2048$ and the actual length is 300 tokens, 85% of the reservation is wasted.
+
+The complementary failure is external fragmentation. Suppose sequences A (512 slots), B (1024 slots), and C (256 slots) are running. B finishes and its 1024 contiguous slots are freed. A new request D needs 800 slots. Even though 1024 free slots exist, the engine might be unable to satisfy a later request E that needs 1200 slots — because the space is fragmented across non-contiguous regions. Total free memory is sufficient; contiguous free memory is not.
+
+The result is that GPU memory utilization in a naive system often sits at 20–40%, not because the hardware is undersized, but because the allocator cannot reuse what it has.
+
+## The virtual memory analogy
+
+Operating systems solved this for CPU RAM in the 1960s: virtual memory. Instead of mapping each process's address space to a contiguous physical region, the OS maintains a page table that translates virtual page numbers to physical page frames. Pages are fixed-size (4 KB on x86), allocated on demand, and freed independently. A process sees a contiguous virtual address space; the physical layout is arbitrary and non-contiguous. Fragmentation at the page level is eliminated because any free page frame can serve any virtual page.
+
+PagedAttention (Kwon et al., 2023 — the paper behind vLLM) applies exactly this idea to the KV cache. Each sequence has a virtual KV cache — a logical sequence of fixed-size blocks. The physical layout in GPU memory is non-contiguous: a block table maps each virtual block number to a physical block location. Blocks are allocated on demand as the sequence grows and freed immediately when the sequence finishes. A new sequence gets the freed blocks without any memory copy.
+
+## The block table
+
+<PagedAttentionDemo />
+
+Each sequence owns a block table: an array mapping logical block index to physical block index. At inference time, the attention kernel uses this table to fetch the right physical memory addresses — it performs a lookup before each attention computation rather than assuming contiguous layout.
+
+For a sequence of length $\ell$ with block size $B$:
+
+$$
+\text{logical block } i \text{ holds tokens } [iB, \,(i+1)B - 1]
+$$
+
+The block table has $\lceil \ell / B \rceil$ entries, each a single integer (the physical block index). Memory is allocated one block at a time as tokens arrive: the first $B$ tokens allocate block 0, the next $B$ tokens allocate block 1, and so on. The last block is partially filled — only $\ell \mod B$ slots are used, wasting at most $B - 1$ tokens of capacity.
+
+The block size is a tuning parameter. Small blocks reduce internal fragmentation (wasted space in the last block) but increase the table size and the number of pointer dereferences. vLLM uses 16 tokens per block as a default — at 128 bytes per KV pair per layer, a block is $16 \times 128 \times 2 \times n_{\text{layers}}$ bytes. For LLaMA-3-8B (32 layers), one block is $16 \times 128 \times 2 \times 32 = 131\ \text{KB}$.
+
+## Memory utilization
+
+Under PagedAttention, fragmentation is bounded:
+
+- **Internal fragmentation**: at most $B - 1$ wasted token slots per sequence, at most $B - 1$ slots in each sequence's last block. With $B = 16$ this is at most 15 wasted slots per sequence — negligible.
+- **External fragmentation**: zero. Every free physical block is usable by any sequence, regardless of where it sits in physical memory. There are no free-but-unusable gaps.
+
+The practical consequence, measured in the original vLLM paper, is that GPU memory utilization rises from 20–40% (naive) to above 90% under PagedAttention. That improvement directly translates into higher concurrency — more sequences in flight on the same hardware.
+
+## How the attention kernel changes
+
+Standard attention assumes contiguous key and value storage. Given query vector $q$ for the current token and a KV cache of shape $[n_{\text{heads}}, \ell, d_{\text{head}}]$, a naive kernel accesses $K$ and $V$ with a single base pointer plus a stride. PagedAttention rewrites this to follow the block table:
+
+```python
+def paged_attention(q, block_table, k_blocks, v_blocks, block_size):
+    # q: [n_heads, d_head]
+    # block_table: [num_blocks] — maps logical → physical block index
+    # k_blocks, v_blocks: [total_physical_blocks, block_size, n_heads, d_head]
+    scores = []
+    for logical_block_idx, physical_block_idx in enumerate(block_table):
+        k = k_blocks[physical_block_idx]  # [block_size, n_heads, d_head]
+        score = einsum('hd, bhd -> bh', q, k) / sqrt(d_head)
+        scores.append(score)
+    # softmax over all scores, aggregate V — same as standard attention
+    ...
+```
+
+The kernel fetches non-contiguous physical blocks in sequence, guided by the block table. The resulting attention output is identical to what contiguous attention would produce — the reordering is transparent to the arithmetic.
+
+## Prefix caching: sharing blocks across sequences
+
+Once blocks are the unit of allocation, a natural optimization falls out: if two sequences share the same prefix tokens, they can share the same physical blocks for that prefix. The block table for each sequence simply points to the same physical block for the shared portion; no duplication is needed.
+
+For a system serving many requests with the same system prompt (a common pattern in instruction-tuned deployments), prefix caching means the KV cache for that prompt is computed once and shared across all subsequent requests that use it. The memory saving is the full KV cache of the shared prefix, multiplied by the concurrency of requests that hit it.
+
+The condition for safe sharing is immutability: a shared block can only be reused if neither sequence will write new tokens to it. Since KV cache entries for past tokens are never modified during decoding (only new tokens add new entries), this condition is always satisfied.
+
+## Copy-on-write for beam search
+
+Beam search maintains $k$ hypotheses simultaneously, all forked from the same partial sequence. Without paging, each beam gets its own copy of the KV cache for the shared prefix — $k \times$ the memory. With paging, all beams share the same physical blocks for the common prefix and only diverge when they emit different tokens.
+
+When a beam appends a new token that causes it to write to a shared block, the engine uses copy-on-write: it allocates a new physical block, copies the shared content, and updates that beam's block table to point to the new block. Only then does it write the new token. The cost is one block copy (a memcpy of at most $B \times n_{\text{heads}} \times d_{\text{head}} \times 2\ \text{bytes}$) at the point of divergence, rather than $k$ full copies at the start.
+
+## Preemption and recomputation
+
+When the serving engine runs out of physical blocks — more requests are admitted than the GPU can hold — it must preempt some running sequences. Under PagedAttention, preemption is clean: the engine records the block table for the preempted sequence, frees its physical blocks, and recomputes the KV cache from the original prompt tokens when the sequence is re-admitted. Alternatively, it can swap the blocks to CPU memory (DRAM) and swap them back when the sequence resumes.
+
+Both strategies are more efficient than naive preemption, which would have required copying potentially gigabytes of contiguous memory. Freeing a sequence under paging is freeing a list of integers (the block table) and marking those physical blocks as available — a microsecond operation regardless of sequence length.
+
+## The serving stack with PagedAttention
+
+The four-layer stack from the [serving post](/blog/inference-serving-at-scale) now has a concrete implementation for its KV cache manager:
+
+1. **Admission**: count available physical blocks; admit a request only if its worst-case block usage fits.
+2. **Block allocation**: as each token is generated, allocate a new physical block when the sequence fills its last one. Look up the block table to find the physical address.
+3. **Block freeing**: when a sequence emits EOS or is preempted, return all its physical blocks to the free pool in O(number of blocks) time.
+4. **Prefix deduplication**: hash the prompt tokens; if a matching physical block sequence exists, point the new sequence's block table at those blocks (read-only sharing).
+
+Together these mechanisms allow vLLM to sustain GPU memory utilization above 90% under mixed-length traffic — the condition that makes the throughput numbers from the continuous batching post achievable in practice rather than in theory.
+
+import { Callout } from '@/components/mdx-components'
+
+<Callout title="Further reading">
+  [PagedAttention paper (vLLM)](/papers/pagedattention) · [Continuous batching](/blog/inference-continuous-batching) · [KV cache memory management](/blog/inference-memory-kv-quantization) · [GPU architecture for inference](/blog/inference-gpu-architecture)
+</Callout>

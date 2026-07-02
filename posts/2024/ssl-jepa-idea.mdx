@@ -1,0 +1,103 @@
+---
+title: "JEPA: Predicting in Representation Space"
+slug: "ssl-jepa-idea"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ssl-world-models"
+seriesOrder: 4
+tags: ["ssl", "jepa", "representation-learning", "world-models"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "MAE predicts pixels. Contrastive methods match views. JEPA predicts representations of target regions from context regions — in an abstract space where irrelevant details have already been discarded."
+---
+
+The complaint with pixel-level reconstruction is that it forces the model to spend capacity on things
+that do not matter. To predict the exact RGB values behind a mask, a model has to commit to the precise
+texture of the fur, the particular fall of the light, the sensor noise in that corner of the frame —
+none of which is what makes a dog a dog. These details vary endlessly across images of the same content
+and carry almost no transferable signal, yet a pixel loss grades the model on getting them right. The
+argument Yann LeCun has pressed is that the prediction *target* is in the wrong space: a good
+representation should be invariant to that irrelevant variation, and so should the thing you ask the
+model to predict.
+
+## The architecture
+
+<JEPAArchitectureDemo />
+
+JEPA — Joint Embedding Predictive Architecture, laid out in
+[LeCun's 2022 position paper](https://openreview.net/forum?id=BZ5a1r-kVsf) — keeps the
+predict-the-missing-part framing and moves the target into latent space. It has two branches. A context
+encoder maps a context region $x$ to an embedding $s_x$; a target encoder maps a target region $y$ — a
+different part or view of the same input — to an embedding $s_y$. A predictor then tries to produce the
+target's embedding from the context's, conditioned on a variable $z$ that encodes *where* the target
+sits relative to the context.
+
+$$
+\hat{s}_y = f_{\text{pred}}(s_x, z)
+$$
+
+The training objective is to make that prediction match the target encoder's output, measured directly
+in representation space rather than pixel space.
+
+$$
+\mathcal{L} = \big\lVert \hat{s}_y - \text{sg}(s_y) \big\rVert^2
+$$
+
+The $\text{sg}$ is a stop-gradient: the target encoder is not updated by this loss, only read from, and
+that asymmetry is what keeps the whole thing from falling into the trivial solution.
+
+## Why it doesn't collapse
+
+<CollapsePreventionDemo />
+
+The collapse danger is the same one that haunts every joint-embedding method: if both encoders are free
+to move, the loss is minimized by mapping everything to a constant, at which point $\hat{s}_y$ and
+$s_y$ agree at zero cost and the representation is useless. JEPA blocks this on two fronts. First, the
+target encoder is a stop-gradient copy of the context encoder — typically an exponential moving average
+of it — so the loss cannot reshape the targets to meet the predictor halfway; the targets are a moving
+but non-cooperating reference. Second, the predictor is conditioned on $z$, the position of the target
+relative to the context, so it is being asked a *specific* question — predict the representation of
+*that* region, not just *a* region. A constant output cannot answer a location-conditioned question, so
+the degenerate solution stops being a solution. This is a sharper anti-collapse mechanism than BYOL's
+bare predictor-plus-stop-gradient, precisely because the positional conditioning gives the model
+something it cannot fake.
+
+## What changes versus MAE
+
+The difference from a [masked autoencoder](/blog/ssl-masked-autoencoders) is one variable: the target.
+MAE's target is pixels, living in input space, so the model is graded on reconstructing the raw signal
+and inherits all the texture-and-lighting burden that comes with it. JEPA's target is $s_y$, a *learned*
+representation produced by the target encoder — and because that encoder is itself trained, it is free
+to discard pixel-level noise and keep only what is stable and semantic. The predictor never sees pixels;
+it learns to reason about abstract content, mapping the representation of a context to the
+representation of a neighbor. The model predicts *what is there*, not *what it looks like down to the
+texel*.
+
+## What changes versus contrastive learning
+
+<JEPAvsContrastiveDemo />
+
+The difference from [contrastive methods](/blog/ssl-contrastive-learning) is structural rather than
+about the target's space. Contrastive learning enforces a *global* relation: the whole-image embedding
+of crop one should match the whole-image embedding of crop two. That collapses each view to a single
+vector and discards the spatial layout in the process — the same invariance cost Part 2 traced. JEPA
+instead poses a *local, structured* prediction: given the representation of a context region, predict
+the representation of a particular target region at a known relative position. Because the prediction is
+tied to specific locations, the spatial relationships between regions survive in the representation
+rather than being averaged away. You get the semantic abstraction of a learned target without paying
+the contrastive method's spatial tax.
+
+## One idea, many modalities
+
+What makes JEPA more than a single model is that the recipe — context encoder, target encoder,
+location-conditioned predictor, loss in latent space — is modality-agnostic. I-JEPA instantiates it on
+images, predicting the representations of masked image regions from a visible context block. V-JEPA
+carries it to video, predicting the representations of masked spatiotemporal regions, which forces the
+model to encode how scenes evolve over time. A-JEPA applies the same structure to audio, and the
+template extends to whatever modality you can carve into context and target. Each is the same bet placed
+on a different signal: predict abstract representations of the missing part, not its raw form. Parts 5
+and 6 of this series take the image and video cases apart in detail — I-JEPA first, then V-JEPA and what
+predicting in latent space across time has to do with learning a world model.

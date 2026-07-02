@@ -1,0 +1,205 @@
+---
+title: "Cheatsheet: RL Loss Functions"
+slug: "cheatsheet-rl-losses"
+date: "2025-01-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "cheatsheets"
+seriesOrder: 1
+tags: ["cheatsheet", "rl", "ppo", "grpo", "llm-training", "alignment"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "PPO and GRPO loss functions annotated term-by-term — the clipped surrogate, GAE, value loss, entropy bonus, and group-normalised advantages — with links to the posts explaining each design choice."
+---
+
+import { Callout } from '@/components/mdx-components'
+
+The two dominant RL algorithms for LLM alignment share a common core — the PPO clipped surrogate — but differ in how they estimate advantages and what auxiliary losses they carry. This cheatsheet annotates both objectives term-by-term and highlights where they diverge.
+
+---
+
+## PPO objective
+
+$$
+\mathcal{L}_{\text{PPO}}(\theta) = \mathcal{L}_{\text{CLIP}}(\theta) - c_1\, \mathcal{L}_{\text{VF}}(\theta) + c_2\, \mathcal{H}[\pi_\theta]
+$$
+
+Three terms summed with coefficients $c_1$ and $c_2$.
+
+---
+
+### $r_t(\theta)$ — probability ratio
+
+$$
+r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t \mid s_t)}
+$$
+
+The ratio of the new policy's probability to the old policy's for action $a_t$. When $r > 1$ the new policy assigns more probability to this token; when $r < 1$, less. This is the importance-sampling weight that lets us evaluate the new policy using trajectories collected under the old one:
+
+$$\mathbb{E}_{\pi_\theta}[A] = \mathbb{E}_{\pi_{\text{old}}}[r_t \cdot A]$$
+
+See [PerTokenRatioExplorer](/blog/ppo-loss-per-token) for a per-token breakdown.
+
+---
+
+### $\mathcal{L}_{\text{CLIP}}$ — clipped surrogate
+
+$$
+\mathcal{L}_{\text{CLIP}}(\theta) = \mathbb{E}_t\!\left[\min\!\left(r_t(\theta)\,\hat{A}_t,\ \text{clip}(r_t(\theta), 1{-}\varepsilon, 1{+}\varepsilon)\,\hat{A}_t\right)\right]
+$$
+
+The $\min$ of the unclipped and clipped terms acts as a pessimistic bound:
+
+- When $\hat{A} > 0$ (good action): if $r > 1+\varepsilon$ the gradient is zeroed — no further push once the action is already much more likely.
+- When $\hat{A} < 0$ (bad action): if $r < 1-\varepsilon$ the gradient is zeroed — no further suppression once the action is already much less likely.
+
+**Why clip instead of a hard KL constraint?** TRPO enforces $\mathbb{D}_{\text{KL}}(\pi_{\theta_{\text{old}}} \| \pi_\theta) \leq \delta$ as a hard constraint, requiring second-order optimisation. PPO approximates the same trust region with a first-order clipping operation. See [PPOLossDecomposition](/blog/ppo-full-training-step).
+
+---
+
+### $\hat{A}_t$ — advantage estimate (PPO)
+
+$$
+\hat{A}_t = Q(s_t, a_t) - V(s_t)
+$$
+
+How much better was action $a_t$ than average from state $s_t$? In practice $Q$ is not available and is estimated via GAE.
+
+**Why subtract $V(s_t)$?** Any constant that doesn't depend on the action can be subtracted without biasing the gradient. Subtracting $V(s_t)$ removes variance common to all actions from state $s_t$. See [BaselineVarianceReduction](/blog/rl-for-llms-policy-gradients).
+
+---
+
+### GAE — Generalised Advantage Estimation
+
+$$
+\hat{A}_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty} (\gamma\lambda)^l\, \delta_{t+l}, \qquad \delta_t = r_t + \gamma\, V(s_{t+1}) - V(s_t)
+$$
+
+$\delta_t$ is the one-step TD error: immediate reward plus discounted next-state value minus current value prediction. Positive = step exceeded expectations.
+
+**$\gamma$ — discount factor**: down-weights future rewards. At $\gamma=0$ only the immediate reward matters; at $\gamma=1$ all future rewards are equal. For LLMs with single-step episode rewards, $\gamma$ is typically 1 or close to it.
+
+**$\lambda$ — GAE interpolation**: blends the one-step TD estimate ($\lambda=0$, low variance, high bias) with the full Monte Carlo return ($\lambda=1$, high variance, zero bias). Typical value: $\lambda=0.95$. See [GAELambdaSweep](/blog/ppo-full-training-step).
+
+---
+
+### $\mathcal{L}_{\text{VF}}$ — value function loss
+
+$$
+\mathcal{L}_{\text{VF}}(\theta) = \mathbb{E}_t\!\left[\left(V_\theta(s_t) - \hat{V}_t\right)^2\right]
+$$
+
+Trains the critic $V_\theta$ to predict expected future rewards from each state. A well-trained critic gives accurate baselines, reducing advantage variance. The coefficient $c_1$ (typically 0.5–1.0) balances how aggressively the critic is updated relative to the policy.
+
+---
+
+### $\mathcal{H}[\pi_\theta]$ — entropy bonus
+
+$$
+\mathcal{H}[\pi_\theta] = -\mathbb{E}_t\!\left[\sum_a \pi_\theta(a \mid s_t) \log \pi_\theta(a \mid s_t)\right]
+$$
+
+Maximising entropy keeps the policy spread across actions rather than collapsing to a single deterministic output. Without it, LLM policies produce repetitive, low-diversity text. $c_2$ (typically 0.01) controls the exploration-exploitation trade-off. See [EntropyCollapseDemo](/blog/ppo-full-training-step).
+
+---
+
+### PPO hyperparameters
+
+| Symbol | Typical value | Role |
+|---|---|---|
+| $\varepsilon$ | 0.1–0.2 | PPO clip ratio |
+| $\gamma$ | 0.99–1.0 | Discount factor |
+| $\lambda$ | 0.95 | GAE interpolation |
+| $c_1$ | 0.5–1.0 | Value loss coefficient |
+| $c_2$ | 0.01 | Entropy bonus coefficient |
+| $K$ | 3–4 | Gradient steps per rollout |
+
+---
+
+## GRPO objective
+
+$$
+\mathcal{L}_{\text{GRPO}}(\theta) = \mathbb{E}_{q,\,\{o_i\}} \left[ \frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \min\!\left(r_{i,t}(\theta)\, \hat{A}_{i,t},\ \text{clip}(r_{i,t}(\theta), 1{-}\varepsilon, 1{+}\varepsilon)\, \hat{A}_{i,t}\right) - \beta\, \mathbb{D}_{\text{KL}}\!\left[\pi_\theta \,\|\, \pi_{\text{ref}}\right] \right]
+$$
+
+GRPO removes the learned value critic entirely. The advantage comes from comparing completions within a group, not from a separate value network.
+
+---
+
+### $\{o_i\}_{i=1}^{G} \sim \pi_{\theta_{\text{old}}}(\cdot \mid q)$ — group sampling
+
+$G$ completions sampled from the old policy for the same prompt $q$. The group is the unit of normalisation — all $G$ outputs share one baseline computed from their collective reward signal.
+
+**Why sample a group?** A single reward per prompt has no baseline to subtract. Generating $G$ outputs and comparing them against each other recovers a low-variance advantage without training a value network. See [GRPOAdvantageExplorer](/blog/grpo-variants).
+
+---
+
+### $\hat{A}_{i,t}$ — group-normalised advantage
+
+$$
+\hat{A}_{i,t} = \frac{r_i - \text{mean}(\{r_j\}_{j=1}^{G})}{\text{std}(\{r_j\}_{j=1}^{G})}
+$$
+
+The same advantage value is broadcast to every token position in completion $i$ — there is no token-level credit assignment within a single completion.
+
+**Why subtract the group mean?** Any constant baseline that doesn't depend on the action can be subtracted without biasing the gradient. The group mean eliminates variance common to all outputs for this prompt.
+
+**Why divide by group std?** Makes the advantage scale consistent across prompts and reward models — necessary for stable updates when reward distributions vary.
+
+---
+
+### $r_{i,t}(\theta)$ — probability ratio (GRPO)
+
+$$
+r_{i,t}(\theta) = \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{\text{old}}}(o_{i,t} \mid q, o_{i,<t})}
+$$
+
+Identical in form to the PPO ratio. When $r > 1$ the new policy assigns more probability to this token than the old policy did. The same [PPO clipped surrogate](#mathcall_textclip----clipped-surrogate) is applied.
+
+---
+
+### $\frac{1}{|o_i|}$ — per-token normalisation
+
+Divides by output length to prevent the objective from being dominated by long completions. Each completion contributes equally regardless of token count.
+
+---
+
+### $\beta\, \mathbb{D}_{\text{KL}}\!\left[\pi_\theta \,\|\, \pi_{\text{ref}}\right]$ — KL penalty
+
+$$
+\mathbb{D}_{\text{KL}}\!\left[\pi_\theta \,\|\, \pi_{\text{ref}}\right] = \mathbb{E}_{o \sim \pi_\theta}\!\left[\log \frac{\pi_\theta(o \mid q)}{\pi_{\text{ref}}(o \mid q)}\right]
+$$
+
+Penalises the policy for drifting too far from the reference model $\pi_{\text{ref}}$ (usually the SFT checkpoint). Without it, the policy finds degenerate outputs that exploit the reward model — reward hacking. See [KLPenaltyTradeoff](/blog/llm-alignment-pipeline).
+
+**Forward KL ($\pi_\theta \| \pi_{\text{ref}}$):** mode-covering — penalises $\pi_\theta$ for putting mass anywhere $\pi_{\text{ref}}$ does not. This keeps the policy in the reference distribution's support rather than collapsing onto a single high-reward mode.
+
+**$\beta$ trade-off:** large $\beta$ keeps the policy close to the reference (safe, less reward); small $\beta$ allows more deviation (higher reward potential, more hacking risk). See [KLDivergenceExplorer](/blog/math-llm-loss-functions).
+
+---
+
+### GRPO hyperparameters
+
+| Symbol | Typical value | Role |
+|---|---|---|
+| $G$ | 4–16 | Group size — more = lower variance baseline, more compute |
+| $\varepsilon$ | 0.1–0.2 | PPO clip ratio |
+| $\beta$ | 0.01–0.1 | KL penalty strength |
+
+---
+
+## PPO vs GRPO at a glance
+
+| | PPO | GRPO |
+|---|---|---|
+| Advantage source | Learned value function + GAE | Group mean/std of scalar rewards |
+| Auxiliary loss | Value function loss $\mathcal{L}_{\text{VF}}$ + entropy $\mathcal{H}$ | KL penalty to $\pi_{\text{ref}}$ |
+| Extra networks | Critic (value head) | Frozen reference model |
+| Credit assignment | Per-token via GAE bootstrapping | Per-completion, broadcast to all tokens |
+| Main failure mode | Value model collapse at long horizons | High variance when $G$ is small |
+
+<Callout title="Further reading">
+  [PPO full training step](/blog/ppo-full-training-step) · [Per-token PPO loss](/blog/ppo-loss-per-token) · [GRPO variants](/blog/grpo-variants) · [Policy gradients from scratch](/blog/rl-for-llms-policy-gradients) · [KL divergence explained](/blog/math-llm-loss-functions)
+</Callout>

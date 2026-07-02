@@ -1,0 +1,137 @@
+---
+title: "Contrastive SSL: SimCLR, MoCo, and DINO"
+slug: "ssl-contrastive-learning"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ssl-world-models"
+seriesOrder: 2
+tags: ["ssl", "contrastive-learning", "dino", "vision-transformers"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Contrastive learning teaches a model that two views of the same image should be close in representation space, and views of different images should be far apart. The details of how you enforce this determine everything."
+---
+
+The contrastive recipe starts from a deceptively simple instruction: take an image $x$, produce two
+augmented views $v_1$ and $v_2$ of it, and push their representations together while pushing the
+representations of *other* images' views apart. Formally, you want to maximize $\text{sim}(f(v_1),
+f(v_2))$ for the matched pair and minimize $\text{sim}(f(v_1), f(v_{\text{neg}}))$ for every negative
+view drawn from a different image. The matched pair is the only "label," and it costs nothing, because
+you created both views yourself.
+
+SimCLR ([Chen et al., 2020](https://arxiv.org/abs/2002.05709)) turned that instruction into a concrete
+loss, the normalized temperature-scaled cross-entropy, or NT-Xent. For a positive pair of embeddings
+$z_i$ and $z_j$ inside a batch, the loss treats the matched partner as the correct class against every
+other embedding as a distractor.
+
+$$
+\mathcal{L}_{i,j} = -\log \frac{\exp\!\big(\text{sim}(z_i, z_j)/\tau\big)}{\sum_{k=1}^{2N}
+\mathbb{1}_{[k \neq i]}\,\exp\!\big(\text{sim}(z_i, z_k)/\tau\big)}
+$$
+
+The temperature $\tau$ is doing more than it looks: it sets how sharply the softmax distinguishes the
+positive from the negatives, and the loss is acutely sensitive to it — set $\tau$ too low and the
+gradients concentrate on a handful of hard negatives and training destabilizes, set it too high and the
+distribution flattens until the negatives stop mattering and the representation degenerates.
+
+## SimCLR: brute force and a head you throw away
+
+
+<NTXentTemperature />
+
+SimCLR's headline cost is the denominator of that loss. Negatives come from the current batch and
+nowhere else, so the quality of the contrast is bounded by how many other images sit alongside $x$ in
+the same step — which is why SimCLR needs batches of 4096 to 8192 images to work well, and why it
+effectively requires a TPU pod to reproduce. It also leans hard on augmentation: random crop, color
+jitter, grayscaling, and Gaussian blur composed together, with the crop-plus-color combination doing
+most of the work. Weak augmentation and the two views are too similar to be informative; the model
+solves the task by reading off low-level color statistics.
+
+The subtler design choice is the projection head. SimCLR does not contrast the encoder's
+representation directly — it adds a small MLP on top, $z = g(h)$, and applies NT-Xent to $z$, not to
+$h$. At transfer time the head $g$ is discarded and the representation $h$ underneath it is what you
+keep. This inversion surprises people, but it follows from what the loss does: the contrastive
+objective demands invariance to every augmentation, so whatever sits closest to the loss is pressured
+to *delete* color, orientation, and crop position. You want that invariance to live in the disposable
+head, leaving $h$ free to retain information the augmentations happened to destroy. Read off the layer
+before the head and you get strictly better transfer than reading off the head's output.
+
+## MoCo: decoupling negatives from batch size
+
+
+<MomentumEncoderEMA />
+
+If the problem is that negatives are chained to batch size, the fix is to stop drawing them from the
+batch. MoCo ([He et al., 2020](https://arxiv.org/abs/1911.05722)) maintains a *queue* of embeddings
+from recent batches — a few tens of thousands of them — and contrasts each new view against the queue
+rather than against its batchmates. That immediately gives you a large, cheap negative set on
+commodity hardware.
+
+The complication is that the encoder is changing every step, so embeddings enqueued ten steps ago were
+produced by a different network and are no longer directly comparable to today's. MoCo handles this
+with a second, slowly-moving copy of the encoder — the momentum encoder — that produces the keys going
+into the queue. Its weights are an exponential moving average of the main encoder's.
+
+$$
+\theta_k \leftarrow m\,\theta_k + (1 - m)\,\theta_q, \qquad m \approx 0.999
+$$
+
+With $m$ that close to one, the key encoder drifts so slowly that the queue stays approximately
+consistent across the steps it spans, and the number of negatives is now a hyperparameter you set
+rather than a quantity you pay for in accelerator memory.
+
+## The collapse problem and the methods that dodge it
+
+
+<CollapseVsGoodRepresentation />
+
+Negatives are not in the loss for decoration. Without them — or without some substitute regularizer —
+the contrastive objective has a trivial global optimum: map every input to the same constant vector,
+and every positive pair is perfectly aligned at zero cost. This is *representational collapse*, and it
+is the central failure mode the whole field designs against. SimCLR and MoCo avoid it by construction,
+because pushing negatives apart is incompatible with a constant output.
+
+The striking result is that you can drop negatives entirely and still not collapse, provided you break
+the symmetry between the two branches. BYOL ([Grill et al., 2020](https://arxiv.org/abs/2006.07733))
+and SimSiam put a prediction MLP on one branch only and a stop-gradient on the other, so the two views
+play asymmetric roles: one predicts, the other provides a fixed target. Empirically this is enough to
+keep the representation from degenerating, even with no negative pairs anywhere in the objective. *Why*
+the asymmetry suffices is still not fully settled — the stop-gradient and predictor clearly matter, but
+the clean theoretical account of what stops collapse remains contested.
+
+## DINO: distillation that segments for free
+
+DINO ([Caron et al., 2021](https://arxiv.org/abs/2104.14294)) takes the no-negatives idea and frames
+it as self-distillation. A student network is trained to match the output distribution of a teacher,
+where the teacher is an exponential moving average of the student — the same momentum trick as MoCo,
+now used to produce *targets* rather than negatives. The asymmetry that prevents collapse comes from a
+multi-crop scheme: the student sees small local crops, the teacher sees large global crops, and the
+student must reproduce the teacher's view of the whole from its glimpse of a part. Centering and
+sharpening the teacher's outputs keeps the distribution from collapsing to a point or spreading to
+uniform.
+
+What made DINO notable was an emergent property nobody trained for. Apply it to a Vision Transformer
+and inspect the self-attention of the [CLS] token in the final layer: the attention maps trace the
+boundaries of the salient objects in the scene — foreground separated from background — with no
+segmentation labels anywhere in the pipeline. The model was only ever asked to make local and global
+crops agree, and object structure fell out as the representation that makes that agreement possible.
+It is one of the cleaner demonstrations that a good pretext task recovers structure you never
+explicitly supervised.
+
+## What invariance costs
+
+Step back and every method here is doing the same thing: learning features *invariant* to the
+augmentations. That is the source of their strength and the precise location of their weakness. Color
+jitter in the augmentation set means the representation is trained to be color-invariant. Random
+cropping means it is trained to be position-invariant. The objective explicitly instructs the model to
+treat everything the augmentations vary as noise to be discarded — and it complies, throwing that
+information out of the representation.
+
+For image classification, where you want a single label invariant to where the cat sits in the frame,
+that is exactly right. For dense prediction — segmentation, detection, depth — it is actively harmful,
+because position and fine spatial detail are the signal, not the noise. A representation optimized to
+forget where things are cannot tell you where things are. That limitation is precisely the opening for
+the other family of methods, the ones that ask the model to reconstruct what was hidden rather than to
+match what is shared — [masked autoencoders](/blog/ssl-masked-autoencoders), in Part 3.

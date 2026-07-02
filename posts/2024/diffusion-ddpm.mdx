@@ -1,0 +1,136 @@
+---
+title: "DDPM: The Diffusion Process, Forward and Reverse"
+slug: "diffusion-ddpm"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "diffusion-models"
+seriesOrder: 2
+tags: ["diffusion", "ddpm", "generative-models", "image-generation"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "DDPM defines a fixed forward process that gradually destroys an image into noise, then trains a neural network to reverse it. The math is tractable because each step is Gaussian."
+---
+
+The single noise scale from [denoising score matching](/blog/diffusion-score-matching) is enough to
+estimate a score, but it is not enough to sample from scratch — a denoiser trained at one $\sigma$ knows
+how to clean up images that are nearly clean, or images that are nearly pure noise, but not how to walk
+the whole distance between them. [DDPM (Ho et al., 2020)](/papers/ddpm) fixes this by stringing together a thousand noise
+scales into a single process: a fixed, untrainable **forward process** that destroys an image one small
+step at a time, and a learned **reverse process** that rebuilds it.
+
+The forward process is a Markov chain that, at each step, scales the current image down slightly and adds
+a little Gaussian noise. The amount added at step $t$ is set by a schedule $\beta_1, \dots, \beta_T$.
+
+$$
+q(x_t \mid x_{t-1}) = \mathcal{N}\!\big(x_t;\, \sqrt{1 - \beta_t}\, x_{t-1},\; \beta_t I\big)
+$$
+
+The $\sqrt{1 - \beta_t}$ scaling is what keeps the chain from exploding: it shrinks the signal by exactly
+the amount needed so that the variance stays bounded as noise accumulates, and after $T = 1000$ steps the
+image has been ground down into something indistinguishable from a draw from $\mathcal{N}(0, I)$.
+
+Running that chain one step at a time during training would be ruinously slow, so the crucial move is to
+collapse it. Because each step is a linear-Gaussian map, the composition of $t$ of them is itself
+Gaussian, and defining $\alpha_t = 1 - \beta_t$ together with the cumulative product
+$\bar\alpha_t = \prod_{s=1}^{t} \alpha_s$ gives the marginal of $x_t$ given the original $x_0$ in closed
+form.
+
+$$
+q(x_t \mid x_0) = \mathcal{N}\!\big(x_t;\, \sqrt{\bar\alpha_t}\, x_0,\; (1 - \bar\alpha_t) I\big)
+$$
+
+This says you can jump to any timestep in a single shot — sample noise once and form $x_t$ directly from
+$x_0$ — without simulating the intervening 999 steps.
+
+$$
+x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \epsilon, \qquad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+That one identity is what makes training tractable at all: each gradient step picks a random $t$, builds
+$x_t$ from a clean image and a single noise draw, and never touches the chain.
+
+<ForwardDiffusionSlider />
+
+The reverse process is the one the model has to learn, because going backward — denoising — is not free.
+It is also a Markov chain, parameterized as a sequence of Gaussians whose means and covariances the
+network produces.
+
+$$
+p_\theta(x_{t-1} \mid x_t) = \mathcal{N}\!\big(x_{t-1};\, \mu_\theta(x_t, t),\; \Sigma_\theta(x_t, t)\big)
+$$
+
+The reason a Gaussian is even the right form for the reverse step is that, in the limit of small
+$\beta_t$, the true reverse conditional is itself approximately Gaussian — so the network is not forced
+into a mismatched family, only asked to find the right mean.
+
+The target for that mean comes from a quantity that *is* tractable: the forward posterior
+$q(x_{t-1} \mid x_t, x_0)$, the distribution over the previous state given both the current state and the
+original image. Conditioning on $x_0$ turns the otherwise-unknown reverse step into a Gaussian you can
+write down exactly, with a mean $\tilde\mu_t(x_t, x_0)$ that interpolates between $x_t$ and $x_0$. The
+network's job is to match this posterior mean — but at sampling time it does not have $x_0$, so it must
+predict whatever is needed to reconstruct the mean from $x_t$ alone.
+
+Here DDPM makes the choice that defines it. Rather than predicting $x_0$ or the mean directly, the
+network predicts the **noise** $\epsilon_\theta(x_t, t)$ that was added to produce $x_t$ — and because
+$x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \epsilon$, knowing $\epsilon$ is equivalent
+to knowing $x_0$. Substituting the predicted noise into the posterior mean gives the reverse-step mean in
+terms of $\epsilon_\theta$.
+
+$$
+\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \epsilon_\theta(x_t, t)\right)
+$$
+
+<NoisePredictionIntuition />
+
+The variational bound that nominally governs training weights each timestep differently, but Ho et al.
+found that throwing those weights away — regressing the predicted noise onto the true noise with a plain
+squared error — works better in practice and could not be simpler.
+
+$$
+L_\text{simple} = \mathbb{E}_{t,\, x_0,\, \epsilon}\!\left[\, \big\| \epsilon - \epsilon_\theta(x_t, t) \big\|^2 \,\right]
+$$
+
+This is denoising score matching from Part 1, now indexed by $t$ instead of a single $\sigma$: at every
+noise level the network learns to name the noise, which is the same as learning the score at that level.
+
+What computes $\epsilon_\theta$ is a **U-Net**. The architecture matters because denoising is a problem
+with two scales at once: the noise to remove is high-frequency and local, but deciding what the
+underlying image *is* requires global context, and a U-Net's encoder–decoder structure with skip
+connections is built to carry both — the contracting path summarizes the image into coarse semantics, the
+expanding path reconstructs spatial detail, and the skips splice fine resolution back in so it is not
+lost in the bottleneck. Ho et al. add residual blocks throughout and self-attention at the lower
+resolutions, where the feature maps are small enough to afford it and global interactions matter most.
+The timestep $t$ is turned into a sinusoidal embedding, projected through a small MLP, and **added** into
+every residual block, so the same weights behave differently depending on how much noise they are being
+asked to remove. (The *adaptive group normalization* conditioning often associated with diffusion U-Nets
+is not from DDPM — it was introduced a year later by
+[Dhariwal and Nichol (2021)](/papers/diffusion-beats-gans); DDPM's timestep conditioning is the simpler
+additive embedding.)
+
+The schedule $\beta_1, \dots, \beta_T$ is the last design choice, and it is not innocuous. Ho et al. use
+a **linear** schedule, ramping $\beta$ from $10^{-4}$ to $0.02$ over the thousand steps. Nichol and
+Dhariwal (2021) later showed this destroys the signal too aggressively at the start — by the middle of
+the chain the image is already almost pure noise, so the late timesteps carry little information and the
+model wastes capacity on them. Their **cosine** schedule fixes the pacing by defining the cumulative
+$\bar\alpha_t$ directly as a slow cosine decay.
+
+$$
+\bar\alpha_t = \frac{\cos^2\!\big(\tfrac{t/T + 0.008}{1.008} \cdot \tfrac{\pi}{2}\big)}{\cos^2\!\big(\tfrac{0.008}{1.008} \cdot \tfrac{\pi}{2}\big)}
+$$
+
+Keeping more signal alive through the middle of the process gives the network a smoother sequence of
+denoising problems and measurably better samples, and most schedules since have been variations on this
+shape.
+
+<NoiseScheduleComparison />
+
+The result is a model that generates beautifully and samples miserably. Drawing one image means starting
+from $x_T \sim \mathcal{N}(0, I)$ and running the reverse chain all the way down, one learned Gaussian
+step at a time, which is one full U-Net forward pass for each of the thousand steps. For a 256×256 image
+that is minutes per sample on a good GPU, and the cost is structural — it comes from the chain being
+Markovian, where each step is only allowed to look one step back. The next part breaks exactly that
+assumption and recovers the same images in fifty steps instead of a thousand — that is
+[DDIM](/blog/diffusion-ddim).

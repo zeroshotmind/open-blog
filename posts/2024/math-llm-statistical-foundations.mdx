@@ -1,0 +1,142 @@
+---
+title: "Statistical Foundations: Distributions, Estimation, and Sampling"
+slug: "math-llm-statistical-foundations"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 9
+tags: ["math", "statistics", "sampling", "bayesian", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Language models are probabilistic systems. Understanding the statistical machinery behind maximum likelihood estimation, Bayesian inference, and sampling algorithms clarifies why training and decoding work the way they do."
+---
+
+Training a language model and decoding from it are the two halves of one statistical problem: first you
+estimate a distribution from data, then you draw from it. The estimation half rests on maximum likelihood,
+which takes data $D = \{x_1, \dots, x_N\}$ assumed drawn independently from some true $p(x \mid \theta^*)$
+and asks for the parameters under which the observed data is most probable.
+
+$$
+\theta_{\mathrm{MLE}} = \arg\max_\theta \sum_{i=1}^{N} \log p(x_i \mid \theta)
+$$
+
+This estimator is not an arbitrary choice but a principled one: under mild conditions it is consistent, so
+$\theta_{\mathrm{MLE}} \to \theta^*$ as the data grows, and asymptotically efficient, meaning it reaches the
+lowest variance any unbiased estimator can achieve. For a language model the connection is immediate —
+writing the joint probability autoregressively and flipping the sign turns the MLE objective into the
+training loss, $\theta_{\mathrm{MLE}} = \arg\min_\theta \sum_t -\log p_\theta(x_t \mid x_{<t})$, so every
+gradient step of next-token [cross-entropy](/blog/math-llm-probability) is a step of maximum likelihood
+estimation and nothing more exotic.
+
+The claim that no unbiased estimator can do better than MLE has a precise floor, the Cramér–Rao bound, which
+lower-bounds the variance of any unbiased estimator by the reciprocal of the Fisher information.
+
+$$
+\mathrm{Var}(\hat{\theta}) \geq \frac{1}{I(\theta)}, \qquad I(\theta) = -\,\mathbb{E}\!\left[ \frac{\partial^2 \log p(x \mid \theta)}{\partial \theta^2} \right]
+$$
+
+The Fisher information $I(\theta)$ measures how sharply the log-likelihood curves around its peak, so a
+sharply peaked likelihood pins the parameter down tightly and permits low variance, while a flat one leaves
+it loosely determined. For a model with many parameters the scalar generalizes to the Fisher *information
+
+<FisherInformationDemo />
+
+matrix*, whose entries describe the curvature of the loss in every pairwise direction at once, and this
+matrix defines the natural geometry of parameter space — it is why natural gradient methods, which
+precondition the update by the inverse Fisher, are in a precise sense the optimal direction to step, and
+also why they are too expensive to run directly, so the [adaptive optimizers](/blog/math-llm-optimization)
+of Part 3 settle for cheap diagonal approximations of exactly this object.
+
+Maximum likelihood returns a single best parameter, but sometimes you want the full distribution of
+parameters consistent with the data, and that is what Bayesian inference provides through the posterior.
+
+$$
+p(\theta \mid D) \propto p(D \mid \theta)\, p(\theta)
+$$
+
+The posterior multiplies the likelihood, which is how well a parameter fits the data, by the prior, which
+encodes belief before any data arrived, and the two familiar estimation regimes fall out as special cases:
+maximum a posteriori estimation maximizes this product, MLE is MAP with a flat prior that contributes
+nothing, and the ubiquitous $L_2$ weight regularization is exactly MAP with a Gaussian prior that pulls
+parameters toward zero. What the Bayesian posterior buys over a point estimate is uncertainty — it does not
+
+<MLEvsMAPDemo />
+
+just say where $\theta$ probably is but how confidently, which is the information a single number throws
+away.
+
+The catch is that $p(\theta \mid D)$ is almost never available in closed form, so drawing from it requires
+sampling algorithms, and three are worth knowing because they recur across machine learning. The
+Metropolis–Hastings algorithm proposes a candidate $\theta'$ from some proposal $q(\theta' \mid \theta)$ and
+accepts it with a probability built from the posterior ratio and the proposal ratio.
+
+$$
+\alpha = \min\!\left( 1, \; \frac{p(\theta' \mid D)\, q(\theta \mid \theta')}{p(\theta \mid D)\, q(\theta' \mid \theta)} \right)
+$$
+
+Run this accept–reject loop long enough and the chain of accepted samples is guaranteed to converge to the
+true posterior regardless of the proposal, which is what makes it a general-purpose workhorse even when it is
+slow. A more scalable variant uses the gradient of the log-posterior to propose smarter moves — Langevin
+dynamics adds a gradient ascent step and a calibrated dose of Gaussian noise.
+
+$$
+\theta_{t+1} = \theta_t + \epsilon\, \nabla_\theta \log p(\theta \mid D) + \sqrt{2\epsilon}\; z, \qquad z \sim \mathcal{N}(0, I)
+$$
+
+This is gradient-based MCMC, and the update should look familiar: it is structurally the same as the reverse
+step of a [score-based diffusion model](/blog/diffusion-score-matching), where $\nabla \log p$ is the score
+the network learns — the resemblance is not a coincidence but a statement that diffusion sampling *is*
+Langevin sampling from a learned distribution. The third method is the one language models actually use:
+ancestral sampling draws each token in turn from $p_\theta(x_t \mid x_{<t})$, conditioning each draw on the
+ones before it, which for an autoregressive model is exact and approximation-free — sampling a sequence is
+nothing more than running the model forward and rolling its per-step dice.
+
+That exactness is precisely why decoding is interesting: you can sample the distribution faithfully, but
+sampling is not the same as finding its most probable sequence, and the standard decoding strategies are
+different compromises around that gap. Greedy decoding takes the argmax token at each step, which is cheap
+but myopic — locally maximizing each token does not maximize the sequence probability, because a slightly
+lower-probability token now can unlock a much higher-probability continuation later. Beam search hedges
+against that myopia by carrying $k$ candidate prefixes forward, extending each and keeping the best $k$, so
+it explores more of the tree and usually finds higher-probability sequences, though it remains a heuristic
+rather than an exact search. Temperature and nucleus sampling go the other way and embrace randomness:
+temperature sampling draws from the softmax distribution directly rather than taking its mode, and top-$p$
+(nucleus) sampling restricts each draw to the smallest set of tokens whose cumulative probability reaches
+$p$, trimming the unreliable tail while preserving diversity among the plausible options.
+
+The temperature in that softmax is worth isolating because it is the single most consequential decoding knob.
+
+<SamplingStrategyComparison />
+
+At $T = 1$ the model samples from the distribution it actually learned; at $T < 1$ it sharpens that
+distribution, concentrating mass on the highest-probability tokens and behaving more deterministically; and
+at $T > 1$ it flattens the distribution, spreading mass toward the tail and producing more varied — but also
+less coherent — text. The right setting is task-dependent: factual question answering wants a low
+temperature so the model commits to what it is confident about, while open-ended or creative generation
+wants a moderate temperature so it can explore, and pushing $T$ too high in either case trades coherence for
+novelty until the output dissolves into noise.
+
+Beam search carries one more subtlety that trips up naive implementations, which is that it systematically
+prefers short sequences. A sequence's log-probability is a sum of per-token log-probabilities, every one of
+them negative, so each additional token can only drive the total lower — a hundred-token sentence accumulates
+a hundred negative terms — and the search, comparing totals, drifts toward stopping early. The standard fix
+divides the score by the sequence length raised to a power $\alpha$.
+
+$$
+\mathrm{score}(y) = \frac{\log p(y)}{|y|^{\alpha}}
+$$
+
+Here $\alpha = 1$ normalizes fully by length, putting long and short hypotheses on equal footing, while
+$\alpha = 0$ recovers the unnormalized score and its short-sequence bias, and tuning $\alpha$ somewhere
+between the two is a real lever on generation quality for translation and summarization systems that rely on
+beam search.
+
+The throughline of this post is that statistics governs both ends of the pipeline: maximum likelihood
+explains why minimizing cross-entropy is the principled way to fit the model, the Cramér–Rao bound and the
+Fisher matrix explain why the geometry of that fit shapes optimization, and the sampling algorithms explain
+why decoding is its own hard problem with no single right answer. Every concept in this series so far —
+linear algebra, probability, optimization, nonlinearity, low-rank structure, evaluation, information,
+estimation — has been developed in isolation; the [final post](/blog/math-llm-putting-it-together) traces a
+single training step from end to end and shows them all firing at once.

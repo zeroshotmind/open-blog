@@ -1,0 +1,180 @@
+---
+title: "Putting It Together: The Mathematics of a Training Run"
+slug: "math-llm-putting-it-together"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 10
+tags: ["math", "llm-training", "transformers", "synthesis"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "A single training step involves linear algebra, probability, information theory, optimization, and statistical estimation — all at once. Here's how the pieces fit."
+---
+
+Nine posts have each isolated one mathematical idea, but a real training step does not isolate anything — it
+fires all of them inside a single forward-and-backward pass, in a fixed order, with each one handing its
+output to the next. The most useful way to end the series is to trace that one step from token to gradient
+update and name the concept doing the work at each stage, because seeing them compose is what turns nine
+separate tools into one coherent machine.
+
+### Step 1: Token embedding (linear algebra)
+
+A step begins with integer token IDs, which are not yet anything a matrix can act on, so the first operation
+turns each ID into a vector by looking up its row in the embedding matrix $W_e \in \mathbb{R}^{V \times d}$.
+
+$$
+x_0 = W_e^{\top} e_{\text{id}}, \qquad e_{\text{id}} \in \{0, 1\}^{V}
+$$
+
+This is a linear map from the one-hot encoding $e_{\text{id}}$ of the token to a dense vector $x_0 \in
+\mathbb{R}^d$, and because the one-hot has a single 1, the product is just the row of $W_e$ indexed by the
+token — the embedding lookup of [Part 1](/blog/math-llm-linear-algebra) is matrix multiplication wearing a
+disguise. Position then enters not as an addition but as a rotation: [RoPE](/blog/transformer-training-positional-encoding)
+turns each query and key by an angle proportional to its position, so relative position is encoded in the
+angle between vectors rather than in their magnitudes.
+
+### Step 2: Attention (linear algebra + probability)
+
+The embedded vectors flow into attention, which first produces three linear projections of the input — the
+queries, keys, and values — each one a matrix multiply against a learned weight.
+
+$$
+Q = x W_Q, \qquad K = x W_K, \qquad V = x W_V
+$$
+
+These are the column-mixing maps of Part 1 reshaping the residual stream into three different spaces, and the
+mechanism's core is to compare queries against keys by a scaled dot product, the similarity measure that the
+same post showed is large when two vectors align.
+
+$$
+A = \frac{Q K^{\top}}{\sqrt{d_k}}
+$$
+
+The raw scores $A$ are unbounded real numbers, so they are passed through the [softmax](/blog/math-llm-probability)
+of Part 2, which exponentiates and normalizes them into a probability distribution over positions.
+
+$$
+\mathrm{softmax}(A_i)_j = \frac{\exp(A_{ij})}{\sum_{k} \exp(A_{ik})}
+$$
+
+Each query now holds a normalized set of weights summing to one across all the keys, and the output of the
+sublayer is the value vectors averaged under exactly those weights.
+
+$$
+O = \mathrm{softmax}(A)\, V
+$$
+
+So attention is a weighted average of values where the weights are an attention *probability* distribution —
+linear algebra to compute the alignments, probability to turn the alignments into a convex combination.
+
+<ForwardPassTrace />
+
+### Step 3: Feed-forward network (linear algebra + activation functions)
+
+The attention output passes into the feed-forward block, which in a modern model is a gated SwiGLU: two
+linear projections combined through a nonlinear gate, then a third projection back down.
+
+$$
+\mathrm{FFN}(x) = \bigl( (x W_1) \odot \mathrm{Swish}(x W_{\text{gate}}) \bigr) W_2
+$$
+
+The element-wise product $\odot$ with the [Swish gate](/blog/math-llm-activation-functions) is the only
+nonlinearity in the block, and it is the entire reason the FFN can represent more than a single linear map —
+without it the three matrices would collapse into one, and the universal-approximation capacity that lets a
+network fit arbitrary functions would vanish.
+
+### Step 4: Loss computation (probability + information theory)
+
+The stack of layers ends by producing logits $z \in \mathbb{R}^V$, one real score per vocabulary token,
+which a final softmax turns into the model's predicted distribution over the next token $p_\theta(x_{t+1}
+\mid x_{\leq t})$. The loss is the negative log-probability the model assigned to the token that actually
+came next.
+
+$$
+L = -\log p_\theta(x_{t+1} \mid x_{\leq t})
+$$
+
+This is the [cross-entropy](/blog/math-llm-probability) of Part 2 and the maximum-likelihood objective of
+[Part 9](/blog/math-llm-statistical-foundations) seen at a single token, and it has the information-theoretic
+reading of Part 8 as well: minimizing it minimizes the KL divergence between the empirical data distribution
+and the model's distribution, which is the same as [compressing](/blog/math-llm-information-theory) the data
+as tightly as the model allows.
+
+<LossLandscapeSlice />
+
+### Step 5: Backward pass (optimization + linear algebra)
+
+To improve the parameters you need the gradient of $L$ with respect to every weight, which the chain rule
+computes by composing local derivatives backward through the network.
+
+$$
+\frac{\partial L}{\partial W} = \frac{\partial L}{\partial z}\, \frac{\partial z}{\partial W}
+$$
+
+Each factor $\partial z / \partial W$ is a Jacobian — a matrix of partial derivatives — so the backward pass
+is itself a chain of matrix products mirroring the forward one, and the residual connections of Part 1 make
+a decisive appearance in how the gradient travels through depth.
+
+$$
+\frac{\partial L}{\partial x_l} = \frac{\partial L}{\partial x_{l+1}} \left( I + \frac{\partial\, \mathrm{Sublayer}}{\partial x_l} \right)
+$$
+
+The identity matrix $I$ inside the parentheses is the gradient's safe passage: it guarantees that even if the
+sublayer's Jacobian shrinks toward zero, the gradient still flows straight through the residual path
+undiminished, which is why deep transformers train at all and why this term is central to the
+[normalization and stability](/blog/transformer-training-normalization) story of how those gradients are
+kept well-scaled.
+
+### Step 6: Optimizer update (optimization + statistics)
+
+<GradientFlowTrace />
+
+With a gradient $g_t$ in hand, the [Adam optimizer](/blog/math-llm-optimization) of Part 3 does not step
+along it directly but along smoothed estimates of its first two moments, beginning with an
+exponentially-weighted average of the gradient itself.
+
+$$
+m_t = \beta_1 m_{t-1} + (1 - \beta_1)\, g_t
+$$
+
+This running mean is momentum — it averages out the noise in successive gradients so the step follows the
+persistent direction rather than the jitter — and alongside it Adam tracks a second moment, the
+exponentially-weighted average of the squared gradient.
+
+$$
+v_t = \beta_2 v_{t-1} + (1 - \beta_2)\, g_t^2
+$$
+
+The quantity $v_t$ is a per-parameter estimate of gradient variance, and because both averages start at zero
+they are biased toward zero early in training, so each is divided by $1 - \beta^t$ to correct that
+initialization bias before they are used. The corrected moments $\hat{m}_t$ and $\hat{v}_t$ then combine
+into the final update.
+
+$$
+\theta \leftarrow \theta - \alpha\, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+Dividing the smoothed gradient by the square root of its smoothed variance gives every parameter its own
+effective learning rate — large where gradients have been small and consistent, small where they have been
+large and noisy — which is the adaptive, per-coordinate stepping that lets one global learning rate $\alpha$
+serve a model with billions of differently-behaved parameters.
+
+### What this series has built
+
+That single update closes one training step, and the next batch starts the whole sequence again, millions of
+times over. Look back across the six steps and the series assembles itself: linear algebra gave the language
+of transformations that carry vectors through every projection and Jacobian; probability gave the
+distributions that softmax produces and cross-entropy scores; information theory connected that scoring to
+compression, so a better predictor is provably a better compressor; optimization supplied the gradient
+machinery and the adaptive optimizer that actually shrinks the loss; activation functions supplied the
+nonlinearity without which the whole stack would collapse to a single matrix; the singular value
+decomposition explained why the [learned weights are low-rank](/blog/math-llm-svd-lora) and how LoRA exploits
+that to specialize a model cheaply; [evaluation metrics](/blog/math-llm-evaluation-metrics) gave the tools to
+measure whether any of it worked and the humility to report confidence intervals when it did; and the
+[statistical foundations](/blog/math-llm-statistical-foundations) grounded the entire training objective in
+maximum likelihood and grounded decoding in sampling. None of these is the secret to how a language model
+works, because there is no single secret — every training run exercises all of them at once, and reading the
+architecture as the place where they meet is the closest thing to understanding it whole.

@@ -1,0 +1,113 @@
+---
+title: "Information Theory for LLMs: Mutual Information, Entropy, and What Models Learn"
+slug: "math-llm-information-theory"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 8
+tags: ["math", "information-theory", "entropy", "representation-learning"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Information theory gives precise answers to questions like: how much does the context tell you about the next token? What information is preserved in a representation? Why does compression and prediction point to the same objective?"
+---
+
+Cross-entropy, the loss every language model minimizes, is a quantity borrowed from information theory, and
+the borrowing is not cosmetic — the whole machinery of training, representation learning, and compression
+turns out to be one subject viewed from three angles. The starting point, from [Part
+2](/blog/math-llm-probability), is Shannon entropy, the average uncertainty of a random variable.
+
+$$
+H(X) = -\sum_x p(x) \log p(x)
+$$
+
+Entropy is measured in bits when the logarithm is base two, and it has a concrete operational meaning: it is
+the average number of bits an optimal code needs to encode a draw from $X$. English text carries roughly one
+to one-and-a-half bits of genuine unpredictability per character, and a language model with a decent
+tokenizer operates at around three to four bits per token on average — which is to say the model has driven
+the uncertainty of the next token down to a few bits, and every bit it shaves off is a bit of structure it
+has learned to predict.
+
+The question of how much one variable tells you about another is answered by mutual information, which
+measures how much observing $Y$ reduces your uncertainty about $X$.
+
+$$
+I(X; Y) = H(X) - H(X \mid Y) = H(Y) - H(Y \mid X) = \mathrm{KL}\!\left( p(X, Y) \,\Vert\, p(X)\, p(Y) \right)
+$$
+
+The three expressions are the same number written three ways: the drop in $X$'s entropy once you know $Y$,
+the symmetric drop in $Y$'s entropy once you know $X$, and the KL divergence between the true joint
+distribution and the product of marginals you would have if $X$ and $Y$ were independent. When the variables
+are independent the joint equals the product, the KL is zero, and $I(X;Y) = 0$; the larger the mutual
+information, the more knowing one collapses your uncertainty about the other. In language modeling the
+relevant quantity is $I(x_t; x_{<t})$ — how much the preceding context reduces uncertainty about the next
+token — and that mutual information is exactly the predictable signal the model is trained to capture, the
+gap between the unconditional entropy of a token and its entropy given everything that came before.
+
+<MutualInformationExplorer />
+
+Mutual information also clarifies what a good *representation* is, through the information bottleneck. When
+you learn a representation $Z$ of an input $X$ to predict a target $Y$, you want two things at once: $Z$
+should tell you as much as possible about $Y$, and it should forget as much as possible of everything in $X$
+that is irrelevant to $Y$. Writing those two desires as a single objective gives the bottleneck Lagrangian.
+
+$$
+\max_Z \; I(Z; Y) - \beta\, I(Z; X)
+$$
+
+The coefficient $\beta$ sets the exchange rate between predictiveness and compression: at $\beta \to 0$ there
+is no pressure to forget and the optimum keeps everything, $Z = X$, while at $\beta \to \infty$ the pressure
+to forget overwhelms everything and $Z$ collapses to a constant that carries no information at all; in
+between, the optimal $Z$ is a compressed code that retains exactly the part of $X$ that is relevant to $Y$
+and discards the rest. A good representation, in this framing, is defined as much by what it throws away as
+by what it keeps.
+
+This is the lens that makes the zoo of self-supervised methods legible, because each one is a different
+choice of what $Z$ should be predictive of. A [masked autoencoder](/blog/ssl-masked-autoencoders) maximizes
+the information its representation carries about the raw masked patches, so $Z$ retains pixel-level detail
+because it is asked to reconstruct pixels; a [JEPA](/blog/ssl-ijepa) instead maximizes the information $Z$
+carries about an abstract *target representation* rather than raw pixels, which lets it discard pixel noise
+and keep semantic structure; and [contrastive learning](/blog/ssl-contrastive-learning) maximizes the
+mutual information between the representations of two augmented views of the same input while staying
+invariant to the augmentations, which is the bottleneck's "forget the irrelevant" term made into a training
+signal. Each method is the same bottleneck objective with a different answer to "predictive of what?"
+
+<InformationBottleneck />
+
+The deepest of these connections is between prediction and compression, and it is exact rather than
+analogical. An optimal lossless code assigns to a symbol $x$ a codeword of length $-\log p(x)$ bits, so a
+model that assigns probability $p_\theta(x_t \mid x_{<t})$ to each next token is, whether or not it was built
+to be, a compressor: feed its probabilities to an arithmetic coder and the average number of bits it spends
+per token is its cross-entropy. Minimizing the cross-entropy loss is therefore *identical* to minimizing the
+description length of the data under the model — a model that predicts the next token better is literally a
+model that compresses the corpus better — which is why low perplexity, good compression, and good language
+modeling are not three goals but one, and why the bits-per-byte a model achieves is sometimes reported in
+place of its loss.
+
+Mutual information measures association between whole distributions, but sometimes you want the association
+between two specific values, and pointwise mutual information supplies it.
+
+$$
+\mathrm{PMI}(x, y) = \log \frac{p(x, y)}{p(x)\, p(y)}
+$$
+
+PMI is the log-ratio of how often $x$ and $y$ actually co-occur to how often they would co-occur if they
+were independent, so it is large and positive when a particular pair shows up together far more than chance
+would predict, and mutual information is just the expectation of PMI over the joint distribution. The
+quantity is not a curiosity: Word2Vec, the embedding method that helped start the modern wave, was shown to
+implicitly factorize a shifted PMI matrix of word co-occurrences, so the geometry of its learned vectors is
+a low-rank approximation of pairwise PMI. The same flavor of association reappears inside transformers,
+where a large [attention weight](/blog/transformer-training-attention-variants) from token $i$ to token $j$
+corresponds, roughly, to a high PMI between them — the model attends from a query to the keys it is most
+informatively associated with.
+
+<PMIMatrix />
+
+Viewed this way, the objectives that look distinct across the field — next-token prediction, masked
+reconstruction, contrastive invariance, lossless compression — are all instances of moving information
+around under an entropy budget, which is what makes information theory the connective tissue of the whole
+series. What it does not by itself tell you is how to *estimate* the distributions it is built on from finite
+data, or how to sample from them once estimated, and those questions — the statistical foundations of
+fitting a model and decoding from it — are where [Part 9](/blog/math-llm-statistical-foundations) goes.

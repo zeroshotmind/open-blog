@@ -1,0 +1,164 @@
+---
+title: "Evaluation Metrics: Precision, Recall, Calibration, and Confidence"
+slug: "math-llm-evaluation-metrics"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 7
+tags: ["math", "evaluation", "metrics", "statistics", "llm"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "How do you measure whether a model is actually good? The answer is a set of metrics — precision, recall, F1, perplexity, calibration, confidence intervals — each measuring something different and failing in a different way."
+---
+
+A trained model produces predictions; the question evaluation answers is whether those predictions are any
+good, and the honest answer is that "good" is not one number but several, each measuring a different thing
+and each blind to a different failure. The most basic structure for thinking about it is the confusion
+matrix, which for a binary decision sorts every prediction into one of four cells: a true positive (TP) when
+the model says yes and the answer is yes, a false positive (FP) when it says yes and the answer is no, a true
+negative (TN) when it says no correctly, and a false negative (FN) when it says no and misses a real yes.
+Every classification metric that follows is just a ratio of these four counts, so all of them inherit
+whatever is true and whatever is misleading about how those counts were collected.
+
+The first ratio asks how much you can trust a positive prediction. Precision is the fraction of the model's
+positive calls that were correct.
+
+$$
+P = \frac{TP}{TP + FP}
+$$
+
+A precision of $0.95$ means that when the model flags something, it is right ninety-five percent of the
+time, so precision is the metric you care about when a false alarm is expensive — when acting on a wrong
+positive costs you something real — but notice that it says nothing whatsoever about the positives the model
+failed to flag.
+
+<BLEUScoreDemo />
+
+That blind spot is exactly what recall covers, by asking what fraction of the genuine positives the model
+managed to find.
+
+$$
+R = \frac{TP}{TP + FN}
+$$
+
+A recall of $0.60$ means the model caught sixty percent of the real cases and let the other forty percent
+slip past, so recall is the metric you care about when a miss is expensive — when failing to catch a true
+positive is the costly error — and it is just as one-eyed as precision, because it says nothing about how
+many false alarms you raised to achieve that coverage.
+
+<ROUGEvsSemanticDemo />
+
+The reason you cannot simply maximize both is that they trade off against each other through the decision
+threshold. A classifier usually outputs a score, and you call everything above some threshold a positive;
+raise the threshold and you become more conservative, firing only on the cases you are surest of, which
+pushes precision up and recall down, while lowering the threshold makes you more aggressive, catching more
+true positives at the cost of more false alarms, which pushes recall up and precision down. Neither end of
+this curve is universally better — the right operating point depends entirely on whether a false positive or
+a false negative is the more painful mistake in your application.
+
+When you genuinely care about both, you need a single number that refuses to be fooled by sacrificing one
+for the other, and the F1 score provides it by taking the harmonic mean of precision and recall.
+
+$$
+F_1 = \frac{2 P R}{P + R}
+$$
+
+The harmonic mean is the right choice here because it is dominated by the smaller of its two inputs: a model
+that achieves $P = 1.0$ but $R = 0.01$ — perfect precision on a single lucky case while missing essentially
+everything — scores $F_1 \approx 0.02$, not the comforting $0.5$ that an arithmetic mean would report, so
+F1 only rewards you when *both* numbers are decent, which is exactly the behavior you want from a summary
+statistic.
+
+F1 weights precision and recall equally, but equal weighting is a choice and not always the right one, so it
+generalizes to a family indexed by a parameter $\beta$ that tilts the balance.
+
+$$
+F_\beta = \frac{(1 + \beta^2)\, P R}{\beta^2 P + R}
+$$
+
+Setting $\beta = 2$ weights recall twice as heavily as precision, which is what you want when a missed
+positive is the worse error — a medical screen where a false negative sends someone home sick — whereas
+$\beta = 0.5$ weights precision twice as heavily, which is what you want when a false positive is the worse
+error, and $\beta = 1$ recovers the balanced F1.
+
+Classification metrics presume discrete labels, but a language model's native output is a probability
+distribution over the next token, and the metric that scores that directly is perplexity, defined as the
+exponentiated average of the model's per-token negative log-likelihood.
+
+$$
+\mathrm{PPL} = \exp\!\left( \frac{1}{N} \sum_{t=1}^{N} -\log p_\theta(x_t \mid x_{<t}) \right)
+$$
+
+The exponent inside is precisely the average [cross-entropy](/blog/math-llm-probability) loss, so perplexity
+is just that loss read on a more interpretable scale: a perplexity of 20 means the model is, on average, as
+uncertain at each token as if it were choosing uniformly among 20 equally likely options, and lower is
+better. The caveat that keeps perplexity honest is that it is measured against a distribution — a model can
+post a low perplexity on text that resembles its training data and still collapse on out-of-distribution
+input, so a good perplexity number is a statement about a particular corpus, not a certificate of general
+competence.
+
+Even a model with excellent accuracy can be untrustworthy in a subtler way: it can be wrong about how sure
+it is. A model is calibrated when its stated confidence matches its empirical accuracy — when, across all
+the times it says "eighty percent," it is in fact right eighty percent of the time.
+
+$$
+P(\text{correct} \mid \text{confidence} = p) = p \quad \text{for all } p
+$$
+
+You measure the violation of this ideal by bucketing predictions into confidence bins and summing, over the
+bins, the gap between the average confidence in a bin and the actual accuracy in that bin, weighted by how
+many predictions fall there.
+
+$$
+\mathrm{ECE} = \sum_{b} \frac{|B_b|}{N}\, \bigl| \mathrm{acc}(B_b) - \mathrm{conf}(B_b) \bigr|
+$$
+
+<CalibrationCurveDemo />
+
+This expected calibration error is often uncomfortably large for LLMs, and worse, fine-tuning — including
+the RLHF that makes models more helpful — frequently degrades calibration even as it improves accuracy, so
+a more accurate model can become a more confidently wrong one. The cheapest repair is temperature scaling:
+divide the logits by a single learned scalar $T$ before the softmax, which leaves the argmax (and therefore
+the accuracy) untouched while spreading or sharpening the probability mass until the confidence matches
+reality.
+
+Accuracy itself comes with an uncertainty that benchmark tables routinely hide. When you evaluate on $N$
+test examples and observe an accuracy $\hat{p}$, that $\hat{p}$ is an estimate of an unknown true accuracy
+$p$, and the Wilson score interval gives a principled 95% confidence range around it.
+
+$$
+\frac{\hat{p} + \dfrac{z^2}{2n} \pm z \sqrt{\dfrac{\hat{p}(1-\hat{p})}{n} + \dfrac{z^2}{4n^2}}}{1 + \dfrac{z^2}{n}}, \qquad z = 1.96
+$$
+
+For $N = 1000$ and $\hat{p} = 0.80$ this works out to roughly $[0.774, 0.824]$, an interval about five
+points wide, and the consequence is sobering: when two models differ by a point or two on a thousand-example
+benchmark, that difference sits comfortably inside both of their confidence intervals, so "Model A beats
+Model B" may be noise dressed up as a result, and a responsible comparison reports the interval rather than
+just the point estimate.
+
+Two more metrics deserve mention because they dominate generation evaluation, even though both are proxies.
+BLEU scores a machine translation or generation by the precision of its n-gram overlap with one or more
+references, combining the per-order precisions $p_n$ geometrically and multiplying by a brevity penalty $BP$
+that punishes outputs shorter than the reference.
+
+$$
+\mathrm{BLEU} = BP \cdot \exp\!\left( \sum_{n} w_n \log p_n \right)
+$$
+
+BLEU is precision-flavored — it asks whether the words you produced appear in the reference — whereas ROUGE
+is recall-flavored, with ROUGE-N measuring n-gram recall and ROUGE-L measuring the longest common
+subsequence, so it asks whether the reference's content shows up in your output, which is why ROUGE became
+the default for summarization. Both correlate with human judgment well enough to be useful and poorly enough
+to be gamed, and treating either as ground truth rather than as a cheap stand-in for human evaluation is how
+benchmarks get overfit.
+
+What every metric here shares is that it measures something you can count, and counting is exactly the limit:
+n-gram overlap is not faithfulness, low perplexity is not understanding, and a high F1 is not good judgment.
+The properties we most want from a model — that it is factually correct, that its reasoning holds, that it
+is genuinely helpful — are the ones that resist being reduced to a confusion matrix, and making those
+measurable is the open problem that alignment research is trying to solve. Before getting there, though, it
+is worth asking what these probabilities and distributions *are* at a more fundamental level, which is the
+province of [information theory](/blog/math-llm-information-theory).

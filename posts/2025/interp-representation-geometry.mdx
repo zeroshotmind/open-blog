@@ -1,0 +1,164 @@
+---
+title: "Representation Geometry: How Neural Networks Encode Meaning"
+slug: "interp-representation-geometry"
+summary: "The linear representation hypothesis, superposition, polysemanticity, and why transformer activations are more structured than they look."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - mechanistic-interpretability
+  - representation-learning
+  - superposition
+  - linear-representation-hypothesis
+  - transformers
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "mechanistic-interpretability"
+seriesOrder: 1
+references:
+  - id: mikolov2013
+    authors: "Mikolov et al."
+    year: "2013"
+    title: "Distributed Representations of Words and Phrases"
+    url: "https://arxiv.org/abs/1310.4546"
+  - id: gurnee2023
+    authors: "Gurnee & Tegmark"
+    year: "2023"
+    title: "Language Models Represent Space and Time"
+    url: "https://arxiv.org/abs/2310.02207"
+  - id: elhage2022
+    authors: "Elhage et al."
+    year: "2022"
+    title: "Toy Models of Superposition"
+    url: "https://transformer-circuits.pub/2022/toy_model"
+  - id: park2023
+    authors: "Park et al."
+    year: "2023"
+    title: "The Linear Representation Hypothesis and the Geometry of Large Language Models"
+    url: "https://arxiv.org/abs/2311.03658"
+---
+
+Every forward pass through a transformer produces a sequence of vectors — one per token, one per layer. These are not opaque blobs of floating-point noise. They are points in high-dimensional space, and their geometry carries the model's internal representation of meaning. Understanding that geometry is the entry point to mechanistic interpretability.
+
+## What is a representation?
+
+When a token passes through the embedding layer, it becomes a vector in $\mathbb{R}^d$ where $d$ is the model dimension (512, 768, 4096, depending on the architecture). At each subsequent transformer layer, that vector is updated by the attention and MLP sublayers. The result at any layer $l$ and position $i$ is called an activation: a point $\mathbf{x}_i^{(l)} \in \mathbb{R}^d$.
+
+The residual stream architecture of most modern transformers makes this especially clean. The input embedding is written into a $d$-dimensional "stream", and each sublayer reads from that stream and adds its output back in:
+
+$$
+\mathbf{x}^{(l+1)} = \mathbf{x}^{(l)} + \text{Attn}^{(l)}(\mathbf{x}^{(l)}) + \text{MLP}^{(l)}(\mathbf{x}^{(l)})
+$$
+
+This means the residual stream at layer $l$ is a running sum: the original embedding plus all contributions from every prior layer. It is the model's evolving "working memory" for a given token position.
+
+Geometry matters here because the operations downstream — attention dot products, MLP nonlinearities, the unembedding projection — are all sensitive to directions and magnitudes, not just individual coordinates. Two activation vectors that are numerically different but geometrically similar (small cosine distance) will produce similar downstream behavior. Two vectors that differ along a single direction in a semantically meaningful way will produce systematically different outputs along that dimension. This is not obvious from the raw numbers; it requires thinking about the space as a whole.
+
+<WordArithmeticDemo />
+
+## The linear representation hypothesis
+
+The central organizing claim of much of mechanistic interpretability is this: **features are encoded as linear directions in activation space**.
+
+A "feature" here is any human-interpretable property — the sentiment of a sentence, whether a token is a verb, whether the context is about royalty, whether the current token is in French. The claim is that for each such feature $f$, there exists a direction $\mathbf{v}_f \in \mathbb{R}^d$ such that the degree to which feature $f$ is present in the context is approximately proportional to the dot product $\mathbf{x} \cdot \mathbf{v}_f$.
+
+The most famous early evidence came not from transformers but from word2vec embeddings trained on plain text [Mikolov et al., 2013]. The word vectors satisfied arithmetic relationships like:
+
+$$
+\mathbf{e}(\text{king}) - \mathbf{e}(\text{man}) + \mathbf{e}(\text{woman}) \approx \mathbf{e}(\text{queen})
+$$
+
+This says that "royalty" and "gender" are encoded as independent linear directions: you can subtract one and add another and land near the correct word. It is a striking structural regularity that says the embedding space has *compositional geometry* — concepts combine by vector addition.
+
+Modern LLMs exhibit the same property at the level of intermediate activations. Gurnee & Tegmark (2023) showed that transformer residual stream activations contain linearly decodable representations of physical space and calendar time: a linear probe trained on the activations of a language model can predict the geographic coordinates of a location being discussed, or the year of a historical event, far above chance. The model is not storing these quantities explicitly in any dedicated component — they emerge distributed across the residual stream, but they are *linearly accessible*.
+
+Park et al. (2023) formalized this as the **linear representation hypothesis**: features of the world are encoded in transformer activations as linear functionals, and the geometry of the feature directions reflects the causal structure of the world (features that are causally independent correspond to directions that are approximately orthogonal).
+
+<ProbingProtocol />
+
+## Probing classifiers
+
+The standard experimental tool for testing whether a property is linearly encoded is the **probing classifier**. The protocol is:
+
+1. Collect a dataset of inputs $\{x_i\}$ labeled with the property of interest (e.g., "Is this sentence positive or negative?").
+2. Run each input through the frozen, pretrained model and extract the activation $\mathbf{h}_i = \mathbf{x}^{(l)}_\text{token}$ at some layer $l$ and position of interest.
+3. Train a linear classifier $f(\mathbf{h}) = \mathbf{w}^\top \mathbf{h} + b$ on the collected activations.
+4. Evaluate classification accuracy on a held-out test set.
+
+If a linear classifier achieves high accuracy, the property is linearly encoded at that layer. If you need a nonlinear classifier (e.g., a small MLP) to achieve the same accuracy, the property may be present but not linearly accessible.
+
+What probing tells you and what it does not are importantly different. High probe accuracy means **the information is present** in the activations at that layer. It does not mean **the model uses that information** in that way. A model could represent sentiment linearly in layer 10 without that representation causally influencing the final output — it might be a byproduct of other computations rather than a functional circuit. Distinguishing "information present" from "information used" requires causal interventions: patching activations, ablations, or activation steering (which we cover in a later post in this series).
+
+This is the fundamental limitation of probing as a tool. It is diagnostic, not mechanistic. It tells you where to look; it does not explain what the model is computing.
+
+<SuperpositionDemo2 />
+
+## Superposition
+
+Here is the core tension. A model with a $d$-dimensional residual stream has a vector space of dimension $d$. In that space, there are at most $d$ truly orthogonal directions. But the world has far more than $d$ features — a 4096-dimensional model cannot have 4096 truly independent features representing every relevant property of every possible context.
+
+What does the model do? It uses **superposition**: it stores more features than dimensions by using *nearly* orthogonal directions and tolerating the interference that results.
+
+Elhage et al. (2022) studied this precisely in "Toy Models of Superposition". They trained a simple model to reconstruct sparse inputs through a bottleneck: if inputs are $n$-dimensional but most features are zero most of the time (sparse), the model can compress through a $d$-dimensional bottleneck ($d < n$) and still recover almost all the information, because the features that are active simultaneously are unlikely to collide.
+
+The key insight is that when features are **sparse** — rarely active — superposition is viable. If feature $A$ is active in 1% of inputs and feature $B$ is active in 1% of inputs and they are independent, they co-occur in only 0.01% of inputs. Storing them along nearly-orthogonal directions (cosine similarity $\sim 0$, not exactly $0$) means they interfere rarely, and the expected error from interference is low.
+
+The geometry of superposed features is not random. Elhage et al. found that the optimal configurations are polygons and polyhedra: features arrange themselves in regular geometric structures (pairs of antipodal vectors, triangles, pentagons, tetrahedra) that maximize the minimum angle between any two feature directions given the constraint that they all fit in a $d$-dimensional space.
+
+For a model with $d$ dimensions storing $n > d$ features with sparsity $s$ (fraction of inputs on which each feature is active), the expected squared interference between features $i$ and $j$ stored along directions $\mathbf{v}_i$ and $\mathbf{v}_j$ is:
+
+$$
+\mathbb{E}[\text{interference}^2] = s^2 (\mathbf{v}_i \cdot \mathbf{v}_j)^2
+$$
+
+Summing over all feature pairs, the total loss from superposition is minimized by configurations that make $|\mathbf{v}_i \cdot \mathbf{v}_j|$ small on average — i.e., approximately uniform distributions on the sphere. The sparser the features, the more superposition the model can tolerate without significant loss.
+
+## Polysemanticity
+
+Superposition has a direct observable consequence: **polysemanticity**. If features are stored as directions rather than as individual neurons, then a given neuron (a single coordinate of the activation vector) is not the natural unit of analysis. A neuron activates whenever the activation vector has a positive component along that coordinate — but a single coordinate in $\mathbb{R}^d$ can be a large component of many different feature directions simultaneously.
+
+The result is that individual neurons respond to multiple, often unrelated, concepts. A neuron in GPT-2 might fire strongly for "Toronto", for mentions of the NBA, and for the actor Keanu Reeves — not because these are semantically related, but because the features for those concepts happen to have large projections onto that neuron's coordinate. This is polysemanticity.
+
+Polysemanticity makes the "just look at what activates each neuron" approach to interpretability fail. You cannot read off a single clean concept from most neurons in large models, because the neuron is not the right unit of analysis. The feature direction is — but finding feature directions requires decomposing the activation space, which is what sparse autoencoders (SAEs) attempt to do.
+
+The contrast is with **monosemanticity**: a feature direction along which only one concept is encoded, so that the component of any activation along that direction varies in direct proportion to a single interpretable property. SAEs try to learn a dictionary of monosemantic features from the polysemantic activations of a trained model. We cover SAEs in detail in a later post.
+
+## Finding directions: cosine similarity and mean differences
+
+If features are linear directions, how do you find them without training a probe? The simplest method is the **mean difference direction**.
+
+Suppose you want the direction for feature $f$ (e.g., "positive sentiment"). Collect two sets of inputs: $\mathcal{P}$ where $f$ is present (positive reviews) and $\mathcal{N}$ where $f$ is absent (negative reviews). Extract activations $\{\mathbf{h}_i\}_{i \in \mathcal{P}}$ and $\{\mathbf{h}_j\}_{j \in \mathcal{N}}$ at the layer of interest. The feature direction is:
+
+$$
+\hat{\mathbf{v}}_f = \frac{\bar{\mathbf{h}}_\mathcal{P} - \bar{\mathbf{h}}_\mathcal{N}}{\|\bar{\mathbf{h}}_\mathcal{P} - \bar{\mathbf{h}}_\mathcal{N}\|}
+$$
+
+where $\bar{\mathbf{h}}_\mathcal{P}$ and $\bar{\mathbf{h}}_\mathcal{N}$ are the mean activations over each set. This is the L2-normalized mean difference — it points in the direction that best discriminates the two classes in a linear sense, and because it is normalized to unit length, the natural similarity measure between two activation vectors with respect to this direction is the cosine similarity:
+
+$$
+\text{cos}(\mathbf{h}, \hat{\mathbf{v}}_f) = \frac{\mathbf{h} \cdot \hat{\mathbf{v}}_f}{\|\mathbf{h}\|}
+$$
+
+This is closely related to what a linear probe learns: the weight vector $\mathbf{w}$ of a trained logistic regression is also a direction in $\mathbb{R}^d$, and at convergence it approximates the mean difference direction when classes are balanced and the activations are roughly Gaussian. The mean difference is faster to compute and requires no optimization, but it can be biased by confounders in the dataset (if positive reviews are also longer, the direction will capture some length-related signal alongside sentiment).
+
+Working with L2-normalized directions is the right abstraction because:
+
+1. The *magnitude* of an activation vector changes across contexts for reasons unrelated to the presence of specific features. A long, complex sentence will have larger-magnitude activations simply because more information is being tracked.
+2. The *direction* — the unit vector — is more stable across variations in context and more directly related to what the model "knows" about a specific property.
+3. Cosine similarity in the range $[-1, 1]$ gives a normalized score: $+1$ means maximally aligned with the feature, $-1$ means maximally anti-aligned, $0$ means orthogonal (feature absent or not detectable).
+
+## Why this matters
+
+The geometry of representations has concrete downstream implications across safety, robustness, and our understanding of what models actually know.
+
+**Steering.** If features are linear directions, you can modify them directly at inference time: compute a steering vector for a concept (using the mean difference or a trained probe), and add a scaled multiple of that vector to the residual stream during a forward pass. This is activation steering — the model's internal representation of the target concept is shifted, and its outputs change accordingly. The linear structure is what makes this possible. We cover steering in detail later in this series.
+
+**Adversarial examples.** The same linear geometry that enables steering also explains a class of adversarial vulnerabilities. Small, imperceptible perturbations to the input that move the activation in the direction of a target class can flip the model's behavior. The linearity of feature encoding means that features can be manipulated with surprisingly small input changes — the signal is spread across many dimensions, but so is the adversarial perturbation.
+
+**World models.** Gurnee & Tegmark's result — that LLM activations contain linearly decodable geographic coordinates and temporal positions — suggests that models doing next-token prediction on text about the world develop internal representations of world structure as a byproduct. The model never trained to encode latitude and longitude; it learned to predict tokens, and encoding spatial structure turned out to be useful for that. This raises the possibility that large models have substantially richer internal world-models than their output behavior alone would suggest, with implications for both capability evaluation and safety.
+
+Understanding representation geometry is the foundation for everything else in mechanistic interpretability. Attribution, circuit analysis, SAEs, steering — all of these tools assume or exploit the linear structure we have described here. The next post covers attention heads as information routing mechanisms and how to read what a circuit is computing.

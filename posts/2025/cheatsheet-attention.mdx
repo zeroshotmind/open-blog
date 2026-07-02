@@ -1,0 +1,183 @@
+---
+title: "Cheatsheet: Attention"
+slug: "cheatsheet-attention"
+date: "2025-01-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "cheatsheets"
+seriesOrder: 4
+tags: ["cheatsheet", "attention", "transformers", "architecture"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Every equation in scaled dot-product attention and multi-head attention annotated term-by-term — the scaling, the softmax, the heads, RoPE, and KV cache — with links to the posts explaining each design choice."
+---
+
+import { Callout } from '@/components/mdx-components'
+
+Self-attention is the core operation of every transformer. This cheatsheet walks the equations from raw input tokens to multi-head output, annotating every design decision and linking to deeper explanations.
+
+---
+
+## Scaled dot-product attention
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+---
+
+## Term-by-term
+
+### $Q$, $K$, $V$ — queries, keys, values
+
+Given an input matrix $X \in \mathbb{R}^{n \times d_{\text{model}}}$ (sequence length $n$, model dimension $d_{\text{model}}$):
+
+$$
+Q = X W^Q, \quad K = X W^K, \quad V = X W^V
+$$
+
+where $W^Q, W^K \in \mathbb{R}^{d_{\text{model}} \times d_k}$ and $W^V \in \mathbb{R}^{d_{\text{model}} \times d_v}$ are learned projection matrices.
+
+**Why three separate projections?** The query, key, and value serve different roles. The query encodes *what this token is looking for*; the key encodes *what this token offers to be found by*; the value encodes *what information to pass on if found*. Keeping them separate allows the model to learn asymmetric matching relationships. See [QKOVCircuitDemo](/blog/interp-transformer-components).
+
+---
+
+### $QK^\top$ — attention scores
+
+$$
+S = QK^\top \in \mathbb{R}^{n \times n}
+$$
+
+Entry $S_{ij}$ is the dot product between the query for token $i$ and the key for token $j$ — a measure of how relevant token $j$ is to token $i$.
+
+**Complexity:** Computing all $n^2$ pairs requires $O(n^2 d_k)$ time and $O(n^2)$ memory — the quadratic bottleneck that motivates FlashAttention and sparse attention variants. See [FlashAttentionMemory](/blog/transformer-training-attention-variants).
+
+---
+
+### $\frac{1}{\sqrt{d_k}}$ — the scaling factor
+
+$$
+\text{Scaled scores} = \frac{QK^\top}{\sqrt{d_k}}
+$$
+
+**Why divide by $\sqrt{d_k}$?** The dot product $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$. If $q_i$ and $k_i$ are independent with zero mean and unit variance, each term contributes variance 1, so the sum has variance $d_k$. Dividing by $\sqrt{d_k}$ restores unit variance — keeping the scores in a range where $\text{softmax}$ remains spread out rather than saturating toward a one-hot distribution. See [SinusoidalHeatmap](/blog/transformer-training-positional-encoding).
+
+---
+
+### $\text{softmax}(\cdot)$ — attention weights
+
+$$
+\alpha_{ij} = \frac{\exp(S_{ij} / \sqrt{d_k})}{\sum_{k=1}^{n} \exp(S_{ik} / \sqrt{d_k})}
+$$
+
+The softmax is applied row-wise (each query independently), producing a probability distribution over all $n$ key positions. $\alpha_{ij}$ is the weight token $i$ assigns to token $j$.
+
+**Why softmax rather than a hard argmax?** Softmax is differentiable — gradients flow through all positions, not just the maximum. It also allows the attention to blend information from multiple tokens simultaneously, which a hard selection could not do.
+
+**Temperature and sharpness.** Dividing the logits by a temperature $\tau$ before softmax controls sharpness: $\tau < 1$ sharpens (more selective), $\tau > 1$ flattens (more diffuse). The $\sqrt{d_k}$ scaling is effectively setting $\tau = \sqrt{d_k}$. See [SoftmaxTemperature](/blog/math-llm-probability).
+
+---
+
+### Causal masking (decoder-only)
+
+For autoregressive models, token $i$ must not attend to future positions $j > i$:
+
+$$
+S_{ij} \leftarrow S_{ij} + M_{ij}, \quad M_{ij} = \begin{cases} 0 & j \leq i \\ -\infty & j > i \end{cases}
+$$
+
+Adding $-\infty$ to future positions before softmax maps them to $\exp(-\infty) = 0$, making their contribution exactly zero.
+
+**Why add $-\infty$ rather than zero-out the weights post-softmax?** Post-softmax zeroing would break the normalisation — the remaining weights would no longer sum to 1. Adding $-\infty$ pre-softmax lets the softmax normalise correctly over only the allowed positions.
+
+---
+
+### $V$ — value aggregation
+
+$$
+\text{Output} = \alpha V = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+The output for token $i$ is the weighted sum of all value vectors, with weights given by the attention distribution. Each output dimension is an independent linear combination — the attention weights select *which* tokens to aggregate but the value projection determines *what* information each token contributes.
+
+---
+
+## Multi-head attention
+
+$$
+\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h)\, W^O
+$$
+
+$$
+\text{head}_j = \text{Attention}(Q W^Q_j,\, K W^K_j,\, V W^V_j)
+$$
+
+Each head $j$ has its own projection matrices $W^Q_j \in \mathbb{R}^{d_{\text{model}} \times d_k}$, $W^K_j$, $W^V_j$, where $d_k = d_{\text{model}} / h$.
+
+**Why multiple heads?** A single attention operation produces one weighted average — it can attend strongly to one relationship at a time. Multiple heads can simultaneously attend to syntactic structure, semantic similarity, positional proximity, and coreference in different representation subspaces. The concatenation then fuses all these views. See [AttentionHeadDiagram](/blog/transformer-training-attention-variants).
+
+**Total parameter count** of multi-head attention:
+$$
+4 \cdot d_{\text{model}}^2 \quad \text{(} W^Q, W^K, W^V \text{ each } d_{\text{model}} \times d_{\text{model}} \text{, and } W^O \text{)}
+$$
+
+---
+
+## Rotary positional encoding (RoPE)
+
+Instead of adding a positional vector to the embedding, RoPE rotates the query and key vectors by an angle proportional to their absolute position before computing dot products:
+
+$$
+\tilde{q}_m = R_m q_m, \qquad \tilde{k}_n = R_n k_n
+$$
+
+$$
+\tilde{q}_m^\top \tilde{k}_n = q_m^\top R_m^\top R_n k_n = q_m^\top R_{n-m} k_n
+$$
+
+The dot product depends only on the **relative position** $n - m$, not on absolute positions — the model sees positional information as relative distance, not as absolute indices.
+
+**Why relative rather than absolute positions?** Language is largely positional relative to context, not absolute. "The dog that bit the man" — the relationship between "dog" and "bit" matters, not which absolute token positions they occupy. Relative encoding also generalises better to lengths unseen during training. See [RoPERotationDemo](/blog/transformer-training-positional-encoding) and [PEEvolutionComparison](/blog/transformer-training-positional-encoding).
+
+---
+
+## KV cache
+
+During autoregressive decoding, the keys and values for all past tokens are constant — they do not change as new tokens are generated. Caching them avoids recomputation:
+
+| Without cache | With cache |
+|---|---|
+| Recompute $K, V$ for all $n$ tokens at each step | Compute $K, V$ for the new token only; concatenate with cache |
+| $O(n^2)$ per generation step | $O(n)$ per generation step |
+| $O(1)$ memory (activations not stored) | $O(n \cdot h \cdot d_k)$ memory per layer |
+
+**What exactly is cached?** The projected key matrix $K = X W^K$ and value matrix $V = X W^V$ for every layer and every head. The query is recomputed fresh for each new token since it changes at every step. See [KVCacheCalculator](/blog/transformer-training-attention-variants) and [KVCacheMemoryGrowth](/blog/kv-cache-lifecycle).
+
+---
+
+## Grouped-query attention (GQA)
+
+Standard multi-head attention has one KV head per query head. GQA reduces this to $g$ KV groups shared across $h/g$ query heads each:
+
+$$
+\text{GQA}: \quad h \text{ query heads},\quad g \text{ KV heads},\quad g \ll h
+$$
+
+**Why?** KV cache memory scales with the number of KV heads. With $h = 32$ heads and $g = 8$ groups, cache memory drops by $4\times$ with minimal quality loss. See [GQAHeadComparison](/blog/large-model-architecture-comparison).
+
+---
+
+## Complexity summary
+
+| Quantity | Standard attention |
+|---|---|
+| Time | $O(n^2 d)$ |
+| Memory (attention matrix) | $O(n^2)$ |
+| KV cache per layer | $O(n \cdot 2 \cdot h \cdot d_k)$ |
+| Parameters | $4 d_{\text{model}}^2$ |
+
+<Callout title="Further reading">
+  [Positional encoding deep dive](/blog/transformer-training-positional-encoding) · [Attention variants (KV cache, GQA, FlashAttention)](/blog/transformer-training-attention-variants) · [Mechanistic view of attention heads](/blog/interp-transformer-components) · [Long context and RoPE scaling](/blog/long-context-mid-training)
+</Callout>

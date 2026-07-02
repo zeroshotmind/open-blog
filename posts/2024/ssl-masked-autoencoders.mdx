@@ -1,0 +1,99 @@
+---
+title: "Masked Autoencoders: Learning by Filling in the Blanks"
+slug: "ssl-masked-autoencoders"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ssl-world-models"
+seriesOrder: 3
+tags: ["ssl", "mae", "masked-autoencoders", "vision-transformers"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Mask 75% of an image's patches. Train a model to reconstruct them. The result is a rich visual representation — and the recipe works because pixels are redundant and structure is not."
+---
+
+The other way to manufacture a target is to hide part of the input and ask the model to restore it.
+This is the recipe that made BERT: mask a fraction of the tokens in a sentence, train the model to
+predict the missing ones from the surrounding context, and the representation it builds along the way
+turns out to be broadly useful. Language took to it immediately. The obvious question — and the one
+that took years to answer well — is whether the same idea works for pixels.
+
+## Why predicting pixels naively fails
+
+<MaskRatioDemo />
+
+The first attempts reconstructed pixels directly and were disappointing. A model trained to regress the
+exact RGB values of a masked region under a mean-squared-error loss discovers a cheap shortcut: predict
+the *average* color of the area. Blurry, low-frequency guesses minimize pixel MSE remarkably well
+because natural images are locally smooth, and the loss rewards getting the average right far more than
+it rewards getting the details right. The trouble is that predicting a patch's mean color requires no
+understanding of what is *in* the patch — no notion of object, boundary, or part. The supervisory
+signal is real but it points at the wrong thing, and the representation that results is weak.
+
+## BEiT: predict tokens, not pixels
+
+<BEiTvsMAEComparison />
+
+BEiT ([Bao et al., 2021](https://arxiv.org/abs/2106.08254)) sidesteps the blur problem by changing the
+target from pixels to discrete codes. First train a discrete VAE to map image patches to a vocabulary
+of visual tokens; then mask patches and train the model to predict the *token IDs* of the masked
+positions, exactly as BERT predicts word IDs. Because each token stands for a discrete visual concept
+rather than a continuous color, there is no averaging escape hatch — the model has to commit to *which*
+concept was hidden, and that forces a more structural kind of understanding.
+
+The cost is the pipeline. BEiT needs a dVAE trained first, as a separate stage, before the masked
+modeling can even begin, and the quality of the visual vocabulary upper-bounds what the second stage
+can learn. A single-stage method that reconstructs pixels directly *and* learns good features would be
+strictly simpler — if you could get past the blur.
+
+## MAE: make the encoder cheap and the task hard
+
+<MAEEncoderEfficiency />
+
+MAE ([He et al., 2022](https://arxiv.org/abs/2111.06377)) gets past it with two ideas that work
+together: mask a *lot*, and make the architecture asymmetric. Split the image into patches and remove
+75% of them. The encoder — a large Vision Transformer — sees only the 25% that remain; it never
+processes a mask token at all. Its output embeddings, plus a set of shared learnable mask tokens
+inserted at the missing positions, are handed to a separate, shallow decoder that reconstructs the raw
+pixels of the masked patches.
+
+The asymmetry is the engineering insight. Because the encoder operates only on the visible quarter of
+the patches, a step costs roughly a quarter of what a full-image ViT would, which is what makes
+training a *large* encoder affordable. The difficult reconstruction work is pushed into the decoder,
+which is deliberately lightweight and — critically — discarded after pretraining. You pay for decoder
+capacity only during training, and you spend encoder capacity only on real content, never on mask
+placeholders. Reconstructing raw pixels turns out to be fine as a target once the masking ratio is high
+enough; the high ratio is what rescues the simple pixel loss that failed in the naive setting.
+
+## Why 75% is the number
+
+The reason such an aggressive ratio works is that images are spatially redundant in a way sentences are
+not. Adjacent patches share texture, color, and continuation, so a small visible fraction already
+pins down a lot of the neighborhood. Mask only 15% and the task is trivial: every hidden patch has
+visible neighbors that all but determine it, and the model solves the problem by local interpolation
+without ever forming a global picture. Push the ratio to 75% and local interpolation stops working —
+too much is missing for neighbor-copying to suffice — so the model is forced to reason about the whole
+scene to fill the gaps. The masking ratio is, in effect, a difficulty dial, and you want it set high
+enough that the only viable strategy is understanding.
+
+## Different methods learn different things
+
+MAE and contrastive learning are not two roads to the same representation; they build different ones.
+MAE's objective is tied to spatial position — it must reconstruct *this* patch *here* — so it preserves
+fine-grained spatial information, which is exactly what detection and segmentation need. Contrastive
+methods, as Part 2 laid out, optimize for invariance, which produces strongly semantic features that
+excel at classification and nearest-neighbor retrieval but blur the spatial detail MAE keeps. The
+empirical pattern follows the objectives: MAE tends to transfer better when you fine-tune for dense
+prediction, while [DINO](/blog/ssl-contrastive-learning) tends to win at frozen-feature retrieval. The
+"best" self-supervised method is not a single answer — it depends on which structure you need
+downstream.
+
+There is a thread common to both families, though, and it is worth naming because it sets up what comes
+next. Contrastive learning matches views in a representation space, but the thing it ultimately keys on
+is low-level invariance to pixel augmentations. MAE predicts pixels outright. Both, at bottom, are tied
+to the raw signal — view similarity in one case, pixel values in the other. The question that motivates
+the rest of this series is whether you can keep the predictive framing of MAE but move the *target* out
+of pixel space and into an abstract, semantic space where the irrelevant detail has already been thrown
+away. That is the bet [JEPA](/blog/ssl-jepa-idea) makes.

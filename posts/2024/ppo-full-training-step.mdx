@@ -1,0 +1,181 @@
+---
+title: "The Full PPO Training Step: Value Loss, Entropy, and GAE"
+slug: "ppo-full-training-step"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+tags: ["rl", "ppo", "llm-training", "rlhf"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "ppo-loss-per-token covered the clipped surrogate objective. This post covers what surrounds it: how the value function is trained, where the advantage estimates come from, and why the entropy bonus exists."
+---
+
+The clipped surrogate objective is one of three loss terms PPO optimizes simultaneously, and on its
+own it explains almost nothing about why the algorithm works. The policy gradient term — the
+[token-by-token clipped objective](/blog/ppo-loss-per-token) — tells the policy to take better
+actions, but it leans on an advantage estimate it does not produce. The value loss trains the critic
+that supplies those advantages, and the entropy bonus stops the policy from collapsing onto a single
+deterministic output before it has found anything worth committing to. All three share one backward
+pass.
+
+## The value head
+
+In LLM RLHF the value function is not a separate network but a scalar head bolted onto the last
+transformer layer, reading the same hidden state the policy reads. At token $t$ it maps the final
+hidden state $h_t \in \mathbb{R}^d$ to a single number through a learned row vector.
+
+$$
+V_\phi(x, y_{<t}) = W_v \, h_t, \qquad W_v \in \mathbb{R}^{1 \times d}
+$$
+
+Because $W_v$ sits on top of the shared backbone, the critic and the policy see identical
+representations and differ only in their final projection — which is exactly why training one
+perturbs the other, a point that returns below. What $V_\phi$ estimates is the expected future reward
+from position $t$ onward, the baseline the advantage will be measured against.
+
+## GAE: where the advantages come from
+
+Given a completed rollout, the value head emits $V_t = V_\phi(x, y_{<t})$ at every position, and
+[generalized advantage estimation](/papers/gae) turns that sequence of values plus the rewards into a
+sequence of advantages. The atom it is built from is the temporal-difference residual, the one-step
+error between the bootstrapped estimate and the realized value.
+
+$$
+\delta_t = r_t + \gamma \, V_{t+1} - V_t
+$$
+
+Here $r_t$ is the shaped reward at token $t$ — zero everywhere except the final token under an
+outcome reward model — and $\gamma$ is a discount that is almost always set to $1.0$ for language
+tasks, since there is no reason to value an early token of a response above a late one. GAE then sums
+these residuals with a geometric decay, trading off how far into the future each one is allowed to
+speak.
+
+$$
+\hat A_t = \sum_{l=0}^{L-t} (\gamma\lambda)^l \, \delta_{t+l}
+$$
+
+The parameter $\lambda$ (with $0.95$ a standard choice) interpolates between the high-bias,
+low-variance estimate at $\lambda = 0$ — pure one-step TD — and the low-bias, high-variance Monte
+Carlo return at $\lambda = 1$. For an outcome-only reward model the expression collapses to something
+intuitive: since every $r_t = 0$ until the end, the advantage at the final token is simply $R - V_t$,
+and that signal propagates backward through earlier tokens with $\lambda$ controlling how much it
+decays per step. Once every advantage is computed, the batch is whitened to zero mean and unit
+variance, which keeps the gradient scale stable across rollouts whose raw rewards may differ by orders
+of magnitude.
+
+<GAEExplorer />
+
+## The value loss
+
+The critic is trained by regressing its predictions onto the empirical returns, but a naive squared
+error lets a single update move $V_\phi$ far enough to invalidate the advantages computed from its
+older self. PPO defends against this the same way it defends the policy — by clipping — taking the
+larger of the unclipped and clipped squared errors so the pessimistic one dominates.
+
+$$
+\mathcal{L}_V = \mathbb{E}_t\Big[\max\big((V_t - R_t)^2,\ (\operatorname{clip}(V_t, V_t^{\text{old}} - \epsilon,\, V_t^{\text{old}} + \epsilon) - R_t)^2\big)\Big]
+$$
+
+Here $R_t$ is the empirical return from $t$ onward, $V_t^{\text{old}}$ is the value the frozen
+rollout-time snapshot predicted, and $\epsilon$ is the same clip radius ($0.2$) the policy uses. The
+clip bounds how far $V_t$ may drift from $V_t^{\text{old}}$ in a single update, which matters because
+the ratios in the policy loss were all computed against advantages derived from $V_t^{\text{old}}$ —
+let the critic lurch and those advantages become stale mid-epoch.
+
+## The entropy bonus
+
+Left alone, an RL-trained policy sharpens: it discovers what the reward model likes and pours
+probability mass onto it, narrowing the distribution at each step. The entropy bonus pushes back, and
+the quantity it rewards is the Shannon entropy of the next-token distribution.
+
+$$
+H_t = -\sum_{v} \pi_\theta(v \mid x, y_{<t}) \, \log \pi_\theta(v \mid x, y_{<t})
+$$
+
+Adding $+\beta_H \, \mathbb{E}_t[H_t]$ to the objective (positive, because we want entropy large while
+the surrogate loss is being minimized) keeps the distribution from concentrating before the policy has
+actually found good strategies. High entropy means the policy is still exploring; entropy near zero
+means it has committed to a mode, possibly the wrong one, and the coefficient $\beta_H$ — typically
+$0.001$ to $0.01$ — sets how strongly premature commitment is resisted.
+
+<EntropyCollapseDemo />
+
+## The combined loss and why the inner loop exists
+
+The three terms add into one scalar, with the value term scaled down and the entropy term subtracted
+so that maximizing entropy reads as minimizing its negative.
+
+$$
+\mathcal{L}_\text{total} = \mathcal{L}_\text{policy} + c_V \, \mathcal{L}_V - c_H \, H
+$$
+
+with $c_V \approx 0.5$ and $c_H \approx 0.01$ the usual defaults.
+
+<PPOLossDecomposition /> A single backward pass differentiates
+this through both heads at once, and because they share the backbone, the gradient that updates the
+representations is a sum of a policy contribution and a value contribution that generally point in
+different directions. This coupling is the catch: a large value step changes the very hidden states
+the policy gradient was linearized around, so neither head can be trusted far from where the rollout
+was taken. PPO answers by refusing to take one big step — it runs several small inner epochs
+(typically four) over the same frozen batch of rollouts, each nudging both heads a little while the
+clips keep ratios and values inside their trust regions.
+
+## One iteration, in code
+
+Stacking the rollout phase and the inner epochs together, a single PPO iteration is a no-grad
+generation-and-scoring block followed by a short optimization loop over the data it produced.
+
+```python
+# 1. Rollout phase (no grad)
+with torch.no_grad():
+    completions = policy.generate(prompts)            # sample from π_θ
+    rewards     = reward_model(prompts, completions)  # scalar per completion
+    old_logp    = policy.log_probs(prompts, completions)  # (B, L) per token
+    old_values  = policy.value(prompts, completions)      # (B, L) per token
+    advantages  = compute_gae(rewards, old_values, gamma=1.0, lam=0.95)
+    advantages  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    returns     = advantages + old_values             # targets for the value head
+
+# 2. Inner epochs (grad flows)
+for _ in range(4):  # K inner epochs on the same rollout batch
+    logits, values = policy(prompts, completions)
+    new_logp = per_token_logps(logits, completions)
+
+    # Policy loss (derived in ppo-loss-per-token)
+    ratio = torch.exp(new_logp - old_logp)
+    L_policy = -torch.min(ratio * advantages,
+                          torch.clamp(ratio, 0.8, 1.2) * advantages).mean()
+
+    # Value loss, clipped against the rollout-time values
+    v_clipped = old_values + torch.clamp(values - old_values, -0.2, 0.2)
+    L_value = torch.max((values - returns) ** 2, (v_clipped - returns) ** 2).mean()
+
+    # Entropy bonus
+    dist = torch.distributions.Categorical(logits=logits)
+    H = dist.entropy().mean()
+
+    loss = L_policy + 0.5 * L_value - 0.01 * H
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+    optimizer.step()
+```
+
+Notice that `advantages` broadcasts over the token axis exactly as it did in the
+[per-token loss](/blog/ppo-loss-per-token): the GAE step has already collapsed the per-token
+machinery into the scalar each completion carries, and `returns = advantages + old_values` recovers
+the regression targets the critic chases.
+
+## What this costs
+
+Read off the loop and the bill is obvious. Each rollout batch demands one autoregressive generation
+pass (slow, because it cannot be parallelized across the sequence), reward-model inference over every
+completion, and then four forward-and-backward passes through a model that is carrying both a policy
+head and a value head. A single PPO update lands somewhere around five to six times the cost of an SFT
+step on the same batch, and the value head is responsible for a large share of that — a second set of
+activations to store, a second loss to balance, a second source of instability to babysit. That
+arithmetic is precisely the opening that [DPO](/papers/dpo), which discards the reward model and the
+rollout loop entirely, and [GRPO](/papers/grpo), which keeps the rollout loop but throws out the value
+head, were built to exploit — and the value head's absence is where the next post starts.

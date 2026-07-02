@@ -1,0 +1,104 @@
+---
+title: "Normalization in Transformers: Why Pre-LN Became the Default"
+slug: "transformer-training-normalization"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "transformer-training"
+seriesOrder: 1
+tags: ["transformers", "normalization", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Post-LN dominated the original transformer. Pre-LN dominates everything since GPT-2. The reason comes down to gradient flow — and the math is clean enough to be worth understanding."
+---
+
+Where you put the LayerNorm inside a transformer block is not a minor hyperparameter you tune after
+the fact. It decides whether the network trains stably from a random initialization or whether you
+need a warmup schedule, gradient clipping, and a lot of patience just to get past the first few
+thousand steps. The original transformer and the model families that followed it split on exactly
+this choice, and the split is not stylistic — it is a statement about how gradients reach the bottom
+of a deep stack.
+
+The original "Attention Is All You Need" architecture put the normalization *after* the residual
+addition, a layout now called Post-LN. Each block adds its sublayer output back to the input and then
+normalizes the sum.
+
+$$
+x_{l+1} = \mathrm{LayerNorm}\big(x_l + F(x_l)\big)
+$$
+
+The consequence is that there is no clean path from the output of layer $l+1$ back to the input
+$x_l$: every backward signal has to pass through the LayerNorm operation, including its division by
+the per-token standard deviation $\sigma(x_l)$.
+
+That division is where the trouble lives. At initialization the sublayer $F$ is close to a zero map,
+so $x_l + F(x_l) \approx x_l$, and the LayerNorm Jacobian is dominated by its $1/\sigma$ scaling. When
+you chain this across dozens of layers, the scale factors multiply, and gradients to the early layers
+are attenuated by a factor that compounds with depth. This is why Post-LN models are notoriously
+warmup-sensitive: without a slow ramp on the learning rate, the early updates are either vanishingly
+small or, once the scales drift, large enough to destabilize the whole stack.
+
+Pre-LN moves the normalization *inside* the residual branch, normalizing the input to the sublayer
+and leaving the residual addition untouched. The block becomes a clean identity plus a normalized
+function.
+
+$$
+x_{l+1} = x_l + F\big(\mathrm{LayerNorm}(x_l)\big)
+$$
+
+Now the residual stream is an unobstructed highway: nothing sits between $x_l$ and $x_{l+1}$ except
+the addition itself.
+
+That structural change is visible directly in the backward pass. Differentiating the Pre-LN update
+with respect to the layer input gives an identity term plus the sublayer's Jacobian.
+
+$$
+\frac{\partial \mathcal{L}}{\partial x_l} = \frac{\partial \mathcal{L}}{\partial x_{l+1}} \big(I + J_F\big)
+$$
+
+The identity $I$ guarantees that every layer receives the downstream gradient essentially undiminished
+no matter how deep the network is, so the early layers learn from step one and the warmup that
+Post-LN demanded becomes optional rather than load-bearing.
+
+<GradientFlowComparison />
+
+The historical record tracks this almost perfectly. The models that used Post-LN are the early ones,
+trained at modest depth with careful schedules; everything built for scale switched to Pre-LN.
+
+| Model | Normalization placement |
+| --- | --- |
+| Original Transformer (2017) | Post-LN |
+| BERT | Post-LN |
+| GPT-2 | Pre-LN |
+| GPT-3 | Pre-LN |
+| LLaMA | Pre-LN |
+| Gemini | Pre-LN |
+| DeepSeek | Pre-LN |
+
+<NormalizationTimeline />
+
+The full analysis of why the placement changes the gradient picture — and the regimes where Post-LN
+can still be made to work — is worth reading in the [Pre-LN vs Post-LN paper explainer](/papers/pre-ln).
+
+Modern models keep the Pre-LN placement and then go a step further on the normalizer itself. Standard
+LayerNorm subtracts the mean and divides by the standard deviation, which costs two passes over the
+feature dimension and a learned bias $\beta$ that, empirically, the network barely uses. RMSNorm drops
+the mean-centering entirely and rescales by the root-mean-square of the activations alone.
+
+$$
+\mathrm{RMS}(x) = \sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2}, \qquad \hat{x} = \frac{x}{\mathrm{RMS}(x)} \odot \gamma
+$$
+
+What you keep is the learned scale $\gamma$; what you throw away is the mean subtraction and the bias
+$\beta$, which buys roughly 15% faster normalization with no measurable loss in quality — which is why
+LLaMA, and most of what came after it, uses it. The [RMSNorm paper explainer](/papers/rmsnorm) covers
+the ablations that established this.
+
+<LayerNormVsRMSNorm />
+
+Normalization is what keeps the forward and backward passes well-scaled enough to train at all. It
+does not, by itself, decide how quickly the loss comes down or how good the final minimum is — that is
+the optimizer's job, and the difference between a default Adam configuration and a tuned one is larger
+than most people expect. That is Part 2.

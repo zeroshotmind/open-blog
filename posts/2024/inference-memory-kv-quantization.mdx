@@ -1,0 +1,61 @@
+---
+title: "KV Cache Memory: Quantization, Eviction, and the Long-Context Problem"
+slug: "inference-memory-kv-quantization"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 3
+tags: ["inference", "kv-cache", "quantization", "memory", "long-context"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "The KV cache is the memory bottleneck in LLM inference. As context length grows, it dominates GPU memory. Here's how quantization, eviction policies, and architectural changes manage it."
+---
+
+Weights are a fixed cost you pay once; the KV cache is a running cost that grows with every token of every concurrent request, and past a certain context length it, not the model, is what fills the GPU. The [lifecycle of a KV cache](/blog/kv-cache-lifecycle) lays out the per-token footprint and why decode is bandwidth-bound — what follows is the management problem that footprint creates once you try to serve long contexts at scale, and the three families of answers: shrink each entry, drop entries you can spare, or change the architecture so the entries are smaller by construction.
+
+## The cache at production scale
+
+<KVCacheSizeCalculator />
+
+Scale the per-token formula up to a frontier-sized model and the constraint becomes obvious. Serving Llama-3-70B (80 layers, 8 KV heads under grouped-query attention, $d_\text{head}=128$, fp16) at 8K context per sequence holds
+
+$$
+2 \times 80 \times 8 \times 128 \times 8192 \times 2\ \text{bytes} \approx 2.68\ \text{GB}
+$$
+
+of cache for a single request. Four H100s give 320 GB total; weights take $\sim 140$ GB, leaving $\sim 180$ GB for cache — room for about 67 concurrent 8K-context sequences before eviction starts. Long context does not merely cost memory, it costs concurrency, which is the same thing as throughput.
+
+## Quantizing the cache
+
+<QuantizationErrorDemo />
+
+The cheapest lever is to store each entry in fewer bits. Casting the KV cache from fp16 to INT8 halves its footprint with minimal quality loss, and INT4 quarters it at a larger but often tolerable cost. The keys and values do not tolerate it equally: keys feed the softmax, so a rounding error in a key distorts the entire attention distribution downstream, whereas a rounding error in a value is only linearly combined into the output and stays local. [KIVI](/papers/kivi) (Liu et al., 2024) exploits exactly this asymmetry in *granularity*: it quantizes both keys and values to 2-bit, but applies the scaling per-channel for keys and per-token for values,
+
+$$
+\text{KV}_\text{quant} = \operatorname{round}\!\left(\frac{\text{KV}}{s}\right) \cdot s, \qquad s = \frac{\max(|\text{KV}|)}{2^{b-1} - 1},
+$$
+
+and reaches roughly a $2\times$ memory reduction — halving the cache from 16-bit down to an average of about 2-bit — with minimal quality degradation on most benchmarks. The per-channel-versus-per-token choice reflects an empirical finding: key activations have more structured outliers, which per-channel scaling captures, while value activations are smoother across channels. The lesson it encodes is that the quantization scheme should not be uniform across keys and values — match the granularity to where rounding errors do the most damage.
+
+## Evicting what the model will not miss
+
+<EvictionStrategyComparison2 />
+
+When the cache fills and quantization is already spent, the remaining option is to stop keeping every position. [StreamingLLM](/papers/streaming-llm) (Xiao et al., 2023) keeps two regions and discards the middle: a handful of attention-sink tokens at the very start, which models attend to heavily regardless of content — apparently as a normalization outlet rather than for meaning — and a sliding window of recent tokens. Dropping everything between them bounds the cache and enables effectively infinite generation, at the price of forgetting anything that scrolled out of the window mid-document. [H2O](/papers/h2o) (Heavy Hitter Oracle) evicts more selectively by tracking cumulative attention mass per position and discarding the lowest scorers, which preserves genuinely important tokens wherever they sit but requires carrying the attention-score history that selectivity depends on.
+
+## Reusing prefixes across requests
+
+Some of the cache should never be recomputed in the first place. Production traffic shares prefixes constantly — an identical system prompt, the same few-shot exemplars in front of every query — and prefix caching stores the KV blocks for a shared prefix once and hands the same blocks to every request that opens with it. vLLM does this by hashing cache blocks: if the leading tokens of a new request hash to blocks already resident, those blocks are reused directly and their prefill is skipped entirely. For a 1000-token system prompt sitting in front of every request, that elides the single most expensive part of each prefill before the request's own tokens are even touched.
+
+## Compressing the cache by design
+
+The architectural answer is to make each cached entry small at the source rather than after the fact. Multi-head Latent Attention (MLA), introduced in DeepSeek-V2, projects the per-token key/value information down to a low-rank latent before caching it,
+
+$$
+c^{KV}_t = W_{DKV}\, h_t, \qquad c^{KV}_t \in \mathbb{R}^{d_c},\ d_c \ll 2\, n_\text{heads}\, d_\text{head},
+$$
+
+then up-projects $K = W_{UK}\, c^{KV}_t$ and $V = W_{UV}\, c^{KV}_t$ at attention time. The cache now stores $d_c$ numbers per token instead of $2\, n_\text{heads}\, d_\text{head}$, and for DeepSeek-V2's $d_c = 512$ against a nominal $2 \times 128 \times 128 = 32768$ that is a $64\times$ reduction — the same long-context wall the eviction and quantization tricks chip at, moved instead by changing what attention chooses to remember.

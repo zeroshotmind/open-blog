@@ -1,0 +1,164 @@
+---
+title: "The LLM Alignment Pipeline: SFT, Reward Models, and RL End to End"
+slug: "llm-alignment-pipeline"
+summary: "Training a helpful, harmless, honest LLM requires three sequential stages that each build on the previous one. Here's how SFT, reward modeling, and RL fit together as a system — and where each stage can fail."
+date: "2024-06-19"
+contentType: "blog-post"
+publishOnZeroShotMind: true
+tags:
+  - alignment
+  - rlhf
+  - sft
+  - reward-model
+  - llm-training
+series: "llm-training-lifecycle"
+seriesOrder: 3
+authors:
+  - name: "Admin"
+    orcid: ""
+---
+
+A base pretrained model can finish "The recipe for chocolate chip cookies is" with a fluent,
+high-probability continuation, and that is the only thing it knows how to do. Nothing in the
+pretraining loss — next-token cross-entropy over web text — ever encoded *helpful*, *harmless*, or
+*honest*; those are properties of how a person uses an answer, not of how likely the answer is under
+the training corpus. Alignment is the engineering of a distribution shift, from "what token comes
+next in web text" to "what response a helpful assistant would give," and in practice it is carried out
+by three stages that each solve a problem the previous stage left open. The three stages are familiar
+in outline — the [Learning from Feedback](/blog/rl-for-llms-learning-from-feedback) post derives the
+RLHF objective stage by stage — so the goal here is the systems view: what data each stage consumes,
+what it costs to run, and the specific way each one breaks.
+
+## Stage 1: supervised fine-tuning turns a completer into a follower
+
+
+<AlignmentPipelineFlow />
+
+SFT converts a document completer into an instruction follower using pairs of (prompt, ideal_response)
+written or curated by annotators, training on cross-entropy over the response tokens only with the
+prompt masked out. The loss is the same one that defines language modeling, restricted to the tokens
+the assistant is supposed to produce.
+
+$$
+\mathcal{L}_\text{SFT}(\theta) = -\sum_{t=1}^{L} \log \pi_\theta(y_t \mid x, y_{<t})
+$$
+
+Masking the prompt is what makes this instruction tuning rather than plain continuation: the gradient
+only ever rewards producing the response given the prompt, never reconstructing the prompt itself.
+
+The reason SFT alone caps out is a property of its supervision signal. An annotator writes *a* good
+response, not the best response across the distribution of completions the model could sample, so SFT
+trains the model to imitate the annotator distribution and inherits its ceiling at annotator quality.
+More limiting still, SFT has no mechanism to tell the model which of *its own* samples is better — at
+inference the model generates many candidate completions, and nothing in the cross-entropy loss ranks
+them. That missing ranking signal is exactly what stages two and three supply.
+
+Data quality dominates data volume here. [InstructGPT](/papers/instructgpt)'s finding that a small set of carefully written,
+diverse, edge-case-covering demonstrations beats an order of magnitude more noisy pairs is the
+operational rule: ten thousand clean prompt-response pairs outperform a million scraped ones. SFT is
+also where the interface contract is fixed — single-turn versus multi-turn, system-prompt handling,
+and tool-call formatting are all established by what the demonstrations look like, and they are
+expensive to change downstream.
+
+## Stage 2: a reward model that judges instead of speaks
+
+
+<KLPenaltyTradeoff />
+
+The reward model learns to score a response the way a human would, trained on pairs of responses to
+the same prompt labeled with a preference $y_w \succ y_l$. It is initialized from the SFT checkpoint —
+same architecture and weights, with the language-model head replaced by a scalar regression head — and
+trained on the Bradley–Terry objective, which models the probability a human prefers $y_w$ as the
+logistic of the score difference.
+
+$$
+\mathcal{L}_\text{RM}(\phi) = -\,\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}}\Big[ \log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big) \Big]
+$$
+
+Minimizing it pulls the preferred response's score above the rejected one's by a margin that grows
+with how confidently humans chose the winner, so unlike SFT the RM never learns *what* to say — it
+learns only to judge what it is shown.
+
+Preference data scales differently from demonstration data. Anthropic's HH-RLHF dataset comprised
+roughly 170K human preference pairs; Llama 2 used on the order of 1.4M. More
+helps, but the marginal pair matters only if the two responses actually differ — a comparison between
+two near-identical answers teaches the RM almost nothing, so collection effort is better spent on
+prompts and response pairs that produce genuine disagreement.
+
+The RM is a proxy for human judgment, and that is its standing failure mode. Optimizing against a
+proxy is optimizing against its blind spots: once the policy is pushing hard, it finds responses that
+the RM scores highly but a human would rate poorly — gratuitous verbosity, flattery, formatting tricks
+that exploit a length or structure bias the RM picked up. This is reward hacking, and the
+[over-optimization curve](/papers/reward-hacking) — true quality falling while measured reward keeps
+climbing — is a property of optimizing a proxy at all, not a bug in any particular RM.
+
+## Stage 3: RL optimizes the policy against the score
+
+
+<RewardHackingDemo />
+
+The RL stage initializes the policy from the SFT checkpoint, samples responses, scores them with the
+RM, and updates the policy toward higher reward — the per-step mechanics of the
+[full PPO training step](/blog/ppo-full-training-step) and the advantage estimation it relies on
+([GAE](/papers/gae)) are worked through elsewhere. The piece that makes the stage stable rather than
+self-destructive is the leash: a KL penalty against the SFT reference, so the effective per-response
+reward is the RM score minus a penalty for drifting away from the anchor.
+
+$$
+r(x, y) = r_\phi(x, y) - \beta\, \mathrm{KL}\big(\pi_\theta(\cdot \mid x)\,\|\,\pi_\text{SFT}(\cdot \mid x)\big)
+$$
+
+Without the KL term the policy optimizes the RM without bound and collapses onto reward-hacking
+outputs; with it, the SFT checkpoint sets a floor on quality because every unit of reward the policy
+chases costs something whenever earning it requires drifting into strange territory.
+
+The coefficient $\beta$ is the exchange rate, tuned empirically and typically in the 0.04–0.2 range:
+larger keeps the policy conservative and close to SFT, smaller buys more optimization against the RM
+at higher hacking risk. The stage is also the expensive one operationally — each step generates
+completions (slow, autoregressive), scores them with the RM, and computes policy-gradient updates
+while holding the policy, a value head, and a frozen reference model in memory at once. For a 70B
+policy that is four to eight H100s just to hold the parameters, before any activation or optimizer
+state, which is why algorithmic simplifications that drop the value network — [GRPO](/papers/grpo),
+contrasted with PPO in [GRPO vs PPO](/blog/grpo-vs-ppo) — or the reward model entirely
+([DPO](/papers/dpo)) are attractive in production.
+
+## Constitutional AI moves the labeler from people to a model
+
+[Constitutional AI](/papers/constitutional-ai) replaces the human in the labeling loop with a model governed by a written
+constitution — a list of natural-language principles. In the supervised phase, the model critiques its
+own response against a principle and revises it, and the revision becomes the SFT target; in the
+preference phase, a model asked "which response better follows principle X?" generates the comparison
+labels that train the RM. The pipeline shape is unchanged — SFT, RM, RL — but the annotation bottleneck
+moves, because millions of preference pairs can be generated from a constitution without proportional
+human labor. The system then inherits the judgment of whatever model is doing the labeling, which is
+the trade you are making for the scale.
+
+## Where each stage fails, and how you'd catch it
+
+The failure modes are stage-specific, and so are the evaluations that catch them. SFT fails by
+annotator distribution shift — annotators write what sounds good to annotators, which is not always
+what real users need — and by coverage gaps where uncommon prompts simply are not in the demonstration
+set; you measure it with held-out instruction-following benchmarks. The RM fails by proxy
+misalignment that does not generalize to novel attack vectors, by a length bias that scores longer
+responses higher regardless of content, and by sensitivity to surface formatting; you measure it with
+held-out preference-pair accuracy. RL fails by reward hacking, by mode collapse onto a narrow set of
+response styles, and by catastrophic forgetting that degrades capabilities the SFT model had; you
+measure it with human preference evals against the SFT baseline, because a rising RM score is exactly
+the number you cannot trust at that point.
+
+## The pipeline is a loop, not a recipe
+
+Production alignment runs the stages on a cadence rather than once. Each iteration collects fresh
+prompts from production traffic, runs the current policy to generate responses, has annotators add
+preference labels on the edge cases the RM handles worst, retrains or fine-tunes the RM, and runs
+another RL pass. The SFT model is the slow-moving foundation and is updated least often; the RM and the
+policy turn over with every iteration, because they are the parts that track the moving distribution of
+what users actually ask and where the current policy currently fails.
+
+Read end to end, the alignment pipeline is a data pipeline wearing a training pipeline's clothes. SFT
+is bounded by annotator quality, the RM by preference-label quality, and RL by RM proxy quality — and
+algorithmic advances like GRPO, DPO, and Constitutional AI change the cost and the failure surface of
+each stage without changing that ordering. The reward model is a proxy, the AI labeler is a proxy for a
+human, and even a verifiable checker is a proxy for "actually good," so the limiting factor in a real
+alignment system is almost never the optimizer — it is the quality and coverage of the human signal
+feeding the whole chain.

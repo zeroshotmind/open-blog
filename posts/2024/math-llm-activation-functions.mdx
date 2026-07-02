@@ -1,0 +1,140 @@
+---
+title: "Activation Functions: The Nonlinearity That Makes Neural Networks Work"
+slug: "math-llm-activation-functions"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 5
+tags: ["math", "activation-functions", "neural-networks", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Without nonlinearity, stacking layers collapses to a single matrix multiplication. Activation functions break that linearity — and the choice of which one determines expressivity, gradient flow, and training efficiency."
+---
+
+[Part 1](/blog/math-llm-linear-algebra) made a point that becomes a problem here: a matrix is a linear map,
+and a stack of linear maps is still just a linear map. Multiply $W_n \cdots W_2 W_1$ together and you get a
+single matrix, so a network of nothing but linear layers — however deep — can only ever represent linear
+functions of its input, no matter how many layers you pile on. The activation function is what breaks that
+collapse; inserting a nonlinearity between the layers makes the composition genuinely nonlinear and unlocks
+the network's ability to approximate complicated functions.
+
+The earliest choice was the sigmoid, which squashes any real number into the open interval $(0, 1)$.
+
+$$
+\sigma(x) = \frac{1}{1 + e^{-x}}, \qquad \sigma'(x) = \sigma(x)\big(1 - \sigma(x)\big)
+$$
+
+Its derivative is the source of its downfall: at $x = \pm 5$ the gradient is already about $0.006$, and in a
+deep network these tiny factors multiply together through the chain rule, shrinking the gradient
+exponentially as it propagates backward — the vanishing gradient problem that made deep sigmoid networks
+nearly impossible to train, which is why sigmoid survives today only inside gating components and the
+occasional binary output, never as a hidden activation.
+
+Tanh is the same shape shifted and stretched to be zero-centered, mapping inputs to $(-1, 1)$ instead of
+$(0, 1)$.
+
+$$
+\tanh(x) = \frac{e^x - e^{-x}}{e^x + e^{-x}} = 2\sigma(2x) - 1, \qquad \tanh'(x) = 1 - \tanh^2(x)
+$$
+
+Being centered at zero helps gradient flow, because the activations no longer carry a constant positive
+bias into the next layer, but tanh saturates just as flatly as sigmoid at its extremes and so inherits the
+same vanishing-gradient disease in deep stacks.
+
+The function that broke the field open was the rectified linear unit, which is almost embarrassingly simple:
+pass positive inputs straight through and zero out the rest.
+
+$$
+\mathrm{ReLU}(x) = \max(0, x)
+$$
+
+Its derivative is exactly one for positive inputs and zero otherwise, so it never saturates on the positive
+side and gradients flow through unattenuated — the property that made very deep networks trainable and let
+ReLU dominate from roughly 2012 to 2020. Its one failure mode is the dead neuron: if a unit's pre-activation
+is always negative, perhaps because of a large negative bias, its gradient is always zero and it never
+updates again, though in practice this afflicts only a small fraction of units and training proceeds fine.
+
+The dead-neuron problem invites obvious patches, and Leaky ReLU and ELU are the two common ones. Leaky ReLU
+gives the negative side a small slope so gradient never fully vanishes there, while ELU uses a smooth
+exponential curve for negative inputs that also produces negative outputs.
+
+$$
+\mathrm{LeakyReLU}(x) = \max(\alpha x, x), \qquad \mathrm{ELU}(x) = \begin{cases} x & x > 0 \\ \alpha(e^x - 1) & x \le 0 \end{cases}
+$$
+
+Both keep negative-region gradients alive and ELU's negative outputs help re-center activations the way tanh
+does, but in practice the improvement over plain ReLU is modest, which is why neither displaced it.
+
+<ActivationExplorer />
+
+<VanishingGradientDemo />
+
+The activation that took over language models is GeLU, which weights each input by the probability that a
+standard Gaussian falls below it — a soft, probabilistic version of ReLU's hard gate.
+
+$$
+\mathrm{GeLU}(x) = x \, \Phi(x) \approx x \, \sigma(1.702 \, x)
+$$
+
+Here $\Phi$ is the Gaussian CDF, so instead of ReLU's abrupt cutoff at zero, GeLU smoothly scales each input
+by how likely it is to be "on," giving a function that is differentiable everywhere including at the origin;
+this smoothness consistently helps on language tasks, and GeLU became the activation of BERT, GPT-2, and
+GPT-3.
+
+The current frontier default goes a step further by making the nonlinearity itself input-dependent. SwiGLU
+splits the input through two separate linear projections, runs one through a Swish nonlinearity, and
+multiplies them element-wise.
+
+$$
+\mathrm{SwiGLU}(x, W, V) = \mathrm{Swish}(xW) \otimes (xV), \qquad \mathrm{Swish}(x) = x \, \sigma(\beta x)
+$$
+
+The second projection acts as a gate that decides, per component, how much of the first projection passes
+through, and because this gating burns parameters on a third matrix the feed-forward hidden dimension is
+set to $\tfrac{8}{3} d_\text{model}$ rather than the usual $4 d_\text{model}$ to keep the parameter count
+matched; SwiGLU is now used in LLaMA, PaLM, Gemini, and essentially every frontier model since 2022, and the
+practical reasons sit alongside the other [architecture internals](/blog/transformer-training-architecture-internals)
+that determine how transformers train.
+
+<SwiGLUArchitecture />
+
+## Which open-source models use which activation
+
+The table below is sourced directly from each model's `config.json` and `modeling_*.py` on Hugging Face — no inference, no approximation.
+
+| Model | Activation | Where it appears | Verified source |
+|---|---|---|---|
+| GPT-2 (1.5B) | **GELU (approximate)** — `gelu_new`, tanh approximation $x \cdot \sigma(1.702x)$ | FFN: `W_2 · gelu_new(W_1 x)` | [`config.json`](https://huggingface.co/openai-community/gpt2/blob/main/config.json) · [`modeling_gpt2.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py) |
+| Qwen3-8B | **SwiGLU** — SiLU gate, `hidden_act: "silu"` | FFN: `down_proj(silu(gate_proj(x)) * up_proj(x))` | [`config.json`](https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json) · [`Qwen3MLP.forward`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) |
+| DeepSeek-V3 (671B MoE) | **SwiGLU** — SiLU gate, `hidden_act: "silu"` | Both dense (layers 1–3) and each routed expert FFN (layers 4–61) | [`config.json`](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json) · [`inference/model.py`](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py) |
+| DeepSeek-R1 | **SwiGLU** (identical to V3) | Same — architecture is identical to DeepSeek-V3 | Same code as V3 |
+| GPT-OSS-20B / 120B | **SwiGLU** — SiLU gate + `swiglu_limit: 7.0` clamp | MoE expert FFNs; gate activation clamped at ±7 for training stability | [`config.json`](https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json) · [`modeling_gpt_oss.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py) |
+
+A note on reading these configs: when you see `hidden_act: "silu"` in a modern model's `config.json`, it does **not** mean a plain `silu(W₁x)` FFN. It means the SiLU function is the gate activation inside a SwiGLU block. The three-matrix structure (`gate_proj`, `up_proj`, `down_proj`) is what makes it SwiGLU; the config key just names the nonlinearity applied to the gate branch. Plain SiLU as a standalone activation (without the gating branch) is what you'd see in a two-matrix MLP without `up_proj`.
+
+GPT-2's `gelu_new` is the tanh-approximate GELU from the original GPT-2 paper — $x \cdot \sigma(1.702x)$ instead of the exact $x \cdot \Phi(x)$ — retained for compatibility with the original weights. Newer models (BERT, RoBERTa) use exact GELU; the tanh form is GPT-2 specific.
+
+It is worth being explicit about why a gate helps, because it is a different idea from a plain
+nonlinearity. The gate $\sigma(xV)$ is a learned, soft mask over the hidden units, so the feed-forward
+block can switch different subsets of its neurons on and off depending on the input — a form of conditional
+computation where the effective function the block computes changes from token to token rather than being
+fixed by the weights alone. That extra flexibility buys roughly a point of perplexity over GeLU at matched
+compute, which at scale is a large margin for so small a change.
+
+Standing behind all of these choices is a guarantee that explains why any of it is worth doing: the
+universal approximation theorem says a single hidden layer with a nonlinear activation and enough width can
+approximate any continuous function on a compact domain to arbitrary precision. The theorem is existence,
+not construction — it promises nothing about how many neurons you need, which could be astronomically many,
+or whether gradient descent will ever find the weights — but it establishes that the function class
+neural networks can represent is rich enough to be worth searching, and the activation function is the
+ingredient that makes the class rich in the first place.
+
+These five tools — the geometry of vectors and matrices, the probability of distributions, the optimizer
+that minimizes a loss, the loss that specifies the goal, and the nonlinearity that gives the network its
+expressive power — are the load-bearing mathematics under every transformer paper. The series continues
+from here into the tools for analyzing, compressing, and evaluating what these networks learn: the SVD and
+low-rank structure that make LoRA work, the entropy and information measures that quantify what a model
+knows, and the evaluation metrics that tell us whether it knows the right things.

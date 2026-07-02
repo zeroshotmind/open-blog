@@ -1,0 +1,67 @@
+---
+title: "V-JEPA: Predicting the Future in Representation Space"
+slug: "ssl-vjepa"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ssl-world-models"
+seriesOrder: 6
+tags: ["ssl", "jepa", "v-jepa", "video", "world-models"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "V-JEPA extends JEPA to video: predict the representations of future or masked frames from context frames. No pixel reconstruction, no contrastive loss — just abstract prediction across time."
+---
+
+Hand a JEPA model video instead of a still image and the prediction task gains an axis it never had before. Where
+[I-JEPA](/blog/ssl-ijepa) hides spatial blocks of one image and predicts their representations from the rest of that
+same image, [V-JEPA (Bardes et al., 2024)](/papers/v-jepa) hides regions of a *clip* — patches that span both space and time — and predicts their
+representations from the context that remains. The held-out region can sit later in the clip than the context, so
+the model is no longer only reasoning about what lies outside the frame; it is reasoning about what comes next.
+
+The machinery is the image setup lifted into three dimensions. A spatio-temporal ViT tokenizes the clip into 3D
+patches that span height, width, and a short stretch of time, and the context encoder processes only the visible
+tokens to produce context embeddings. A target encoder — again an exponential-moving-average copy whose weights
+receive no gradient — encodes the full clip to produce the targets. The predictor takes the context embeddings plus
+positional mask tokens for each masked spatio-temporal location and outputs a predicted representation there, trained
+under the same stop-gradient mean-squared-error objective that kept I-JEPA from collapsing.
+
+<VideoJEPAPredictionDemo />
+
+How the clip is masked decides what the model is forced to learn. Two schemes dominate. *Tube* masking removes the
+same spatial region across every time step, so the hole is a column drilled straight through the clip and nothing
+visible at any frame sits where the answer should be; the only way to fill it is to infer how the scene evolves from
+the frames around it. *Random block* masking instead removes 3D blocks scattered through space and time, which usually
+leaves a visible version of the masked region at some nearby frame, so the model can solve much of the task by copying
+across a short temporal gap rather than predicting genuine dynamics. Tube masking is the harder of the two and the one
+that pushes the encoder toward temporal reasoning.
+
+<TemporalMaskingDemo />
+
+Nothing in this objective mentions objects, motion, or physics, yet a model that does it well has to behave as though
+it understood all three. To place a sensible representation on a tube it cannot see, it has to carry an object's
+identity across the frames where that object is hidden, respect the fact that motion is smooth rather than teleporting,
+and infer the contents of an occluded region from what the visible frames imply. None of that is labeled. It is what a
+purely predictive loss extracts from raw video once the masking makes copying impossible.
+
+<VJEPAvsVideoMAEComparison />
+
+The contrast with pixel-level video pretraining is where the design earns its keep. A video masked autoencoder such as
+VideoMAE reconstructs the missing pixels, and it reconstructs them in extraordinary detail — but that detail is the
+problem, because the model burns capacity modeling fabric textures, static backgrounds, and incidental motion that no
+downstream task cares about. V-JEPA predicts representations instead of pixels, throws away that low-level detail, and
+as a result transfers better to action recognition on benchmarks like Kinetics and Something-Something v2 while
+training at lower compute than the pixel reconstruction baselines.
+
+Something-Something v2 is the sharpest evidence for the claim. Its labels are not "dog" or "kitchen" but fine-grained
+physical interactions — pushing something so it rolls, pretending to pick something up, putting one thing behind
+another — and you cannot tell those classes apart from appearance alone, because the same objects and scenes recur
+across opposite labels. You have to read the dynamics. V-JEPA's margin over appearance-driven models on exactly this
+dataset is the signal that temporal prediction in representation space has captured something closer to physical
+intuition than to texture statistics.
+
+All of that prediction, though, stays inside a clip a few seconds long, with no action ever fed in and no question of
+what the agent observing the scene might *do*. The natural next question is whether prediction of this kind can be
+pushed until it becomes something an agent can plan with — an internal simulator of consequences rather than a
+representation learner. That is the move from a JEPA to a [world model](/blog/ssl-world-models-vision).

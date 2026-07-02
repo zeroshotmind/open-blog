@@ -1,0 +1,105 @@
+---
+title: "Why Language Models Need Reinforcement Learning"
+slug: "rl-for-llms-why-rl"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "rl-for-llms"
+seriesOrder: 1
+tags: ["rl", "llm-training", "sft"]
+authors:
+  - name: "Admin"
+    url: "https://zeroshotmind.com"
+    affiliation: "Independent"
+summary: "Supervised fine-tuning teaches a model to imitate. Reinforcement learning teaches it to optimize. The difference turns out to matter enormously."
+---
+
+Take a base model that has read most of the internet and you have something that can continue text
+but cannot reliably *answer* anything. The standard fix is supervised fine-tuning: collect a dataset
+of prompts paired with good responses, and train the model to reproduce those responses token by
+token. Concretely, for a prompt $x$ and a target response $y = (y_1, \dots, y_L)$, you minimize the
+cross-entropy of the model's predictions against the human-written tokens.
+
+$$
+\mathcal{L}_\text{SFT}(\theta) = -\sum_{t=1}^{L} \log \pi_\theta(y_t \mid x, y_{<t})
+$$
+
+Every term in that sum pushes the model to put more probability mass on the exact token a human
+wrote at position $t$, given everything before it. Done over enough examples, the model stops
+rambling and starts producing the shape of answer a person would write.
+
+This works remarkably well, and it is where every aligned model starts. But notice what the objective
+is actually rewarding. It rewards *likelihood of the training distribution* — assigning high
+probability to text humans produced — and nothing else. There is no term anywhere in
+$\mathcal{L}_\text{SFT}$ that says a response is correct, or useful, or honest. The model learns to
+sound like the people who wrote its labels, and it inherits whatever those people did, faithfully and
+indiscriminately.
+
+## Imitation copies the surface, not the intent
+
+The failure mode is subtle because it looks like success. Suppose a human annotator, genuinely unsure
+about a fact, writes "I'm not sure, but maybe it's X?" That is a perfectly good label — honest,
+appropriately hedged. SFT dutifully raises the probability of that phrasing. But the model has no
+access to the *reason* the human hedged. It does not know the annotator was uncertain. It only sees
+that, in contexts that look like this one, the training distribution contains hedging. So it learns
+to hedge — not because it lacks confidence, but because hedging is what the data looks like.
+
+Run this over a whole corpus and the pathologies compound. Sycophancy is in the data, so the model
+agrees with the user. Confident-sounding wrong answers are in the data, so the model produces them
+with the same fluency as correct ones. Evasive non-answers are in the data, so the model evades. SFT
+
+<SFTvsRLObjective />
+
+cannot distinguish "this is a good way to respond" from "this is a common way to respond," because
+its loss function only ever measured the second thing. Maximizing likelihood is maximizing
+*resemblance*, and resemblance to human text is not the same as being good.
+
+What's missing is a way to express a preference over outputs that the model can actually optimize —
+a signal that says *this* response was better than *that* one, even when both are fluent, even when
+neither appears verbatim in any training set.
+
+## A reward turns imitation into optimization
+
+Reinforcement learning supplies exactly that signal. Instead of handing the model a fixed target to
+copy, you let it generate its own response, then score that response with a reward $r$, and update
+the model to make high-scoring responses more likely. The thing being maximized is no longer
+likelihood of a label but expected reward over the model's own outputs.
+
+$$
+J(\theta) = \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot \mid x)}\big[ r(x, y) \big]
+$$
+
+The change is small on the page and enormous in consequence: the expectation is taken over $y$
+sampled from the model itself, so improving $J$ means shifting the model's *own distribution* toward
+whatever $r$ rewards. If $r$ rewards correctness, the model is pulled toward correctness even when
+correct answers were rare in pretraining. If $r$ rewards honesty over confident bluffing, hedging
+becomes a learned strategy rather than a copied tic. You are no longer constrained by what humans
+
+<RewardLandscape />
+
+happened to write — you are constrained by what you can *measure*.
+
+This reframing has a precise structure underneath it. Generating a response is a sequence of
+decisions: at each step the model is in a state — the prompt plus the tokens generated so far — and
+it chooses an action, the next token, from its vocabulary. The state evolves deterministically by
+appending that token, and a reward arrives, usually at the end once the full response $y$ can be
+scored (or at each step, if you have a process reward model that grades partial work). State, action,
+transition, reward: this is exactly a Markov decision process, and a language model is exactly a
+policy $\pi_\theta(y_t \mid x, y_{<t})$ over it.
+
+That correspondence is what makes the whole apparatus of RL available to language modeling. And it is
+
+<MDPLanguageFraming />
+
+what makes alignment tractable in a way pure imitation never could be. You cannot write down, as
+labeled text, the millions of judgments that distinguish a good assistant from a plausible one. But
+you *can* collect comparisons — given two responses, which is better? — train a reward model to
+predict those comparisons, and then use RL to optimize the policy against it. The model stops
+imitating text and starts optimizing an objective you define.
+
+The catch is that you cannot optimize $J(\theta)$ the way you optimized $\mathcal{L}_\text{SFT}$. The
+reward depends on a *sampled* response, and sampling is not differentiable — there is no gradient
+flowing from the score back through the discrete choice of token to the weights that made it. Getting
+a usable gradient out of that expectation is the entire problem, and the trick that solves it, the
+policy gradient, is where this series goes next.

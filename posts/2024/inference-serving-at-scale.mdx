@@ -1,0 +1,67 @@
+---
+title: "LLM Serving at Scale: Throughput, Latency, and System Design"
+slug: "inference-serving-at-scale"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 4
+tags: ["inference", "serving", "systems", "throughput", "latency"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "A single GPU is the easy part. Serving LLMs at production scale involves tensor parallelism, pipeline parallelism, load balancing, SLO enforcement, and hardware heterogeneity. Here's how it fits together."
+---
+
+One GPU running one model is a solved problem; a fleet honoring latency targets under bursty traffic is not. At scale the model splits across devices, the scheduler arbitrates between throughput and tail latency, and the hardware stops being uniform — and every one of those decisions is, underneath, a negotiation with the memory and bandwidth ceilings the earlier parts of this series mapped out.
+
+## The serving stack
+
+A production system stacks four layers, each with its own failure mode. A load balancer fronts the fleet and routes requests across worker pools. Within a worker, a scheduler owns batching, queuing, and preemption — the continuous-batching loop from [part two](/blog/inference-continuous-batching) lives here. Beneath it, an execution engine runs the actual forward pass. And underneath that, a KV cache manager allocates and frees the memory those passes consume, paging it as [PagedAttention](/papers/pagedattention) describes so the engine never blocks on fragmentation. The layers are separable on purpose: you can swap a scheduling policy without touching the kernel, or a memory allocator without touching the router.
+
+<TensorParallelismScaling />
+
+## Tensor parallelism
+
+When a model is too large for one device, tensor parallelism splits each weight matrix across GPUs. For a linear layer $Y = XW$ with $W \in \mathbb{R}^{d \times 4d}$, you partition column-wise as $[\,W_1 \mid W_2\,]$, let each GPU compute its shard $Y_i = X W_i$, and stitch the result back together with an all-reduce. That collective is the tax: two all-reduces per transformer layer, one after attention and one after the feed-forward block, and at batch size 1 the $\sim 50\ \mu\text{s}$ of all-reduce latency over NVLink can dominate the step, which is why tensor parallelism loses efficiency precisely in the low-concurrency decode regime where there is little compute to hide it behind. The degree is bounded by the head count — it should divide $n_\text{heads}$ evenly, so LLaMA-3-70B with 64 attention heads runs comfortably at TP=8 — and beyond eight the communication grows faster than the compute it saves for most models.
+
+<PipelineBubbleDemo />
+
+## Pipeline parallelism
+
+Pipeline parallelism cuts the model the other way, assigning contiguous layer groups to different GPUs: layers 0–7 on GPU 0, 8–15 on GPU 1, and so on, with activations handed down the line stage by stage. Keeping every stage busy requires feeding many micro-batches so that while GPU 1 works one micro-batch, GPU 0 is already on the next. The cost is the pipeline bubble — the idle time at the ends while the pipe fills and drains — which for $m$ micro-batches across $p$ stages is
+
+$$
+\text{bubble fraction} \approx \frac{p - 1}{m + p - 1},
+$$
+
+and shrinks toward zero as $m$ grows. Pipelining earns its bubble only for models large enough that tensor parallelism alone cannot hold them — GPT-4-scale systems — since a 70B model fits in TP=8 on a single eight-H100 node without paying for a pipeline at all.
+
+## Enforcing SLOs
+
+Production services commit to latency targets — TTFT under 500 ms, TPOT under 50 ms, both at the 99th percentile — and those targets fight the throughput instinct, because the larger batches that lift tokens per second also lengthen every request in the batch. The scheduler resolves the tension by prioritizing queued requests nearing their TTFT deadline, capping batch size to hold TPOT inside its bound, and preempting low-priority work when high-priority requests arrive. Most schemes make the tradeoff legible with a token budget,
+
+$$
+\text{max\_batch\_tokens} = \text{max\_new\_tokens} \times \text{max\_concurrent\_seqs},
+$$
+
+which keeps memory and compute per step predictable so the latency a request will see is something the admission decision can actually reason about.
+
+<DecodeRooflineDemo />
+
+## The roofline for decode batch size
+
+The right decode batch size falls straight out of the roofline. At batch $B$ the step does $\sim 2NB$ FLOPs for a model with $N$ parameters while reading the weights once at $\sim 2N$ bytes in fp16, so the arithmetic intensity is
+
+$$
+I = \frac{2NB}{2N} = B\ \text{FLOP/byte},
+$$
+
+which says the batch size *is* the intensity. The crossover sits where $I$ meets the hardware's ridge point — the A100's $\sim 156$ FLOP/byte that [the KV-cache post](/blog/kv-cache-lifecycle) pins down from its 312 TFLOP/s over 2.0 TB/s. Below a batch of roughly 156 the step is memory-bound and you are leaving compute on the table; above it you are compute-bound and adding latency for diminishing throughput — and in practice the KV cache exhausts memory and caps $B$ well before that ceiling, which is exactly why the previous parts spent so long on shrinking the cache.
+
+## Heterogeneous hardware
+
+Because prefill and decode load the machine so differently, the cost-optimal fleet is not built from one GPU. Prefill is compute-dense and wants H100s or A100s feeding their matrix units; decode is bandwidth-dense and benefits from an H100's compute far less than its spec sheet suggests, so a cheaper A10G at 600 GB/s can match its decode throughput per dollar for any batch below the roofline crossover. Disaggregated serving turns that mismatch into an architecture, running prefill on expensive compute-dense hardware and decode on cheaper bandwidth-dense hardware, and shipping the cache between them.
+
+The thread running through all of it is that the binding constraint in LLM serving is memory, not model quality. The KV cache claims most of the GPU at high concurrency, decode is gated on the bandwidth of reading the weights, and every technique this series covered — quantization, continuous batching, prefix caching, tensor parallelism — is one more way to fit useful computation inside the memory and bandwidth envelope of the hardware you can afford.

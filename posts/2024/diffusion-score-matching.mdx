@@ -1,0 +1,134 @@
+---
+title: "Score Matching: The Math Behind Diffusion"
+slug: "diffusion-score-matching"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "diffusion-models"
+seriesOrder: 1
+tags: ["diffusion", "score-matching", "generative-models"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Diffusion models learn to reverse a noise process. The key insight is that you don't need to know the data distribution — you only need to learn its score function, the gradient of the log-density."
+---
+
+Every generative model is trying to solve the same problem and pretending it is a different one. You
+have a finite pile of samples — photographs, say — drawn from some distribution $p_\text{data}(x)$ that
+you cannot write down. You want to produce new samples that look like they came from the same place.
+The distribution itself is inaccessible: it lives in a space of hundreds of thousands of dimensions,
+its normalizing constant is an integral nobody can compute, and all you ever get to see is the
+samples. The entire game is to learn something useful about $p_\text{data}$ from those samples alone,
+and the choice of *what* to learn is what separates one family of generative models from another.
+
+Diffusion makes an unusual choice. Instead of learning the density, or learning a direct map from noise
+to data, it learns the gradient of the log-density — a quantity called the **score**.
+
+$$
+s(x) = \nabla_x \log p(x)
+$$
+
+The score is a vector field over the whole space: at any point $x$, it points in the direction in which
+the log-probability increases fastest, which is to say toward regions where the data piles up. What
+makes it the right object to learn is a fact about normalization: the score of $p(x) = \tilde p(x)/Z$ is
+$\nabla_x \log \tilde p(x) - \nabla_x \log Z$, and since $Z$ does not depend on $x$, the troublesome
+normalizing constant differentiates away to zero. Learning the score sidesteps the one quantity that
+makes densities intractable.
+
+If you knew the score everywhere, you could sample without ever evaluating a probability, by treating it
+as a force that pushes a random walker toward the data. This is **Langevin dynamics**: start from noise
+and repeatedly step along the score while injecting a calibrated amount of fresh randomness.
+
+$$
+x_{t+1} = x_t + \epsilon \, \nabla_x \log p(x_t) + \sqrt{2\epsilon}\, z, \qquad z \sim \mathcal{N}(0, I)
+$$
+
+
+<ScoreFieldDemo />
+
+The drift term climbs the log-density and the noise term keeps the walker from collapsing onto a single
+mode, and as $\epsilon \to 0$ and the number of steps grows, the distribution of $x_t$ converges to
+$p(x)$ regardless of where you started. Sampling becomes navigation, and the only thing you need to
+navigate is the score.
+
+So the problem reduces to estimating $s_\theta(x) \approx \nabla_x \log p(x)$ with a neural network. The
+obvious objective is to regress the network onto the true score under the data distribution.
+
+$$
+J(\theta) = \tfrac{1}{2}\, \mathbb{E}_{x \sim p_\text{data}}\!\left[\, \big\| s_\theta(x) - \nabla_x \log p_\text{data}(x) \big\|^2 \,\right]
+$$
+
+This is honest but useless as written, because the regression target $\nabla_x \log p_\text{data}(x)$ is
+exactly the thing you do not have — you have samples from $p_\text{data}$, not its gradient.
+
+**Score matching** (Hyvärinen, 2005) makes the objective computable through integration by parts. Expand
+the square, and the cross term $\mathbb{E}[s_\theta(x)^\top \nabla_x \log p_\text{data}(x)]$ becomes an
+integral of $s_\theta(x)^\top \nabla_x p_\text{data}(x)$, which you can integrate by parts to move the
+derivative off the unknown density and onto the known network. Up to a constant that does not depend on
+$\theta$, the objective rewrites entirely in terms of the network and the data.
+
+$$
+J(\theta) = \mathbb{E}_{x \sim p_\text{data}}\!\left[\, \operatorname{tr}\!\big(\nabla_x s_\theta(x)\big) + \tfrac{1}{2}\, \big\| s_\theta(x) \big\|^2 \,\right] + \text{const}
+$$
+
+The ground-truth score has vanished — everything left is evaluable on samples — but the trace of the
+Jacobian $\nabla_x s_\theta(x)$ is the catch: computing it exactly costs one backward pass per input
+dimension, which for an image is hundreds of thousands of passes per training example. Exact score
+matching is correct and completely impractical at scale.
+
+**Denoising score matching** (Vincent, 2011) escapes the trace by changing what you match. Instead of
+the score of $p_\text{data}$, match the score of a *noised* distribution: corrupt each sample with
+Gaussian noise of scale $\sigma$, so that $\tilde x = x + \sigma\epsilon$ is drawn from
+$p_\sigma(\tilde x \mid x) = \mathcal{N}(\tilde x; x, \sigma^2 I)$. The marginal $p_\sigma(\tilde x) =
+\int p_\sigma(\tilde x \mid x)\, p_\text{data}(x)\, dx$ is a blurred version of the data density, and its
+score has a closed form in terms of the conditional, because the gradient of a Gaussian log-density is
+linear.
+
+$$
+\nabla_{\tilde x} \log p_\sigma(\tilde x \mid x) = \frac{x - \tilde x}{\sigma^2}
+$$
+
+
+<DenoisingScoreIntuition />
+
+Vincent's identity says that matching $s_\theta(\tilde x)$ to this conditional score — averaged over both
+the data and the noise — gives the same minimizer as matching it to the true marginal score
+$\nabla_{\tilde x} \log p_\sigma(\tilde x)$, with no Jacobian anywhere. The target is now something you
+can write down from the corruption you applied yourself.
+
+Reparameterize the network as a denoiser and the picture becomes concrete. Let $D_\theta(\tilde x,
+\sigma)$ predict the clean $x$ from the corrupted $\tilde x$; then a score estimate falls out of the
+denoiser directly, because the optimal denoiser's residual *is* the score up to a factor of $\sigma^2$.
+
+$$
+\nabla_{\tilde x} \log p_\sigma(\tilde x) = \frac{D_\theta(\tilde x, \sigma) - \tilde x}{\sigma^2}
+$$
+
+
+<NoiseLevelSweep />
+
+This is the equivalence that makes the whole field tractable: a network trained to remove noise is, for
+free, a network that estimates the score of the noised data. Training reduces to the most ordinary loss
+imaginable — predict the clean image from a noisy one, in squared error.
+
+$$
+J(\theta) = \mathbb{E}_{x \sim p_\text{data},\; \epsilon \sim \mathcal{N}(0, I)}\!\left[\, \big\| D_\theta(x + \sigma\epsilon, \sigma) - x \big\|^2 \,\right]
+$$
+
+There is no trace, no normalizing constant, and no inaccessible target — just a regression on pairs you
+generate by adding noise you control.
+
+Why this should work is worth holding onto intuitively, because the algebra can make it feel like a
+trick. A point $\tilde x$ that is a clean image plus noise sits, on average, slightly *off* the data
+manifold, displaced in the direction the noise happened to push it. The clean image is where it came
+from, so the vector $x - \tilde x$ points from the corrupted point back toward the manifold — back
+toward higher data density. That is precisely what the score is: a direction of increasing
+log-probability. A denoiser that learns to undo the corruption is implicitly learning, at every noise
+level, which way is "toward the data," and that direction is the score Langevin dynamics needs to
+sample.
+
+Denoising score matching is the insight; turning it into a model that generates 256×256 images is the
+engineering. The next part takes the single noise scale $\sigma$ here and replaces it with a thousand of
+them, chained into a forward process whose reverse is exactly the sampler this objective trains — that
+is [DDPM](/blog/diffusion-ddpm).

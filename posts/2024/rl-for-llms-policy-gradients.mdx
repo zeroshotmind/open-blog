@@ -1,0 +1,123 @@
+---
+title: "Policy Gradients: The Math Behind RLHF"
+slug: "rl-for-llms-policy-gradients"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "rl-for-llms"
+seriesOrder: 2
+tags: ["rl", "policy-gradient", "llm-training"]
+authors:
+  - name: "Admin"
+    url: "https://zeroshotmind.com"
+    affiliation: "Independent"
+summary: "The policy gradient theorem lets you differentiate through a reward signal you can't backprop through. Here's the derivation and why it works."
+---
+
+The objective from the previous post is expected reward, $J(\theta) = \mathbb{E}_{y \sim
+\pi_\theta}[r(y)]$, and the obstacle is that you cannot take its gradient the usual way. The reward
+$r(y)$ is a number a reward model assigns to a *sampled* sequence; there is no differentiable path
+from that score back through the act of sampling to the parameters $\theta$. The sampling step is a
+wall, and gradient descent needs to get to the other side of it.
+
+The way through is to differentiate the expectation itself rather than the reward. Write the
+expectation as an explicit sum (or integral) over outcomes weighted by their probability, and the
+only thing that depends on $\theta$ is that probability.
+
+$$
+\nabla_\theta J(\theta) = \nabla_\theta \sum_{y} \pi_\theta(y)\, r(y) = \sum_{y} \big(\nabla_\theta \pi_\theta(y)\big)\, r(y)
+$$
+
+The reward $r(y)$ came out front untouched because it does not depend on $\theta$ — it is a fixed
+score for a fixed sequence. All the gradient has to handle is $\nabla_\theta \pi_\theta(y)$, the
+sensitivity of the probability of generating $y$ to the weights.
+
+## The log-derivative trick
+
+A raw $\nabla_\theta \pi_\theta(y)$ is not something we can estimate by sampling, because it is not an
+expectation under $\pi_\theta$ — there is no factor of $\pi_\theta(y)$ multiplying it. The fix is an
+identity that manufactures one. For any positive function, the gradient of its log is the gradient
+divided by the function, which rearranges to:
+
+$$
+\nabla_\theta \pi_\theta(y) = \pi_\theta(y)\, \nabla_\theta \log \pi_\theta(y)
+$$
+
+This is the whole trick: it reintroduces $\pi_\theta(y)$ as a multiplier, which means the sum is once
+again an expectation we can approximate with samples. Substituting it back and folding the reward in:
+
+$$
+\nabla_\theta J(\theta) = \sum_{y} \pi_\theta(y)\, \nabla_\theta \log \pi_\theta(y)\, r(y) = \mathbb{E}_{y \sim \pi_\theta}\big[ r(y)\, \nabla_\theta \log \pi_\theta(y) \big]
+$$
+
+We have turned a gradient we could not compute into an expectation we can: sample some responses from
+the current policy, and for each one compute $r(y)\,\nabla_\theta \log \pi_\theta(y)$. That estimator
+is unbiased, and it never once required differentiating through the sampling step — the only gradient
+left is $\nabla_\theta \log \pi_\theta(y)$, which for a language model is just the gradient of the
+log-probability the model assigned to tokens it already produced.
+
+Reading the result tells you what training actually does. The update moves $\theta$ in the direction
+$\nabla_\theta \log \pi_\theta(y)$ — the direction that makes $y$ more likely — scaled by $r(y)$. A
+sequence that earned a high reward gets its log-probability pushed up; a sequence that earned a low
+(or negative) reward gets pushed down. The policy is reshaped to put more mass on what scored well.
+Spelled out per token, since $\log \pi_\theta(y) = \sum_t \log \pi_\theta(y_t \mid y_{<t})$, every
+token in a good response gets nudged up and every token in a bad one gets nudged down.
+
+<LogDerivativeTrick />
+
+## Why the naive version is too noisy to use
+
+That last sentence also exposes the weakness. The same scalar $r(y)$ multiplies the gradient of
+*every* token in the sequence, indiscriminately. If a 200-token response gets a high reward because of
+one excellent sentence buried in the middle, the estimator rewards all 200 tokens equally, including
+the filler. This is the credit-assignment problem, and it makes the gradient extremely noisy: the
+return $r(y)$ is a single Monte Carlo draw, high variance on its own, and it is being smeared across
+the whole trajectory.
+
+The standard cure is to subtract a baseline $b$ from the reward before multiplying. The remarkable
+fact is that this changes the variance without changing what the gradient is in expectation — it
+introduces no bias. The reason is that the expected score function is zero:
+
+$$
+\mathbb{E}_{y \sim \pi_\theta}\big[ b\, \nabla_\theta \log \pi_\theta(y) \big] = b \sum_y \pi_\theta(y)\, \nabla_\theta \log \pi_\theta(y) = b\, \nabla_\theta \sum_y \pi_\theta(y) = b\, \nabla_\theta 1 = 0
+$$
+
+The sum $\sum_y \pi_\theta(y)$ is identically $1$ for every $\theta$ — a probability distribution
+always normalizes — so its gradient is exactly zero, and subtracting any baseline that does not depend
+on the action leaves the expected gradient untouched. What it *does* change is the magnitude of the
+per-sample terms: if $b$ tracks the typical reward, then $r(y) - b$ is centered near zero, and the
+estimator stops shouting on every sample. A response that is merely average no longer yanks the
+policy around; only responses meaningfully better or worse than expected move it.
+
+<BaselineVarianceReduction />
+
+## From return to advantage
+
+The good baseline is a *value function* $V(s)$ — the expected reward from state $s$ onward — and the
+centered quantity $r - V(s)$ becomes the **advantage**: how much better an action did than the state
+predicted. Estimating the advantage well is its own problem, and the standard answer is generalized
+advantage estimation, which blends multi-step temporal-difference errors with a parameter $\lambda$
+that trades bias against variance.
+
+$$
+\hat{A}_t = \sum_{l=0}^{\infty} (\gamma \lambda)^l\, \delta_{t+l}, \qquad \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+Each $\delta_t$ is a one-step surprise — reward plus discounted next-state value minus current value —
+and GAE sums these surprises with a geometrically decaying weight, so $\lambda \to 0$ trusts the value
+function (low variance, biased) and $\lambda \to 1$ trusts the observed returns (unbiased, high
+variance). The derivation and the bias–variance picture are worth seeing in full in the
+[GAE paper explainer](/papers/gae); for now, treat $\hat{A}_t$ as the cleaned-up signal that replaces
+the raw return in the policy gradient.
+
+<GAELambdaSweep />
+
+With a good advantage estimate the gradient is far less noisy, but one problem remains, and it is not
+about variance. The policy gradient tells you a *direction* to step, not how far to go. Take too small
+a step and training crawls. Take too large a step and you can move the policy into a region where the
+samples you collected no longer reflect how it behaves — the data goes stale mid-update and the
+policy collapses. Vanilla policy gradients have no built-in sense of how far is too far, and that
+missing guardrail is precisely what [PPO](/papers/ppo) adds. With the gradient machinery in hand and
+its instability named, the next post assembles the full pipeline that turns it into an aligned model:
+learning from human feedback.

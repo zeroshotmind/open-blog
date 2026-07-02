@@ -1,0 +1,501 @@
+---
+title: "LLM Training Stages: Pre-training, Mid-training, SFT, RL, and DPO"
+slug: "llm-training-stages"
+summary: "What actually happens at each stage of training a large language model — what data, what objective, what the model learns, and why the stages are ordered the way they are."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - llm-training
+  - pretraining
+  - mid-training
+  - sft
+  - rlhf
+  - dpo
+  - alignment
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "llm-training-lifecycle"
+seriesOrder: 1
+references:
+  - authors: "Brown, T., et al."
+    title: "Language Models are Few-Shot Learners"
+    year: "2020"
+    venue: "arXiv preprint arXiv:2005.14165"
+    doi: "10.48550/arXiv.2005.14165"
+  - authors: "Ouyang, L., et al."
+    title: "Training language models to follow instructions with human feedback"
+    year: "2022"
+    venue: "arXiv preprint arXiv:2203.02155"
+    doi: "10.48550/arXiv.2203.02155"
+  - authors: "Zhou, C., et al."
+    title: "LIMA: Less Is More for Alignment"
+    year: "2023"
+    venue: "arXiv preprint arXiv:2305.11206"
+    doi: "10.48550/arXiv.2305.11206"
+  - authors: "Rafailov, R., et al."
+    title: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+    year: "2023"
+    venue: "arXiv preprint arXiv:2305.18290"
+    doi: "10.48550/arXiv.2305.18290"
+  - authors: "Touvron, H., et al."
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models"
+    year: "2023"
+    venue: "arXiv preprint arXiv:2307.09288"
+    doi: "10.48550/arXiv.2307.09288"
+  - authors: "DeepSeek-AI"
+    title: "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    year: "2025"
+    venue: "arXiv preprint arXiv:2501.12948"
+    doi: "10.48550/arXiv.2501.12948"
+---
+
+Modern LLMs are trained in a sequence of distinct stages, each with different data, a different
+objective function, and a different goal. Treating "fine-tuning" as a monolith — or conflating SFT
+with RLHF, or assuming DPO is just cheaper RLHF — leads to poor design decisions and misplaced
+debugging effort. This post maps the full arc: from raw web text to an instruction-following,
+preference-aligned assistant, stage by stage.
+
+## Stage 1: Pre-training
+
+<TrainingStageTimeline />
+
+**Goal**: build a general world model from raw text.
+
+Pre-training is where virtually all of a model's knowledge comes from. The training signal is
+next-token prediction: given a sequence of tokens $x_1, \ldots, x_{t-1}$, predict $x_t$ by
+minimizing cross-entropy loss over the training corpus:
+
+$$\mathcal{L}_{\text{PT}} = -\sum_{t=1}^{T} \log P_\theta(x_t \mid x_1, \ldots, x_{t-1})$$
+
+```python
+import torch
+import torch.nn.functional as F
+
+# logits: (batch, seq_len, vocab_size), labels: (batch, seq_len)
+# labels are shifted: labels[t] = x[t+1]
+def pretrain_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # Flatten to (batch * seq_len, vocab_size) and (batch * seq_len,)
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+        ignore_index=-100,  # padding tokens masked out
+    )
+    return loss  # scalar, averaged over non-masked tokens
+```
+
+The `ignore_index=-100` convention is universal — padding tokens and, in SFT, prompt tokens are set to `-100` in the label tensor before the loss call.
+
+### How the loss actually works: per-token, not per-sequence
+
+This is where a lot of confusion lives, so it's worth being precise about what happens mechanically.
+
+**Yes, the loss is per-token — but backprop happens once per batch, not once per token.**
+
+Here is what actually occurs for one training step:
+
+1. A batch of sequences arrives — say 8 sequences of 2048 tokens each, packed into a tensor of shape `(8, 2048)`.
+2. The entire batch goes through a **single forward pass**: the transformer processes all 2048 token positions in parallel (using the causal mask to prevent each position from seeing future tokens), producing logits of shape `(8, 2048, vocab_size)`.
+3. At position $t$, the logit vector is the model's prediction for $x_{t+1}$. The label at position $t$ is therefore `input_ids[:, t+1]`, shifted by one.
+4. Cross-entropy is computed at every token position simultaneously — `F.cross_entropy` flattens the `(8, 2048, vocab_size)` logits and the `(8, 2048)` labels and computes loss for all $8 \times 2048 = 16{,}384$ positions at once.
+5. Those per-token losses are **averaged into a single scalar**.
+6. `.backward()` is called **once** on that scalar — a single backprop through the entire sequence for all tokens in the batch simultaneously.
+7. The optimizer steps once.
+
+So "per-token loss" means the scalar is an average over individual token predictions, not that backprop runs 2048 times. The gradient for each token position flows back through the same forward pass in one `.backward()` call.
+
+```python
+# What one training step actually looks like:
+input_ids = batch["input_ids"]             # (B, T) = (8, 2048)
+labels    = batch["labels"]                # (B, T) — same as input_ids but shifted
+
+# One forward pass over all T positions simultaneously
+logits = model(input_ids).logits           # (B, T, V)
+
+# Cross-entropy averaged over all B*T non-masked positions in one call
+loss = F.cross_entropy(
+    logits[:, :-1, :].reshape(-1, vocab_size),  # (B*(T-1), V): predictions
+    labels[:, 1:].reshape(-1),                   # (B*(T-1),): targets
+    ignore_index=-100,
+)                                                # scalar
+
+# One backward pass — gradients flow back through all T positions at once
+loss.backward()
+optimizer.step()
+optimizer.zero_grad()
+```
+
+**Why averaging, not summing?** Averaging over tokens makes the loss magnitude independent of sequence length and batch size, so the same learning rate works across different packing strategies. Some implementations sum instead and compensate with a smaller learning rate — the gradient is mathematically identical, just scaled.
+
+**Gradient accumulation**: in practice, fitting 8 sequences of 2048 tokens on a single GPU is often impossible due to activation memory. Gradient accumulation simulates a larger batch by running several smaller micro-batches forward+backward and summing the gradients before stepping:
+
+```python
+accumulation_steps = 4
+optimizer.zero_grad()
+
+for i, micro_batch in enumerate(micro_batches):
+    loss = compute_loss(micro_batch) / accumulation_steps  # scale to match full-batch average
+    loss.backward()   # accumulates gradients into .grad, does NOT step
+
+optimizer.step()      # one parameter update after all micro-batches
+optimizer.zero_grad()
+```
+
+The weight update is identical to doing the full batch in one pass; the difference is peak memory, not correctness.
+
+There are no labels, no human feedback, and no task specification — just the statistical structure
+of text at scale.
+
+**Data**: web-scale text assembled from Common Crawl, books, code repositories, scientific papers,
+and Wikipedia. The quality of this data matters at least as much as its quantity. FineWeb (from
+Hugging Face), Dolma, and RedPajama are canonical examples of open, deduplicated, quality-filtered
+pre-training corpora. The filtering pipeline typically includes: language identification, quality
+heuristics (perplexity filtering, n-gram deduplication), and explicit block-listing of known toxic
+sources.
+
+**Scale**: frontier models are trained on 1T–15T tokens. The Chinchilla scaling laws give an
+approximate compute-optimal allocation: for a compute budget $C$ (in FLOPs), the optimal model size
+$N$ and dataset size $D$ satisfy
+
+$$N \propto \sqrt{C}, \quad D \propto \sqrt{C}$$
+
+so doubling compute should roughly double both parameters and data, not just parameters. In practice,
+inference cost pushes post-Chinchilla models toward training smaller models on more data than
+strictly compute-optimal — Llama 2 7B on 2T tokens is the canonical example.
+
+**What the model learns**: syntax, factual associations, reasoning patterns, code, math — everything
+that emerges from statistical co-occurrence in text. The model is an extraordinarily capable text
+completer. It has no concept of a "turn," no concept of a "user," and no preference for being
+helpful or harmless. Given the prompt "How do I make a bomb?", it will continue in the most
+statistically likely direction, which may well be an instructional one.
+
+**Duration**: weeks to months on thousands of GPUs. Pre-training is by far the most
+compute-intensive stage.
+
+**Output**: a base model. GPT-3 (Brown et al., 2020), Llama 2-base, and Mistral-7B-base are
+examples. You can prompt-engineer them with few-shot examples, but they don't robustly follow
+instructions and have no safety behaviors.
+
+## Stage 2: Mid-training (Continued Pre-training / Domain Adaptation)
+
+**Goal**: shift the model's knowledge distribution toward a target domain or capability, without
+forgetting general knowledge.
+
+Mid-training is not universally used — many pipelines skip directly from pre-training to SFT — but
+it is common in several scenarios:
+
+- **Domain specialization**: medical (MedPaLM), legal, coding (Code Llama), or mathematical
+  reasoning. The model is continued on domain-specific text at a much smaller scale than pre-training.
+- **Long-context extension**: many models are pre-trained at 4K context and then continued at 32K or
+  128K with positional encoding adjustments (RoPE scaling, YaRN). The out-of-distribution position
+  problem, attention entropy collapse, and the "lost in the middle" retrieval failure all require
+  gradient updates to fix — inference-time tricks are insufficient. See [Why Long-Context Mid-Training
+  Is Its Own Stage](/blog/long-context-mid-training) for the full breakdown.
+- **Language adaptation**: continuing on a non-English corpus to improve multilingual capability
+  without training a new base model from scratch.
+- **Knowledge refreshing**: continuing on more recent web data when the pre-training corpus has a
+  hard cutoff.
+
+**Objective**: same as pre-training — next-token prediction on the new data — but with the domain
+corpus mixed with a fraction of general-domain data to prevent catastrophic forgetting. The mixing
+ratio is a hyperparameter that requires careful tuning; too little general data and the model forgets
+broadly; too much and the domain signal is diluted.
+
+**Examples in the literature**: Code Llama (Touvron et al., 2023) continued Llama 2 on 500B code
+tokens from a code-focused corpus. Phi-3.5 used "textbook quality" synthetic data curated for
+reasoning density. MedPaLM extended PaLM on a medical literature corpus before any instruction
+tuning.
+
+**Key risk**: catastrophic forgetting. If the domain corpus is much smaller than the general corpus
+and the mixing ratio is wrong, the model can lose general reasoning ability rapidly. Regularization
+approaches (EWC, replay buffers of general data) are often used but add complexity.
+
+## Stage 3: Supervised Fine-Tuning (SFT)
+
+<SFTvsRLHFDataComparison />
+
+**Goal**: teach the model to follow instructions, adopt a conversational format, and produce the
+output style users expect.
+
+SFT is the first stage that involves human-authored (or human-curated) demonstrations. The training
+data is a set of (prompt, ideal response) pairs. The objective is next-token prediction on the
+response tokens, with the loss masked on the prompt:
+
+$$\mathcal{L}_{\text{SFT}} = -\sum_{t \in \text{response}} \log P_\theta(x_t \mid x_{<t})$$
+
+```python
+def sft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # labels has -100 for all prompt tokens; loss is computed only on response tokens
+    # Identical call to pre-training — the masking is done upstream when building labels
+    return F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+        ignore_index=-100,
+    )
+
+# Building the label tensor (done in the data collator, not the model):
+def build_sft_labels(input_ids: torch.Tensor, response_start: int) -> torch.Tensor:
+    labels = input_ids.clone()
+    labels[:, :response_start] = -100  # mask prompt tokens
+    return labels
+```
+
+The loss function itself is identical to pre-training — the difference is entirely in the label tensor construction. This is why a single `Trainer` class handles both.
+
+This is mechanically identical to pre-training but applied to a much smaller, much higher-quality
+dataset, and only computing loss over the response half of each example.
+
+**What changes — and what doesn't**: SFT is fundamentally a format transfer, not a knowledge
+transfer. The model learns what a "turn" looks like, how to conclude a response, how to follow the
+instruction's implicit style constraints. Factual knowledge doesn't meaningfully improve during SFT —
+the pre-training corpus is orders of magnitude larger, so SFT-scale data cannot shift factual
+associations measurably. This is why hallucinations cannot be fixed by SFT alone.
+
+**Data quality vs. quantity**: LIMA (Zhou et al., 2023) showed that 1,000 carefully curated
+demonstrations — selected for diversity of task type, clarity of prompt, and quality of response —
+were competitive with models trained on 50K examples from noisier datasets. The implication is
+strong: for SFT, curation and quality dominate volume.
+
+**Data sources**: Human-written demonstrations (expensive, slow), model-generated demonstrations
+filtered by quality (Alpaca, WizardLM, OpenHermes), and combinations. The risk with
+model-generated data is distributional collapse — if the teacher model has systematic errors, the
+student inherits them.
+
+**Limitations**: SFT can only teach the model to produce the kinds of responses present in the
+demonstration data. It cannot teach the model to avoid behaviors that were never demonstrated; it
+cannot teach preference — i.e., that response A is better than response B when both are valid
+formats. Those require a feedback signal from humans or a trained reward model.
+
+**Output**: an instruction-following model. Llama-3-8B-Instruct after SFT (before any RL) is a
+good example. It will follow instructions robustly, but may be sycophantic, may fail on ambiguous
+preference questions, and may not have internalized safety behaviors consistently.
+
+## Stage 4a: RLHF / PPO / GRPO
+
+<LossProfileByStage />
+
+**Goal**: align the model's outputs with human preferences — make it helpful, harmless, and honest
+in ways that are not fully captured by demonstrations alone.
+
+RLHF (Reinforcement Learning from Human Feedback), as introduced in InstructGPT (Ouyang et al.,
+2022), is a two-phase process.
+
+**Phase 1 — Reward model training**: collect comparison data: for the same prompt, show a human
+two model responses and ask which is better. Fit a reward model $r_\phi$ that predicts a scalar
+reward from a (prompt, response) pair, trained to rank the preferred response above the rejected one
+under the Bradley-Terry model:
+
+$$\mathcal{L}_{\text{RM}} = -\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma(r_\phi(x, y_w) - r_\phi(x, y_l)) \right]$$
+
+```python
+def reward_model_loss(
+    reward_chosen: torch.Tensor,   # (batch,) scalar rewards for preferred responses
+    reward_rejected: torch.Tensor, # (batch,) scalar rewards for rejected responses
+) -> torch.Tensor:
+    # Bradley-Terry: preferred response should score higher
+    return -F.logsigmoid(reward_chosen - reward_rejected).mean()
+```
+
+The reward model is usually the SFT model with its language model head replaced by a linear layer mapping hidden states to a scalar. Only the final token's hidden state is used as the reward for the full sequence.
+
+where $y_w$ is the preferred (winning) response and $y_l$ is the rejected (losing) one. The reward
+model is typically initialized from the SFT model with a scalar head replacing the language model
+head.
+
+**Phase 2 — RL fine-tuning**: use the reward model as the reward signal and optimize the policy
+$\pi_\theta$ (initialized from the SFT model $\pi_{\text{SFT}}$) via policy gradient, with a KL
+penalty to prevent the policy from drifting too far from the SFT model:
+
+$$\mathcal{L}_{\text{RL}} = \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot|x)} \left[ r_\phi(x, y) - \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{SFT}}(y|x)} \right]$$
+
+```python
+def grpo_loss(
+    log_probs: torch.Tensor,      # (batch, group_size) log P(y|x) for each sample
+    ref_log_probs: torch.Tensor,  # (batch, group_size) log P_ref(y|x)
+    rewards: torch.Tensor,        # (batch, group_size) scalar rewards
+    clip_eps: float = 0.2,
+    beta: float = 0.01,
+) -> torch.Tensor:
+    # Group-relative advantage: normalize rewards within each group
+    adv = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-8)
+
+    # Policy ratio (current policy vs old policy used to generate samples)
+    ratio = torch.exp(log_probs - ref_log_probs)
+
+    # Clipped surrogate objective (PPO-style clipping)
+    clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+    policy_loss = -torch.min(ratio * adv, clipped * adv).mean()
+
+    # KL penalty to prevent drift from reference policy
+    kl = (log_probs - ref_log_probs).mean()
+    return policy_loss + beta * kl
+```
+
+In practice `log_probs` and `ref_log_probs` are summed over tokens in the response (sequence-level log-prob). The `ref_log_probs` come from a frozen copy of the SFT model run in inference mode alongside the training policy.
+
+PPO (Proximal Policy Optimization) is the canonical algorithm here, using a clipped surrogate
+objective and a separate value head to estimate per-token advantages.
+
+**GRPO** (Group Relative Policy Optimization), introduced in DeepSeek-R1 (DeepSeek-AI, 2025),
+removes the separate value head. Instead of learning a value function, it computes the advantage of
+each response relative to the mean reward of a group of responses sampled for the same prompt. This
+makes the training significantly cheaper and removes the value model collapse failure mode that
+affects PPO at long horizons.
+
+**What changes**: the model learns to produce outputs that score well under the reward model,
+which is trained to reflect human preferences. This can teach behaviors not present in the SFT
+demonstrations, including refusals, caveats, and calibrated uncertainty. The RL stage is also where
+reasoning models learn to produce long chains of thought — the reward comes from final answer
+correctness, not from intermediate steps, so the model discovers that longer, more structured
+reasoning improves the reward.
+
+**Key risks**: reward hacking (the policy finds behaviors that maximize the reward model's score
+without actually being good), mode collapse (the policy collapses onto a few high-reward response
+patterns), and training instability. Running RL in a loop is expensive — each gradient update
+requires generating complete responses from the current policy before computing rewards.
+
+## Stage 4b: DPO (Direct Preference Optimization)
+
+**Goal**: same alignment objective as RLHF, but without a separate reward model or RL training loop.
+
+DPO (Rafailov et al., 2023) reformulates the RLHF objective directly as a supervised loss on
+preference pairs. The key insight is that under the Bradley-Terry preference model, the optimal
+policy $\pi^*$ can be expressed in closed form in terms of the reward function $r^*$ and the
+reference policy $\pi_{\text{ref}}$:
+
+$$r^*(x, y) = \beta \log \frac{\pi^*(y|x)}{\pi_{\text{ref}}(y|x)} + \beta \log Z(x)$$
+
+Substituting this implicit reward into the Bradley-Terry loss eliminates $r^*$ and $Z(x)$
+entirely, yielding a loss that depends only on $\pi_\theta$ and $\pi_{\text{ref}}$:
+
+$$\mathcal{L}_{\text{DPO}} = -\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma\!\left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \right) \right]$$
+
+```python
+def dpo_loss(
+    policy_chosen_logps: torch.Tensor,    # (batch,) log P_θ(y_w | x), summed over tokens
+    policy_rejected_logps: torch.Tensor,  # (batch,) log P_θ(y_l | x)
+    ref_chosen_logps: torch.Tensor,       # (batch,) log P_ref(y_w | x) — frozen
+    ref_rejected_logps: torch.Tensor,     # (batch,) log P_ref(y_l | x) — frozen
+    beta: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    chosen_rewards  = beta * (policy_chosen_logps  - ref_chosen_logps)
+    rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
+
+    loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
+
+    # Diagnostic metrics (log alongside loss during training)
+    reward_accuracy = (chosen_rewards > rejected_rewards).float().mean()
+    reward_margin   = (chosen_rewards - rejected_rewards).mean()
+    return loss, reward_accuracy, reward_margin
+```
+
+The function returns three values because `reward_accuracy` and `reward_margin` are the real training diagnostics for DPO — the loss value alone is not a reliable signal of alignment quality. A healthy DPO run shows reward accuracy climbing toward 1.0 and a widening margin.
+
+The policy is trained to increase the log-likelihood of the preferred response and decrease the
+log-likelihood of the rejected response, relative to the reference policy. No RL sampling loop, no
+reward model, no value head.
+
+**Advantages**: DPO is more stable than PPO, requires no reward model infrastructure, uses the same
+(prompt, $y_w$, $y_l$) data format as RLHF, and is straightforward to implement on top of standard
+language model training. It is the default alignment stage for many open-weight models.
+
+**Disadvantages**: DPO is offline — the preference pairs are fixed at collection time and drawn from
+some behavioral distribution, not from the current policy. As the policy deviates from the reference,
+the training distribution becomes stale. This hurts on tasks requiring complex, multi-step reasoning
+where the quality of the current policy's outputs matters for the quality of the preference signal.
+DPO can also overfit to the reference distribution and struggle to generalize to out-of-distribution
+prompts.
+
+**Variants in active use**:
+- **IPO** (Identity Preference Optimization): replaces the log-sigmoid with a squared loss to avoid
+  saturation.
+- **KTO**: replaces preference pairs with scalar labels (thumbs up / thumbs down per response,
+  rather than comparisons), removing the dependency on paired data.
+- **SimPO**: removes the reference model entirely by using response length-normalized rewards as
+  the implicit signal.
+- **ORPO** (Odds Ratio Preference Optimization): combines the SFT cross-entropy loss and the
+  preference alignment loss in a single training pass, eliminating the need for a separate SFT stage.
+
+## Reading the Training Metrics
+
+Each stage produces a different set of meaningful signals. Watching the wrong metric — or misreading a healthy curve — is one of the most common sources of wasted compute.
+
+**Pre-training**: the loss follows a power-law decay — steep at the start, gradually flattening. A loss spike (sudden increase of >5%) usually means a bad data batch or a learning rate that's too high; if the spike recovers within a few hundred steps it's usually benign. Perplexity is a direct transformation of loss ($\text{ppl} = e^{\mathcal{L}}$), so it carries the same information. Gradient norm should stay roughly constant after warmup; a steadily climbing gradient norm is a sign of instability before it becomes visible in the loss.
+
+**SFT**: training loss drops quickly (the dataset is small) and the key signal is the gap between training and evaluation loss. A widening gap after the first epoch means overfitting — SFT datasets are often small enough that one epoch is sufficient and more hurts. Because the loss is computed only on response tokens, the absolute loss value is not comparable across different datasets (longer average responses produce lower per-token loss for the same quality).
+
+**Reward model**: track reward accuracy on a held-out preference set — the fraction of pairs where the model correctly ranks $y_w > y_l$. A good reward model reaches 70–80% accuracy on human preference data; above 85% often indicates overfitting to annotator idiosyncrasies rather than genuine preference understanding.
+
+**RL (PPO/GRPO)**: the key metrics are (1) **reward** — should climb and then plateau, not keep climbing indefinitely (if it keeps climbing, reward hacking is likely); (2) **KL from reference** — should stay bounded; unbounded KL is the canonical signature of reward hacking in progress; (3) **entropy** — should stay positive; entropy collapse means the policy has found a few high-reward templates and is stuck in them; (4) **response length** — often increases with reasoning quality early in training, but suspiciously long responses at saturation usually indicate length-reward correlation, not improved reasoning.
+
+**DPO**: the loss is a poor standalone signal — it can decrease while alignment quality stagnates. The meaningful metrics are **reward accuracy** (fraction of pairs where $\log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} > \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}$) and **reward margin** (the gap between the two implicit rewards). Watch also that the log-probability of $y_l$ actually decreases — if it increases alongside $y_w$, the model is drifting away from the reference in a way that's not preference-aligned.
+
+## Why the Order Matters
+
+The stages are not interchangeable. Several ordering constraints are fundamental:
+
+**Pre-training must come first.** No downstream stage can inject world knowledge that wasn't
+acquired in pre-training. SFT on a tiny corpus cannot teach facts; it can only rearrange how
+already-known facts are expressed. Forgetting this leads to the common mistake of trying to update
+a model's knowledge via fine-tuning instead of retrieval augmentation.
+
+**SFT must precede RL.** The RL stage requires sampling rollouts from the current policy and
+scoring them. If the policy hasn't learned to follow instructions, its rollouts are incoherent
+continuations, not responses to prompts — there's nothing meaningful to compare or score. The SFT
+stage is what installs the concept of a "turn" and makes the model's outputs comparable.
+
+**DPO requires a reference policy.** By construction, DPO's loss is defined relative to
+$\pi_{\text{ref}}$, which is the SFT model. The SFT model must exist and be fixed before DPO
+training begins.
+
+**SFT after RL can erase alignment.** Fine-tuning an RLHF-aligned model on new demonstration data
+— even benign data — can partially reverse the alignment, because the SFT loss updates all tokens
+in the response equally, which can overwrite the subtle distributional shifts that RL introduced.
+This has been documented empirically as the "alignment tax reversal" problem.
+
+## Stage Comparison
+
+| Stage | Data | Objective | What changes | Key metrics to watch |
+|---|---|---|---|---|
+| Pre-training | Web-scale text | Cross-entropy (all tokens) | World model, knowledge | Loss (power-law decay), gradient norm |
+| Mid-training | Domain text | Cross-entropy | Domain knowledge, context length | Loss on domain eval set, forgetting on general benchmarks |
+| SFT | Demonstrations | Cross-entropy (response only) | Format, instruction following | Train/eval loss gap, 1–2 epoch convergence |
+| RLHF/PPO/GRPO | Reward signal | Policy gradient + KL | Preference alignment, reasoning | Reward, KL from ref, entropy, response length |
+| DPO | Preference pairs | Bradley-Terry cross-entropy | Preference alignment | Reward accuracy, reward margin, $y_l$ log-prob |
+
+## Emerging Directions
+
+**RLVR (Reinforcement Learning from Verifiable Rewards)**: instead of training a reward model from
+human comparisons, use a programmatic reward — a math answer checker, a code execution harness, or
+a formal verifier. The reward signal is binary (correct / incorrect) but ground-truth accurate and
+free from reward model overfitting. DeepSeek-R1 used RLVR for its math and coding capabilities,
+producing its distinctive long chain-of-thought reasoning style as an emergent consequence of
+optimizing for final-answer correctness.
+
+**Constitutional AI / RLAIF**: use an LLM as the judge rather than human annotators. A "constitution"
+(a set of principles) is used to generate AI-preference labels at scale, reducing dependence on
+expensive human annotation. The critique-revision loop allows iterative self-improvement without
+human involvement at each step.
+
+**Iterated / Online DPO**: to address DPO's offline limitation, generate new responses with the
+current policy checkpoint, collect preference labels on those responses, and retrain. Each iteration
+uses on-policy data, approximating the online distribution-matching that makes RL effective. Early
+empirical results suggest iterated DPO closes much of the gap with PPO on reasoning tasks at lower
+compute cost.
+
+**ORPO**: by folding SFT and preference alignment into a single loss, ORPO eliminates the need for
+a separate SFT phase and a reference model checkpoint. The training is simpler, the pipeline is
+shorter, and results on instruction-following benchmarks are competitive with two-stage SFT+DPO.
+Very new, but promising for resource-constrained training scenarios.
+
+---
+
+The arc from base model to instruction-following, preference-aligned assistant is not a single
+fine-tuning step — it is a carefully ordered pipeline where each stage solves a problem the previous
+stage left open, and where skipping or reordering stages has predictable failure modes. The next
+post in this series examines mid-training in depth: when it is worth the compute, how to set the
+mixing ratio, and what the empirical evidence says about domain-adapted models.

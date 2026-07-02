@@ -1,0 +1,59 @@
+---
+title: "Prefill and Decode: The Two Phases of LLM Inference"
+slug: "inference-prefill-decode"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 1
+tags: ["inference", "llm", "systems", "kv-cache"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "LLM inference has two fundamentally different compute phases. Prefill processes the prompt in parallel and is compute-bound. Decode generates tokens one at a time and is memory-bandwidth-bound. Understanding both determines how you optimize."
+---
+
+A single inference request hides two workloads that share nothing but the model weights. The first reads a prompt and the second writes a continuation, and they sit on opposite sides of the roofline — one starved for arithmetic, the other starved for bandwidth. Every serving decision, from batch size to which GPU you buy, follows from which of the two you are trying to make faster.
+
+<PrefillDecodeRegimes />
+
+## Prefill: the prompt in one parallel pass
+
+When a request arrives with prompt tokens $[t_1, \ldots, t_P]$, the model runs a single forward pass over all $P$ positions at once, computes attention as a full $P \times P$ matrix under a causal mask, and populates the KV cache for every position in one shot. The cost is $O(P^2)$ for attention and $O(P)$ for the feed-forward blocks, and the quadratic term dominates once prompts get long. Because all $P$ positions move through the matrix units together, prefill has high arithmetic intensity and runs near the GPU's compute ceiling rather than its memory ceiling.
+
+The numbers make the regime concrete. A forward pass costs roughly $2N$ FLOPs per token for a model with $N$ parameters, so a 7B model spends about $14$ GFLOP on each token, and an A100 delivers $\sim 312$ TFLOP/s in fp16. Prefilling a 1024-token prompt therefore takes on the order of
+
+$$
+\frac{1024 \times 14\ \text{GFLOP}}{312{,}000\ \text{GFLOP/s}} \approx 0.046\ \text{s}.
+$$
+
+That time scales gracefully with batching, because several prompts can be packed into the same matrix multiply and the hardware was compute-bound to begin with.
+
+## Decode: one token, the whole weight read
+
+Decode is the other half, and it inverts every property prefill has. After the prompt is cached, the model emits one token per step: it runs a forward pass with a single input vector — the last token generated — attends that query against the cached keys and values for all earlier positions, and samples the next token. The compute per step is $O(P+t)$ for attention against the cache and effectively $O(1)$ for the feed-forward layers, which is almost no arithmetic at all.
+
+What it costs instead is a full sweep of the weights through memory. Each decode step reads roughly $\sim 14$ GB of fp16 weights for a 7B model and does very little with them, so on an A100 with $\sim 2$ TB/s of HBM bandwidth the floor on a step is
+
+$$
+\frac{14\ \text{GB}}{2000\ \text{GB/s}} \approx 7\ \text{ms},
+$$
+
+and that read, not the matmul, is the bottleneck. The companion post on the [lifecycle of a KV cache](/blog/kv-cache-lifecycle) works through why batching decode requests is what rescues throughput: several sequences read their own caches but share one weight load, so the bandwidth cost amortizes across the batch and the idle compute units finally do work. A batch-of-one decode wastes most of the GPU; thirty-two concurrent requests use it.
+
+## Why the two phases optimize in opposite directions
+
+Because prefill is compute-bound, it responds to anything that feeds the matrix units faster — larger batches that pack more prompts, tensor parallelism that splits each matmul across GPUs, and FlashAttention that keeps the $P \times P$ scores in SRAM instead of round-tripping them through HBM. Decode, being bandwidth-bound, responds to anything that moves fewer bytes per emitted token: continuous batching to keep the batch full, quantization to shrink the weights that get read every step, and [speculative decoding](/papers/speculative-decoding) to cash several tokens out of a single weight load. An optimization that helps one phase is often neutral or harmful to the other, which is why a serving stack rarely has a single knob.
+
+<ChunkedPrefillDemo />
+
+## Disaggregating the two phases
+
+If prefill and decode want different hardware and different batching, the logical end state is to stop running them on the same device. Disaggregated systems such as Mooncake and Splitwise route the two phases to separate GPU pools: prefill pods run large batches at FP8 with tensor parallelism to maximize compute throughput, decode pods run many small quantized batches to maximize bandwidth throughput, and the KV cache is shipped from the prefill pod to the decode pod once the prompt is processed. The transfer costs bandwidth, but it buys the freedom to scale each phase independently — add prefill capacity when prompts are long, add decode capacity when generations are long — instead of provisioning one homogeneous fleet for the worse of the two.
+
+<TTFTvsTOPT />
+
+## TTFT, TPOT, and which latency the user feels
+
+The two phases also map cleanly onto the two latencies a serving SLO cares about. Time-to-first-token (TTFT) is dominated by prefill: nothing can be emitted until the prompt is cached, so a long prompt is a long silence before the first word. Time-per-output-token (TPOT) is dominated by decode: once generation starts, each token arrives at the cadence of a bandwidth-bound step. Interactive chat lives and dies by TTFT, so it favors short prompts and large decode batches; offline document processing cares only about aggregate tokens per second, so it favors throughput at the expense of any single request's latency. Mixed workloads reach for chunked prefill — splitting a long prompt into pieces so its compute-heavy passes do not monopolize the GPU and stall the decode steps of every other request in the queue.

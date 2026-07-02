@@ -1,0 +1,59 @@
+---
+title: "Privacy Leakage in LLMs: PII, Memorization, and Code Generation Risks"
+slug: "rai-privacy-leakage"
+summary: "LLMs memorize training data. Under the right prompts, they reproduce it. Here's how memorization works, how to measure it, and the specific privacy risks in code generation models."
+date: "2024-06-19"
+contentType: "blog-post"
+tags:
+  - responsible-ai
+  - privacy
+  - memorization
+  - code-generation
+authors:
+  - name: "Admin"
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "responsible-ai-eval"
+seriesOrder: 2
+---
+
+A model has "memorized" a training example when it can reproduce a significant portion of that example given a prefix — and the precise version of that statement is what makes it measurable. Carlini et al. (2021), in their study of extracting training data from GPT-2, define extractability carefully: a sequence `s` is extractable from model `M` if there exists a prompt `p` such that `M` generates `s` given `p`, and `s` is not predictable by a reference model. That last clause does the real work, because it rules out sequences that any model would produce — the spelling of common words, boilerplate phrasing — and isolates the content that is specific to *this* model's training data rather than to the language at large.
+
+## Measuring it
+
+<MemorizationRateDemo />
+
+The standard procedure is mechanical once you accept the definition. Take held-out examples that are known to be in the training set, feed the first 50 tokens as a prefix, sample the continuation, and measure exact match or ROUGE-L overlap against the true continuation. That number alone is meaningless, so you compare it against two baselines: a random baseline of non-training examples, which tells you the overlap you would see by chance, and ideally a model trained without those specific examples, which tells you how much of the overlap is genuinely memorization rather than predictability — though the second baseline requires retraining and is usually too expensive to run. A follow-up study, Carlini et al. (2022) ("Quantifying Memorization Across Neural Language Models"), found that GPT-2 XL memorizes roughly 0.1% of training sequences verbatim, and that memorization scales with both model size and the number of times a sequence is repeated in training.
+
+## What gets memorized, and why it is the worst stuff
+
+Repetition is the dominant variable. A sequence appearing 100 times in the training corpus is memorized at dramatically higher rates than one appearing once, which means the model preferentially memorizes exactly the content that shows up in templated, repeated forms. A phone number that appears once is invisible; a phone number that appears in 100 forum signatures is recoverable. This is precisely the distribution of PII on the open web: email addresses in forum signatures, phone numbers in business listings, mailing addresses replicated across review sites and contact pages. The data that is most repeated is the data that is most personal-yet-public, and that is the data the model is most likely to regurgitate.
+
+## The code-generation version of the problem
+
+<ExtractionAttackDemo />
+
+Code models — Codex, CodeLlama, StarCoder — are trained on GitHub, and GitHub is a repository of secrets that were never meant to ship:
+
+- API keys and credentials that were committed, noticed, and deleted — but remain in git history, which crawlers routinely scrape.
+- Hardcoded test credentials living in unit tests, where nobody thought they mattered.
+- Personal email addresses embedded in commit messages and license headers.
+- Internal system names and architecture notes left in comments.
+
+The danger is subtler than "the model remembers one specific key." The model learns the *pattern* of how secrets appear in code — the variable names, the surrounding context, the format — and can therefore complete a secret-shaped prompt with something that looks real and sometimes is. A useful evaluation gives the model a prompt like `# AWS credentials for testing\nAWS_ACCESS_KEY_ID = "` and asks whether the completion has the structure of a real key, then escalates to the sharper question: can you use the model to recover keys that actually appeared in its training data?
+
+## Trade secrets are harder than verbatim leaks
+
+If a company's proprietary code ended up in the training set — scraped by a data vendor from an internal repository that leaked, say — the model may reproduce architectural patterns, internal API shapes, or business logic when prompted with related code, without ever emitting a verbatim copy. This is harder to detect than literal reproduction because the leakage is semantic, not lexical, and exact-match search will never find it. The evaluation tool for this is membership inference: given two code snippets, one drawn from training and one not, can you tell them apart from the model's perplexity? If you can, the model is leaking the fact of membership, which is the first step toward leaking the content.
+
+## Differential privacy, and why most models skip it
+
+<DifferentialPrivacyTradeoff />
+
+Training with differential privacy via DP-SGD provides a formal guarantee: the probability that any single training example influences the model — and therefore can be memorized — is bounded. The guarantee is parameterized by ε, where a smaller ε means stronger privacy and worse utility, and the trade is brutal at scale. The privacy loss compounds across the bound roughly as the inverse of ε, so driving ε below 10 on a large language model degrades perplexity to a degree most teams find unacceptable. In practice, that is why most production models do not use DP-SGD and instead lean on cheaper, weaker defenses: filtering PII out of the data before training, deduplicating the corpus to cut the repetition that drives memorization, and suppressing memorized outputs after the fact at inference time.
+
+## Catching it at inference
+
+When the training-time defenses are imperfect — they always are — post-hoc detection is the last line. Three signals are worth combining. A perplexity gap: if the model assigns far lower perplexity to its own output than a reference model does, it may be regurgitating something it memorized rather than generating. PII pattern matching: regexes for email, phone, SSN, and IP-address formats catch the structured leaks. And near-duplicate search: embed the output and query a database of known sensitive documents for similarity, which catches the semantic leaks that regexes miss. None of the three is sufficient alone, but together they cover the verbatim, the structured, and the paraphrased leak respectively.

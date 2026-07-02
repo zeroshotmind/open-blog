@@ -1,0 +1,61 @@
+---
+title: "Runtime Guardrails: Architecture Patterns for Production AI Safety"
+slug: "rai-runtime-guardrails"
+summary: "Training-time alignment is not enough. Production AI systems need runtime layers that detect, intercept, and respond to harmful inputs and outputs. Here's how to build them."
+date: "2024-06-19"
+contentType: "blog-post"
+tags:
+  - responsible-ai
+  - safety
+  - guardrails
+  - production
+  - llm
+authors:
+  - name: "Admin"
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "responsible-ai-eval"
+seriesOrder: 3
+---
+
+RLHF and RLAIF push a model toward safe behavior on the training distribution, and production traffic is not the training distribution. Real inputs are adversarial, long-tailed, and out-of-distribution in ways no training run fully anticipates, so jailbreaks work by finding the gaps in the reward model's coverage rather than by overpowering it. Worse, the attack surface moves faster than the retraining cycle: many-shot jailbreaking, indirect prompt injection through retrieved documents, and multilingual attacks all emerged and spread faster than any model could be re-aligned against them. Runtime guardrails exist because of this gap — they are a defense-in-depth layer that catches what alignment missed and, crucially, can be updated in hours rather than weeks.
+
+## The shape of the stack
+
+A complete runtime safety stack has three insertion points, and they catch different things.
+
+1. An **input classifier** runs before the LLM and scores the incoming prompt for policy violations; above threshold, it rejects or rewrites the prompt.
+2. An **output classifier** runs on the generated text and scores it for harm before it reaches the user; above threshold, it suppresses or regenerates.
+3. A **context monitor** runs across the whole multi-turn conversation, tracking whether the accumulated context is steering toward a harmful objective that no single turn triggers on its own.
+
+The third is the one teams skip and attackers exploit, because a sequence of individually-innocuous turns can assemble into a request that none of them states outright.
+
+## Input classifiers and the latency budget
+
+<GuardrailLatencyBudget />
+
+A useful input classifier has to return in under 50ms or it eats the latency budget the product promised. Three implementations hit that target with different trade-offs: a fine-tuned BERT- or RoBERTa-class model around 350M parameters runs in roughly 10ms on CPU and handles nuance; embedding similarity against a database of known harmful prompts is fast and easy to update; and rule-based regex catches the high-confidence cases — known jailbreak templates, explicit keywords — at essentially zero cost.
+
+The failure mode that sinks input classifiers is over-blocking. A classifier tuned to catch everything will reject "How do I kill a process in Linux?" because it pattern-matched on "kill," and every false positive of that kind is a legitimate user turned away. Threshold calibration is therefore not a one-time hyperparameter but an ongoing process: sample production traffic, review the edge cases the threshold flags, and A/B test threshold changes on live traffic with humans reviewing the newly-flagged set before the change ships.
+
+## Output classifiers and wasted compute
+
+<OutputClassifierWaste />
+
+Running a full output classifier after generation has an uncomfortable property: if the classifier rejects the output, you have already paid the full generation cost for nothing. Three strategies attack that waste. Streaming classification scores each sentence as it is produced and interrupts the moment a harmful sentence appears, which cuts wasted compute at the cost of sentence-boundary detection complexity. Speculative classification runs a tiny classifier in parallel with generation and only triggers the expensive full classifier when the tiny one flags something. And output rewriting replaces suppression entirely: flagged outputs pass through a rewriter model that strips the harmful content while preserving the helpful remainder, so the user gets a degraded-but-useful answer instead of a refusal.
+
+## Prompt injection and the data-instruction confusion
+
+<PromptInjectionDemo />
+
+Prompt injection is the attack where malicious instructions are smuggled into content the model treats as data — a document retrieved by a RAG pipeline, a web page the model browses, a user-controlled field it processes — and the model fails to distinguish "text I should act on" from "text I should reason about." The structural defense is an instruction hierarchy: tag system instructions, user instructions, and retrieved data with distinct trust levels, and fine-tune the model to obey only instructions that arrive at a sufficiently trusted level. This reduces the attack surface but does not close it; full mitigation of prompt injection is an open research problem, and any architecture that claims to have solved it should be treated with suspicion.
+
+## Evaluating the guardrails themselves
+
+The metrics are the standard classification pair: precision (of the outputs we flagged, what fraction were genuinely harmful?) and recall (of the harmful outputs that existed, what fraction did we flag?). What is not standard is the cost asymmetry between the two error types. A false negative — a harmful output that reaches the user — has direct, user-facing consequences, while a false positive merely degrades utility by blocking something benign. Because the costs differ, aggregate F1 hides the number that matters, and the right report is precision at a target recall level. Safety systems should generally target high recall, above 95%, and then accept whatever precision that recall implies, with the acceptable false-positive rate varying by harm category — near-zero tolerance for missed CSAM, more slack for borderline profanity.
+
+## What this looks like at Meta scale
+
+At billions of queries per day, the guardrail stack inherits hard infrastructure constraints. It must be horizontally scalable, which means stateless classifiers that replicate freely. It must be low-latency, which means co-locating the classifiers with inference rather than making a remote call per query. And it must be auditable, which means every classification decision is logged with its input, output, and score so it can be reviewed later. That last requirement collides directly with privacy: logging full prompts and outputs to audit safety creates a database of exactly the sensitive user inputs you were trying to protect. The standard resolution is to log only classifier metadata — score, category, timestamp — by default, and to retain full content only for cases above a high-harm threshold, under explicit retention limits. The safety log and the privacy risk are the same object, and the architecture has to treat them that way.

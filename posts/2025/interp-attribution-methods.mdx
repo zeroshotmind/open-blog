@@ -1,0 +1,163 @@
+---
+title: "Attribution Methods: Saliency, Integrated Gradients, LIME, and SHAP"
+slug: "interp-attribution-methods"
+summary: "What each attribution method actually computes, where they agree, where they fail, and whether gradient-based and perturbation-based approaches are still relevant for LLMs."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - mechanistic-interpretability
+  - attribution
+  - integrated-gradients
+  - saliency
+  - lime
+  - shap
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "mechanistic-interpretability"
+seriesOrder: 7
+---
+
+Attribution methods were built to answer one question: which input features caused this output? For decades, that question was tractable because neural networks were small and the outputs were class probabilities over a fixed label set. For LLMs, the question fragments into at least two distinct questions — and conflating them explains most of the confusion in the literature about whether attribution methods are useful or not.
+
+## Input Attribution vs. Internal Attribution
+
+*Input attribution* asks: which input tokens most influenced this output? The model is treated as a black box; you observe how the output changes as inputs vary. This is the domain of saliency maps, LIME, SHAP, and integrated gradients applied at the embedding layer.
+
+*Internal attribution* asks: which model components (layers, heads, neurons, circuits) contributed most to this prediction? This requires model access and produces answers like "attention head 8.5 in GPT-2 performs induction" or "MLP layer 9 stores the factual association for the Eiffel Tower."
+
+Both framings are legitimate. They answer different questions for different audiences. Input attribution is useful for model users — it tells you which tokens a deployed model pays attention to. Internal attribution is useful for model builders — it tells you how the model actually computes its answer. Activation patching and circuit analysis (covered elsewhere in this series) are tools for internal attribution. This post focuses on input attribution.
+
+<AttributionComparison />
+
+## Gradient-Based Saliency
+
+The simplest attribution: compute the gradient of the loss $\mathcal{L}$ with respect to each input token embedding $x_i$ and take the magnitude:
+
+$$
+\text{Saliency}_i = \left| \frac{\partial \mathcal{L}}{\partial x_i} \right|
+$$
+
+One backward pass. The interpretation is local: saliency measures how much the loss would change if you moved infinitesimally in the direction of $x_i$. It is not a measure of the token's counterfactual importance — it doesn't tell you what would happen if you removed the token, only which direction locally increases the loss the most.
+
+The two main failure modes:
+
+**Gradient saturation.** In regions where the loss surface is flat — because the model is highly confident — gradients are near zero regardless of which tokens are important. A model that is 99.9% confident on a correct answer will produce near-zero saliency even for the token that clinches the prediction. This is especially acute for transformers, which use softmax activations that saturate hard.
+
+**Baseline independence.** The gradient is computed at the actual input. But "important" is inherently a comparative judgment — important relative to what? Gradient-based saliency has no baseline; it can't distinguish between a token being important and a token being at a location where the loss happens to be steep for unrelated reasons.
+
+The **gradient × input** variant addresses saturation partially:
+
+$$
+\text{Saliency}_i^{\times} = \frac{\partial \mathcal{L}}{\partial x_i} \cdot x_i
+$$
+
+Multiplying by the input value downweights contributions in directions where the input itself is small, which correlates with features that are actually active. But it still doesn't introduce a baseline, so the counterfactual interpretation is not fully recovered.
+
+<IntegratedGradientsDemo />
+
+## Integrated Gradients
+
+Sundararajan, Taly, and Yan (2017) formalize what a baseline should do and derive the attribution method that satisfies their axioms. IG integrates gradients along the straight line from a chosen baseline $x'$ to the actual input $x$:
+
+$$
+\text{IG}_i(x) = (x_i - x'_i) \int_0^1 \frac{\partial F\bigl(x' + \alpha(x - x')\bigr)}{\partial x_i} \, d\alpha
+$$
+
+where $F$ is the model output (or a scalar derived from it). The integral is approximated in practice with $m$ Riemann steps — typically 50 to 300 for LLMs.
+
+Two axioms drive the construction:
+
+**Sensitivity.** If $F(x) \neq F(x')$ and the functions differ only at feature $i$, then feature $i$ gets non-zero attribution. Gradient saliency can violate this: if the loss is locally flat at $x$, the gradient is zero even though changing feature $i$ would change the output if you moved far enough.
+
+**Implementation invariance.** Two networks that are mathematically identical (same function, different computational graph) receive identical attributions. Discrete approximations like LIME and SHAP don't satisfy this — the perturbation distribution depends on the representation, not just the function.
+
+The choice of baseline matters. For vision, black image is the standard. For NLP, options include: zero embedding (a vector of zeros), a padding token, or a mask token. Each gives different results because the "background signal" they establish differs. There is no universally correct baseline for language; it is a modeling choice that should be reported.
+
+IG was applied in "What Does BERT Look At?" (Clark et al., 2019) style analyses to understand attention-head specialization — though the analyses there primarily used attention weights rather than IG. More recent applications include diagnosing factual recall failures in GPT-2 and identifying spurious correlations in classification models.
+
+## Attention as Explanation — and Why It Usually Isn't
+
+Before LIME and SHAP took hold for LLMs, the tempting shortcut was to use attention weights directly as importance scores. High attention weight on token $j$ when predicting token $t$ means the model was "looking at" $j$, so surely it matters?
+
+Jain and Wallace (2019) ran the test: they compared attention weights against gradient-based importance scores across NLP classification tasks. Correlation was low. More damningly, they showed that you can permute attention weights across positions and get the same output — the model has learned to use the residual stream in ways that make the downstream layers robust to attention weight reordering.
+
+Wiegreffe and Pinter (2019) pushed back: attention *can* be an explanation if you define explanation as a faithful account of what the model uses in some formal sense, and they demonstrate models where attention and gradient-based scores agree. The nuanced position is that attention weights encode a learned routing decision, not a direct measure of feature importance. In multi-head attention with residual connections and LayerNorm, the attention weight from head $h$ on token $j$ reflects only what that head's value projection passes to position $i$, averaged over all heads and composed with everything in the residual stream. Reading off raw attention weights as importance scores ignores all of that structure.
+
+The practical conclusion: don't use raw attention weights as your attribution method. If you need to visualize attention for exploration, attention rollout (Abnar & Zuidema, 2020) at least accounts for the residual connections. For actual attribution, use IG or gradient-based methods.
+
+## LIME
+
+Ribeiro, Singh, and Guestrin (2016) took the view that interpretability doesn't require understanding the model — it requires understanding the model's behavior locally around a specific prediction. LIME (Locally Interpretable Model-agnostic Explanations) makes this precise:
+
+1. Perturb the input by randomly masking tokens (or words, or segments).
+2. Run each perturbed input through the model and record the output.
+3. Weight the perturbed inputs by their proximity to the original input.
+4. Fit a weighted linear regression over the perturbations.
+5. The regression coefficients are the attributions.
+
+The result is a local linear approximation of the model around the input point. The interpretation is: *if the model were locally linear here*, each token's coefficient is its marginal contribution.
+
+LIME is model-agnostic — it only needs query access. This makes it the right tool for black-box APIs where you can't run backprop. The explanations are also immediately interpretable: positive coefficient means the token pushed toward the predicted class, negative means it pushed away.
+
+For LLMs, the perturbation scheme runs into problems. Masking tokens from a sentence produces grammatically broken inputs that fall outside the training distribution. The "neighborhood" in token space is discrete and poorly defined compared to continuous feature spaces. Stochasticity in the random perturbations means running LIME twice gives different results. And the local linear approximation is a model of a model — it describes how the black-box changes around this point, not why.
+
+## SHAP
+
+Lundberg and Lee (2017) grounded feature attribution in cooperative game theory. Shapley values, introduced by Lloyd Shapley in 1953, measure the marginal contribution of player $i$ in a coalition game by averaging over all possible coalitions:
+
+$$
+\phi_i(F) = \sum_{S \subseteq \mathcal{F} \setminus \{i\}} \frac{|S|!(|\mathcal{F}| - |S| - 1)!}{|\mathcal{F}|!} \left[ F(S \cup \{i\}) - F(S) \right]
+$$
+
+where $\mathcal{F}$ is the set of all features, $S$ is a subset not containing $i$, and $F(S)$ is the model output when only features in $S$ are present (others set to baseline). The exact computation is exponential in $|\mathcal{F}|$ and is approximated via KernelSHAP (a weighted least-squares approach) or TreeSHAP (exact, for tree models).
+
+Shapley values satisfy four axioms that IG does not: *efficiency* (attributions sum to $F(x) - F(x')$), *symmetry* (symmetric features get equal attribution), *dummy* (unused features get zero), and *linearity* (attributions add over linear combinations of models). The efficiency property is particularly useful: you can verify that attributions account for the full output difference from the baseline.
+
+For LLMs, PartitionSHAP and variants treat token segments as players. This is expensive — each evaluation requires a model forward pass with some tokens masked — and shares LIME's problem of out-of-distribution masked inputs. GTP-J and LLaMA-scale SHAP analyses exist in the literature but are computational studies, not production tools.
+
+<FaithfulnessVsPlausibility />
+
+## Faithfulness vs. Plausibility
+
+Jacovi and Goldberg (2020) draw a distinction that clarifies most disagreements about attribution methods.
+
+A *plausible* explanation looks correct to a human. It highlights tokens that, intuitively, should matter. It is evaluated by human annotation studies.
+
+A *faithful* explanation accurately reflects the model's actual computation. It is evaluated by interventional tests: does removing the highlighted tokens degrade performance? Does the model actually change its prediction when the "important" tokens are modified?
+
+These are independent properties. An explanation can be plausible but unfaithful (looks right, doesn't reflect actual computation) or faithful but uninterpretable (accurately reflects a computation humans can't parse).
+
+Gradient-based methods and IG are designed for faithfulness: the gradients are part of the computation graph. But they can produce token-level attributions that look noisy and uninterpretable to humans. LIME and SHAP are designed for plausibility: the local linear model is easy to read. But they approximate the model with a simpler function, so the approximation error is the gap between plausibility and faithfulness. Attention weights tend to be plausible (they have an intuitive reading) but unfaithful (they don't correlate with interventional measures of importance).
+
+ROAR (Removing And Retraining), Hooker et al. (2019), is one formal faithfulness test: remove the features that an attribution method flags as most important, retrain the model, and measure performance degradation. More degradation = more faithful attribution. Running ROAR for LLMs is expensive (requires retraining at scale), which is why few papers do it.
+
+## Are These Methods Still Relevant for LLMs?
+
+Honest assessment by method:
+
+**Integrated Gradients** — yes, still actively used. It is the standard tool for token-level attribution in production systems (Google, among others, deploys IG in its model explanation APIs). The limitation is that IG tells you *which tokens* mattered, not *how* the model processed them. It cannot tell you that the model used token $j$ as a key in an induction head — that requires internal attribution.
+
+**LIME and SHAP** — mostly superseded for mechanistic questions in white-box settings. If you have model weights, activation patching answers causal questions more directly. But for black-box API access, LIME and SHAP remain the right tools. They are also useful for communicating predictions to non-ML stakeholders who need a feature-importance narrative.
+
+**Attention weights / rollout** — useful for visualization and hypothesis generation, not as mechanistic evidence. BERTViz and attention rollout are legitimate exploration tools. They do not constitute explanations.
+
+**Activation patching and causal tracing** — the right tools for mechanistic questions in white-box settings. They dominate for circuit analysis because they answer interventional questions directly: does this component causally contribute to this output?
+
+The practical split: attribution methods for *model users* (which inputs matter?), mechanistic methods for *model builders* (how does the model compute?). A practitioner debugging a model that refuses a reasonable request might use IG to identify which tokens triggered the refusal. A researcher trying to understand *why* those tokens triggered the refusal needs circuit analysis.
+
+Attribution methods haven't been superseded — they've been correctly scoped. The mistake was expecting them to answer mechanistic questions they were never designed for.
+
+## References
+
+- Sundararajan, M., Taly, A., & Yan, Q. (2017). Axiomatic Attribution for Deep Networks. *arXiv:1703.01365*.
+- Ribeiro, M. T., Singh, S., & Guestrin, C. (2016). "Why Should I Trust You?": Explaining the Predictions of Any Classifier. *arXiv:1602.04938*.
+- Lundberg, S. M., & Lee, S.-I. (2017). A Unified Approach to Interpreting Model Predictions. *arXiv:1705.07874*.
+- Jain, S., & Wallace, B. C. (2019). Attention is not Explanation. *arXiv:1902.10186*.
+- Wiegreffe, S., & Pinter, Y. (2019). Attention is not not Explanation. *arXiv:1908.04626*.
+- Jacovi, A., & Goldberg, Y. (2020). Towards Faithfully Interpretable NLP Systems: On the Concept of Explanations. *arXiv:2005.00558*.
+- Hooker, S., Erhan, D., Kindermans, P.-J., & Kim, B. (2019). A Benchmark for Interpretability Methods in Deep Neural Networks. *NeurIPS 2019*.

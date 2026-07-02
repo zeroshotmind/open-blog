@@ -1,0 +1,267 @@
+---
+title: "From Likelihood to Perplexity: One Unified Reference"
+slug: "log-likelihood-to-perplexity"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 11
+tags: ["math", "probability", "information-theory", "perplexity", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Probability, likelihood, log-likelihood, NLL, expectation, entropy, cross-entropy, KL divergence, and perplexity are constantly confused for one another. They are not the same thing — but they are all the same thing seen from different angles. This is the definitive deep-dive that names each one precisely and shows exactly how they connect for LLMs."
+---
+
+The rest of this series tells a story in order, and [Part 2](/blog/math-llm-probability) and [Part 8](/blog/math-llm-information-theory) introduce most of the quantities below in the flow of that narrative. This post is the deep-dive *reference* companion: it slows down on the cluster of ideas that get confused for one another more than any other in machine learning — probability versus likelihood, log-likelihood, negative log-likelihood, expectation, entropy, cross-entropy, KL divergence, and perplexity — and pins down what each one is, with worked numbers, and exactly how they collapse into a single equation for language models.
+
+A note on units before anything else, because mixing logarithm bases is the single most common error in this material. **Throughout, $\log$ means natural log and quantities are in nats**, unless a formula explicitly converts to bits. The only consequence that matters: perplexity is $e^{\text{NLL}}$ when the NLL is in nats, and bits-per-character involves a division by $\ln 2$ to convert nats to bits. Get the base wrong and every number is off by a factor of $\ln 2 \approx 0.693$.
+
+### Probability and likelihood are the same formula read two different ways
+
+Start with the distinction that everything else rests on. A probability and a likelihood are computed from the *identical* expression $P(x \mid \theta)$ — the chance of observing data $x$ under a model with parameters $\theta$ — but they hold different things fixed and vary different things, and that difference is not pedantic.
+
+$$
+\underbrace{P(x \mid \theta)}_{\text{probability: } \theta \text{ fixed, } x \text{ varies}} \qquad\qquad \underbrace{\mathcal{L}(\theta \mid x) = P(x \mid \theta)}_{\text{likelihood: } x \text{ fixed, } \theta \text{ varies}}
+$$
+
+A **probability** answers *"given this fixed model, how probable are the various outcomes?"* — you sweep over $x$ with $\theta$ held constant, and the values sum or integrate to one over all $x$, because *something* must happen. A **likelihood** answers *"given this fixed observation, how well do various models explain it?"* — you sweep over $\theta$ with $x$ held constant at the data you actually saw, and it emphatically **does not** integrate to one over $\theta$. The likelihood is not a probability distribution over parameters; it is a function that scores parameters by how plausibly each one would have generated the fixed data.
+
+| | Probability $P(x \mid \theta)$ | Likelihood $\mathcal{L}(\theta \mid x)$ |
+| --- | --- | --- |
+| What's fixed | the model $\theta$ | the observed data $x$ |
+| What varies | the outcome $x$ | the parameters $\theta$ |
+| Normalizes to 1 over | $x$ (always) | nothing — it need not sum to 1 over $\theta$ |
+| Question it answers | "how likely is this outcome?" | "how well does this model explain what I saw?" |
+| Used for | sampling, decoding, prediction | fitting, training, MLE |
+
+**Maximum likelihood estimation (MLE)** is the act of choosing the parameters that maximize the likelihood of the data you observed.
+
+$$
+\hat{\theta} = \arg\max_\theta \mathcal{L}(\theta \mid x) = \arg\max_\theta P(x \mid \theta) = \arg\max_\theta \log P(x \mid \theta)
+$$
+
+For a language model the "observation" is a corpus, and the model factors the probability of a sequence by the chain rule into a product of next-token conditionals — this is the entire probabilistic content of "autoregressive."
+
+$$
+P(w_1, \dots, w_T \mid \theta) = \prod_{t=1}^{T} P(w_t \mid w_{<t}, \theta)
+$$
+
+Reading this left-to-right with $\theta$ fixed gives the probability the model assigns to a particular text. Reading it with the text fixed and $\theta$ varying gives the likelihood of the parameters — and training is MLE: search for the $\theta$ that makes the observed corpus as likely as possible.
+
+### Log-likelihood: why we never optimize the likelihood directly
+
+Nobody maximizes the product above as written, for three independent reasons, all fixed by taking a logarithm.
+
+**Products become sums.** The log of a product is a sum of logs, which turns a fragile chained multiplication into a robust accumulation.
+
+$$
+\log P(x_{1:T}) = \sum_{t=1}^{T} \log P(x_t \mid x_{<t})
+$$
+
+**It avoids numerical underflow.** This is not a theoretical nicety. Suppose each token gets probability around $0.1$ — generous for a vocabulary of tens of thousands — and the sequence is $1000$ tokens. The product is $\approx 10^{-1000}$, which is flatly zero in IEEE double precision (the smallest positive double is $\approx 10^{-308}$). The sum of logs is $1000 \times \ln(0.1) \approx -2302.6$ nats, a perfectly ordinary number. Without the log, the loss of any realistic sequence would round to zero and no gradient would flow.
+
+**The argmax is preserved.** The logarithm is strictly monotonic, so $\arg\max_\theta P = \arg\max_\theta \log P$ exactly — taking the log changes the *value* of the objective but never *where* its maximum sits, which is the only thing MLE cares about.
+
+Because sequences differ in length, the comparable quantity is the **average log-likelihood per token**, which is what you should picture whenever someone mentions "the loss" without qualification:
+
+$$
+\frac{1}{T} \sum_{t=1}^{T} \log P(x_t \mid x_{<t})
+$$
+
+### Negative log-likelihood is the training loss
+
+MLE *maximizes* log-likelihood, but every optimizer in deep learning *minimizes*. Flip the sign and you get the **negative log-likelihood (NLL)**, which is the loss reported on every pretraining dashboard ever made.
+
+$$
+\text{NLL} = -\frac{1}{T} \sum_{t=1}^{T} \log P(x_t \mid x_{<t})
+$$
+
+The "negative" carries no extra meaning beyond "we minimize instead of maximize" — minimizing NLL and maximizing likelihood are the same operation said two ways. What is genuinely worth internalizing is that **this NLL is exactly cross-entropy loss with a one-hot target.** Cross-entropy between a target distribution $p$ and a predicted distribution $q$ is
+
+$$
+H(p, q) = -\sum_x p(x) \log q(x).
+$$
+
+At a single training position the target $p$ is *one-hot*: it puts all its mass on the token $x^*$ that actually came next and zero everywhere else. Every term in the sum vanishes except the one at $x^*$, where $p(x^*) = 1$, collapsing the whole expression to
+
+$$
+H(p, q) = -\log q(x^*),
+$$
+
+which is precisely the per-token NLL. This is why `nn.CrossEntropyLoss` in PyTorch *is* the language-modeling loss — it fuses a `log_softmax` (turn logits into log-probabilities) with `nll_loss` (pick out the negative log-prob of the correct class) in a single numerically stable kernel:
+
+```python
+import torch, torch.nn.functional as F
+
+# logits: (batch, seq_len, vocab)   targets: (batch, seq_len) of token ids
+logits  = model(input_ids)
+loss = F.cross_entropy(
+    logits.view(-1, logits.size(-1)),  # (B*T, V)
+    targets.view(-1),                  # (B*T,)
+)
+# identical, spelled out — log_softmax then gather the true token's log-prob:
+logp = F.log_softmax(logits, dim=-1)
+nll  = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1).mean()
+assert torch.allclose(loss, nll)
+```
+
+So **NLL = cross-entropy loss = what the optimizer minimizes**, and the three names refer to one number.
+
+<NLLPerplexityCurve />
+
+
+### Expectation is the glue
+
+Everything above is a finite sum over observed tokens, but the *meaning* lives in an expectation. For a function $f$ and a distribution $p$, the expectation is the probability-weighted average,
+
+$$
+\mathbb{E}_{x \sim p}[f(x)] = \sum_x p(x)\, f(x),
+$$
+
+and the training loss is exactly the expected surprise of the model under the data distribution:
+
+$$
+\text{NLL} = \mathbb{E}_{x \sim p_\text{data}}\!\left[-\log q_\theta(x)\right].
+$$
+
+The empirical average over the corpus, $-\frac{1}{T}\sum_t \log q_\theta(x_t)$, is a Monte-Carlo *estimate* of this expectation — the corpus tokens are samples from $p_\text{data}$, and averaging over them estimates the average over the true distribution. This estimator view is the bridge between "the finite loss I compute" and "the population quantity I care about," and it is the lens through which the whole field reasons: the ELBO that trains a VAE, the policy-gradient and REINFORCE estimators behind [RL for LLMs](/blog/rl-for-llms-policy-gradients), and the KL penalties below are all expectations of log-probabilities, estimated from samples. One identity from this family recurs constantly — the expected log-probability of a distribution *under itself* is the negative of its entropy:
+
+$$
+\mathbb{E}_{x \sim p}[\log p(x)] = \sum_x p(x) \log p(x) = -H(p),
+$$
+
+which is the door into information theory.
+
+### Entropy: the average surprise of a distribution under itself
+
+**Shannon entropy** measures how uncertain a distribution is — the expected surprise $-\log p(x)$ averaged over $p$'s own outcomes.
+
+$$
+H(p) = -\sum_x p(x) \log p(x) = \mathbb{E}_{x\sim p}[-\log p(x)]
+$$
+
+A peaked, confident distribution has low entropy (few surprises); a flat, uncertain one has high entropy. Two anchors make this concrete, computed in **bits** ($\log_2$) so the numbers are familiar:
+
+- A **fair coin**: $H = -(0.5\log_2 0.5 + 0.5\log_2 0.5) = 1$ bit. Maximum uncertainty for two outcomes.
+- A **biased coin**, $p = 0.9$: $H = -(0.9\log_2 0.9 + 0.1\log_2 0.1) \approx 0.469$ bits. Knowing it usually lands heads, you are far less surprised on average.
+- A **uniform distribution** over $V$ outcomes: $H = \log V$, the maximum possible. For a vocabulary of $V = 50{,}000$ tokens, $\log_2 50{,}000 \approx 15.6$ bits — a model that has learned nothing.
+
+A distribution that places *all* its mass on one outcome has $H = 0$: nothing it produces is ever a surprise. For continuous distributions the analogue is **differential entropy**, $h(p) = -\int p(x)\log p(x)\,dx$, which can be *negative* (a tight Gaussian concentrated in a region of width $< 1$ has negative differential entropy) — a reminder that differential entropy is not a straightforward limit of the discrete kind. In an LLM, the entropy of the model's output distribution at a position is a direct readout of how *sure* it is about the next token: low entropy at "the capital of France is ___", high entropy at "my favorite color is ___".
+
+### Cross-entropy: the cost of using the wrong distribution
+
+Entropy scores a distribution against itself. **Cross-entropy** scores the cost of encoding draws from $p$ using a code optimized for $q$ — the average surprise you incur when the data truly comes from $p$ but you model it as $q$.
+
+$$
+H(p, q) = -\sum_x p(x) \log q(x)
+$$
+
+Its decomposition is the most important identity in this entire post:
+
+$$
+\boxed{\,H(p, q) = H(p) + D_{\text{KL}}(p \,\|\, q)\,}
+$$
+
+Cross-entropy is the irreducible entropy of the data *plus* a non-negative penalty for the mismatch between $q$ and $p$. Because that penalty (the KL divergence below) is always $\geq 0$, **cross-entropy is always at least the entropy**, $H(p,q) \geq H(p)$, with equality if and only if $q = p$. Worked example with $p = (0.9, 0.1)$ and a model $q = (0.5, 0.5)$, in bits:
+
+$$
+H(p) \approx 0.469, \qquad H(p, q) = -(0.9\log_2 0.5 + 0.1\log_2 0.5) = 1.0, \qquad D_{\text{KL}}(p\|q) = 1.0 - 0.469 = 0.531.
+$$
+
+The model pays $0.531$ extra bits per symbol for being wrong about the bias. Training an LLM minimizes $H(p_\text{data}, q_\theta)$, and since $H(p_\text{data})$ is a constant the optimizer cannot touch, **minimizing cross-entropy is identical to minimizing $D_{\text{KL}}(p_\text{data} \| q_\theta)$** — pulling the model's distribution toward the data's.
+
+<CrossEntropyDecomposition />
+
+
+#### The one-hot vs. data-distribution confusion, resolved
+
+Here is the subtlety that trips up careful readers, and it is worth a paragraph rather than a footnote. The section on NLL said the per-token target is one-hot, which makes $H(p) = 0$ and the per-token loss equal to *pure* KL with no floor. This section says the loss bottoms out at the nonzero data entropy $H(p_\text{data})$. Both are true, because **they describe cross-entropy against two different $p$'s.**
+
+Per *individual token*, the target distribution really is the one-hot $\delta_{x^*}$ — it has zero entropy, so the per-token loss $-\log q(x^*) = H(\delta_{x^*}, q) = D_{\text{KL}}(\delta_{x^*}\|q)$ is all KL and could in principle reach zero if the model put all its mass on $x^*$. But natural language is genuinely stochastic: given a context, *many* next tokens are valid, so the true conditional $p_\text{data}(\cdot \mid x_{<t})$ is **not** one-hot — it has real entropy. Those one-hot targets are *samples drawn from* $p_\text{data}$, and the corpus-averaged loss $-\frac{1}{T}\sum_t \log q(x_t)$ is a Monte-Carlo estimate of the cross-entropy $H(p_\text{data}, q) = H(p_\text{data}) + D_{\text{KL}}(p_\text{data}\|q)$ against the *full* distribution. So the per-token loss can hit zero only for a token that was truly deterministic; in aggregate the loss cannot fall below $H(p_\text{data})$ — the irreducible entropy of language, the few bits of genuine unpredictability per token that no model can remove. A perfect model drives the KL term to zero and lands *exactly* at $H(p_\text{data})$, **not** at zero. The naive reading "targets are one-hot so $H(p)=0$ so the loss goes to zero" is precisely backwards, and the resolution is that the one-hot you compute against per token and the entropic $p_\text{data}$ you estimate against in aggregate are different distributions wearing the same letter.
+
+### KL divergence: a directional gap between distributions
+
+The penalty term, the **Kullback–Leibler divergence**, is the number of extra nats you pay for using $q$ when the truth is $p$.
+
+$$
+D_{\text{KL}}(p \,\|\, q) = \sum_x p(x) \log \frac{p(x)}{q(x)} = H(p, q) - H(p) = \mathbb{E}_{x\sim p}\!\left[\log\frac{p(x)}{q(x)}\right]
+$$
+
+By Gibbs' inequality it is always $\geq 0$ and is $0$ only when $p = q$, which makes it the natural measure of a gap. But it is **not a distance**: it is not symmetric, and the asymmetry has real consequences. Continuing the worked example, $D_{\text{KL}}(p\|q) = 0.531$ bits but the reverse is
+
+$$
+D_{\text{KL}}(q\|p) = 0.5\log_2\frac{0.5}{0.9} + 0.5\log_2\frac{0.5}{0.1} \approx 0.737 \text{ bits} \neq 0.531.
+$$
+
+The two directions behave differently enough to deserve names:
+
+| | Forward KL $D_{\text{KL}}(p\|q)$ | Reverse KL $D_{\text{KL}}(q\|p)$ |
+| --- | --- | --- |
+| Expectation taken under | the true $p$ | the model $q$ |
+| Penalizes | $q$ being small where $p$ is large | $q$ being large where $p$ is small |
+| Behavior | **mass-covering / mean-seeking** — $q$ stretches to cover every mode of $p$ | **mode-seeking / zero-forcing** — $q$ collapses onto one mode and ignores the rest |
+| Where it shows up | maximum-likelihood training (this is what minimizing cross-entropy does) | variational inference, some RL objectives |
+
+Forward KL is what LLM pretraining minimizes — and its mass-covering nature is *why* a base model will happily assign probability to many continuations rather than committing to one. KL divergence also appears explicitly as a loss term, not just a diagnostic, in two places worth knowing (both detailed in [Part 4](/blog/math-llm-loss-functions)): the **RLHF penalty** $\beta \, D_{\text{KL}}(\pi_\theta \,\|\, \pi_\text{ref})$ that leashes a fine-tuned policy to its reference model so it cannot drift into reward-hacked gibberish, and the **VAE regularizer** $D_{\text{KL}}(q_\phi(z\mid x) \,\|\, p(z))$ that pulls the learned latent posterior toward a chosen prior.
+
+### Perplexity: the loss on an interpretable scale
+
+NLL in nats is the quantity that matters, but $2.31$ nats means nothing to intuition. **Perplexity** exponentiates it back onto the scale of "number of options."
+
+$$
+\text{PPL} = \exp\!\left(-\frac{1}{T}\sum_{t=1}^{T} \log P(w_t \mid w_{<t})\right) = \exp(\text{NLL}) = e^{H(p_\text{data}, q_\theta)}
+$$
+
+The interpretation is the **effective branching factor**: a perplexity of $10$ means the model is, on average, as uncertain at each step as if it were choosing uniformly among $10$ equally likely tokens. This follows directly from the uniform case — a uniform distribution over $V$ options has $\text{NLL} = \ln V$, so $\text{PPL} = e^{\ln V} = V$. The exponential makes the relationship between loss and perplexity violently nonlinear: shaving NLL from $3.0$ to $2.9$ nats drops PPL from $20.1$ to $18.2$, while $2.0 \to 1.9$ drops it from $7.4$ to $6.7$ — the same loss improvement buys very different perplexity gains depending on where you are. **Lower is always better**: lower PPL $\Leftrightarrow$ lower NLL $\Leftrightarrow$ the model assigns higher probability to the held-out data.
+
+The base discipline from the top of the post matters most here. Perplexity is $e^{\text{NLL}}$ *only when NLL is in nats*. The bit-denominated cousins convert explicitly:
+
+$$
+\text{bits-per-token} = \frac{\text{NLL (nats)}}{\ln 2}, \qquad \text{BPC} = \frac{\text{NLL (nats)}}{\ln 2 \cdot (\text{characters per token})}, \qquad \text{PPL} = 2^{\text{NLL (bits)}}.
+$$
+
+So $\text{NLL} = 2.0$ nats gives $\text{PPL} = e^2 \approx 7.39$, which equals $2^{2.0/\ln 2} = 2^{2.885} \approx 7.39$ — the same number, as it must be. Bits-per-character is the form you report for character-level work; **bits-per-byte (BPB)** divides the total nats by $\ln 2$ times the total bytes, $\text{BPB} = \text{NLL (nats)} / (\ln 2 \cdot \text{bytes per token})$, and is the *tokenizer-agnostic* metric used for fair cross-model comparison precisely because bytes are a fixed unit while tokens are not.
+
+<PerplexityUnitConverter />
+
+
+#### Perplexity's traps
+
+Perplexity is a sharp metric and a dull instrument at once, and four caveats keep it honest.
+
+**It is corpus-dependent.** A perplexity number is a statement about a *particular* text distribution. GPT-2's perplexity on Penn Treebank ($\approx 35.8$ for the 1.5B model) and on WikiText-103 ($\approx 17.5$) are both correct and not comparable to each other — they measure surprise on different distributions.
+
+**Comparing across tokenizers is invalid, and the canonical "headline" comparison is exactly this trap.** It is tempting to line up GPT-2 1.5B at $\text{PPL} \approx 17.5$ on WikiText-103 against LLaMA-3 8B at $\text{PPL} \approx 6.1$ on WikiText-2 and conclude LLaMA is "$3\times$ less perplexed." That conclusion is unsound on three counts: different *split* (WikiText-103 vs WikiText-2), and more fundamentally different *granularity* — GPT-2's number is reported as **word-level** perplexity (the paper de-tokenizes its BPE output back to a per-word basis precisely so the figure is comparable), while the LLaMA-3 figure is **subword/token-level** under the LLaMA tokenizer. Perplexity is defined per modeling unit, and $e^{\text{NLL}}$ shrinks when each unit predicts less text, so a model with a finer tokenizer posts a lower per-token perplexity for free. The valid way to compare two models with different tokenizers is to route through a fixed unit — word-level perplexity, or better, **bits-per-byte**, which is why frontier reports increasingly quote BPB instead of raw PPL.
+
+**Conditional perplexity is much lower than unconditional.** The perplexity of $p(\text{answer} \mid \text{question})$ is far below the perplexity of $p(\text{text})$ — conditioning removes uncertainty, so a number is only meaningful alongside what it was (or wasn't) conditioned on.
+
+**It can be gamed without understanding.** A model can lower perplexity by playing it safe — favoring high-frequency tokens, hedging, and repeating — without getting any better at the things we care about. This is the famous, repeatedly observed gap: perplexity and downstream task performance are correlated but not the same, and below a certain loss the correlation frays. Perplexity measures *compression*, and a fluent parrot compresses text well. It is a necessary signal and an insufficient one — which is why [evaluation](/blog/math-llm-evaluation-metrics) needs calibration (a model can have great NLL yet be confidently wrong, measured by Expected Calibration Error) and task benchmarks on top of it.
+
+### The unified picture
+
+Every quantity in this post is one identity seen from a different side. For language-model training they all sit on a single line:
+
+$$
+\underbrace{-\frac{1}{T}\sum_{t=1}^{T} \log P(w_t \mid w_{<t})}_{\text{NLL} \;=\; \text{cross-entropy loss}} \;=\; \underbrace{H(p_\text{data}, q_\theta)}_{\text{cross-entropy}} \;=\; \underbrace{H(p_\text{data})}_{\substack{\text{data entropy} \\ \text{(irreducible floor)}}} \;+\; \underbrace{D_{\text{KL}}(p_\text{data} \,\|\, q_\theta)}_{\substack{\text{model error} \\ \text{(what training removes)}}}
+$$
+
+$$
+\text{PPL} = \exp(\text{NLL}) = e^{H(p_\text{data}, q_\theta)}
+$$
+
+Read it left to right. The thing you compute — the average negative log-likelihood of the corpus — *is* cross-entropy between the data and the model. Cross-entropy splits into a part you cannot reduce (the entropy of language itself) and a part you can (the KL divergence from data to model). Training drives that KL toward zero, which is the same as maximizing likelihood, which is the same as minimizing description length and [compressing the data](/blog/math-llm-information-theory) as tightly as the model allows. And perplexity is just that loss exponentiated onto the scale of effective vocabulary so a human can read it.
+
+| Quantity | Symbol | One-line meaning |
+| --- | --- | --- |
+| Probability | $P(x\mid\theta)$ | how likely an outcome is, model fixed |
+| Likelihood | $\mathcal{L}(\theta\mid x)$ | how well a model explains fixed data |
+| Log-likelihood | $\sum_t \log P(x_t\mid x_{<t})$ | likelihood made additive and underflow-proof |
+| NLL | $-\frac1T\sum_t \log P$ | the training loss (minimize it) |
+| Entropy | $H(p)$ | average surprise of $p$ under itself |
+| Cross-entropy | $H(p,q)$ | average surprise of $p$ encoded as $q$ — the loss |
+| KL divergence | $D_{\text{KL}}(p\|q)$ | extra nats for using $q$ instead of $p$ — the error |
+| Perplexity | $e^{\text{NLL}}$ | effective branching factor — the loss, human-readable |
+
+None of these is the "real" one with the others as approximations. They are a single circle of ideas — a distribution, the surprise it assigns, the average of that surprise, the gap between two distributions, and that gap put on a readable scale — and a language model is the machine that spends all of training walking $q_\theta$ around that circle toward $p_\text{data}$. The narrative version of where this fits among optimization, architecture, and estimation is the series finale, [Putting It Together](/blog/math-llm-putting-it-together).

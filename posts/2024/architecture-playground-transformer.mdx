@@ -1,0 +1,49 @@
+---
+title: "The Architecture Playground: What a Transformer Config Actually Buys You"
+slug: "architecture-playground-transformer"
+summary: "An interactive research blog. Drag the config of a decoder-only transformer — hidden size, head counts, FFN type — and watch the parameter count, KV cache, and mixture-of-experts routing recompute live."
+abstract: ""
+date: "2024-06-19"
+version: ""
+contentType: "blog-post"
+tags:
+  - architecture
+  - transformers
+  - interactive
+  - kv-cache
+  - moe
+authors:
+  - name: "Admin"
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "architecture-playground"
+seriesOrder: 1
+image: ""
+canonicalUrl: ""
+doi: ""
+zenodoUrl: ""
+pdf: ""
+license: ""
+bibliography: ""
+citationKey: ""
+---
+
+A frontier language model, stripped of its press release, is a short list of integers. Hidden size, number of layers, how many attention heads, how many of those heads share key/value projections, the feed-forward width, the vocabulary, the context length. Those numbers decide the parameter count, the memory each token of context costs at inference, and whether the model is dense or a mixture of experts.
+
+The trouble with reading them off a table is that the consequences are non-linear and they interact. Halving the key/value heads barely touches the parameter count but quarters the KV cache. Switching a dense feed-forward block for a mixture of experts multiplies the total parameters by ten while leaving the compute-per-token almost unchanged. The only way to build intuition is to turn the dials and watch.
+
+So turn them. The playground below is live — every slider recomputes the parameter breakdown, the spatial diagram, the KV-cache memory bar, and the expert-routing view in real time. Load a preset to start from a real published config.
+
+<ArchitecturePlayground />
+
+## What to look for
+
+**Grouped-query attention.** Set `num_key_value_heads` below `num_attention_heads` and the K and V projection matrices visibly narrow in the per-layer view. The parameter savings are modest; the KV-cache savings are the whole point. LLaMA 3 8B runs 32 query heads over 8 key/value heads — a 4× smaller cache for nearly free.
+
+**The KV cache is the inference bottleneck, not the weights.** The memory a serving stack fights over during decoding is `seq_len × n_kv_heads × d_head × 2 × bytes × n_layers`. It grows linearly with context. Push the sequence-length slider toward a long context and watch a 7B model's cache blow past 24 GB even though its weights fit comfortably — then drop the precision to fp8 or int4 and watch it come back.
+
+**Mixture of experts decouples size from cost.** Switch the FFN type to MoE, or load Mixtral or DeepSeek-V3. Total parameters explode because every expert is a full feed-forward block, but only `num_experts_per_tok` of them fire for any given token — so the active parameter count, and the FLOPs, stay small. The routing diagram shows the softmax over experts with the chosen top-k lit up.
+
+This is the first entry in an ongoing experiment: research blogs you can operate, not just read. Everything here is computed from the same arithmetic the model configs imply — no approximations hidden behind the diagram.

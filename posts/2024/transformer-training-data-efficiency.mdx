@@ -1,0 +1,90 @@
+---
+title: "Data Efficiency in Pretraining: Packing, Batching, and What Gets Wasted"
+slug: "transformer-training-data-efficiency"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "transformer-training"
+seriesOrder: 3
+tags: ["transformers", "llm-training", "sequence-packing", "pretraining"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Up to 30% of GPU compute can vanish into padding tokens that contribute nothing to learning. Here's how modern pretraining pipelines eliminate that waste."
+---
+
+<DataMixingDemo />
+
+A training batch is a rectangle, but documents are not. To stack sequences of length 200, 800, and
+1,900 into a single tensor, the short ones get padded out to the longest in the batch, and those pad
+positions are masked out of the loss so they never affect the gradient. The catch is that masking them
+out of the *loss* does not mask them out of the *compute*: every pad token still flows through every
+attention layer and every FFN on the forward pass, consuming the same FLOPs as a real token before
+being discarded at the very end. On corpora with a long tail of short documents, the padded fraction
+of a batch can run high enough that a substantial slice of the GPU-hours produces no learning signal
+at all.
+
+Sequence packing removes the rectangle's wasted corners by refusing to pad. Instead of one document
+per row, you concatenate documents end to end into a single stream and cut it into chunks of exactly
+`max_len`, so every position in the batch holds a real token and the padding fraction drops to
+essentially zero. The problem this introduces is that a packed row now contains several unrelated
+documents sitting in one contiguous sequence, and a standard causal mask lets a token attend to
+everything before it — including tokens that belong to a completely different document earlier in the
+pack. That cross-document attention is contamination: the model learns spurious dependencies across a
+boundary that should not exist.
+
+The fix is to make the causal mask block-diagonal, allowing attention only between tokens that share a
+document. Each position carries a document id, and the mask permits a query at position $i$ to see key
+position $j$ only when $j$ is in the past *and* the two share a document.
+
+$$
+\text{mask}[i,j] = \mathbb{1}\big[\, j \le i \;\wedge\; \mathrm{doc\_id}[j] = \mathrm{doc\_id}[i]\,\big]
+$$
+
+Materializing that full mask would cost quadratic memory, so in practice FlashAttention's `varlen`
+kernels implement it implicitly from a `cu_seqlens` vector — the cumulative sequence lengths that mark
+where each document starts and ends — and simply never compute attention across a boundary. The full
+implementation, including how the boundaries are threaded through the kernel, is in the
+[padding vs packing post](/blog/padding-vs-packing).
+
+The mask is only half of the contamination fix, because position information leaks too. With rotary
+embeddings the position index is baked into the query and key rotations, and if a packed row counts
+positions $0, 1, 2, \dots$ straight across document boundaries, then the second document is encoded as
+though it begins thousands of tokens into a single long text, distorting every relative offset the
+model reads. The remedy is to reset the position ids to zero at each document boundary so every
+document is encoded from its own start. Many models trained with packing reset position IDs at
+document boundaries — this ensures RoPE sees correct relative distances between tokens within each
+document, not inflated distances across document boundaries.
+
+<DeduplicationImpactDemo />
+
+Packing fixes per-sequence waste; the batch dimension is governed separately, and it is rarely a
+single number you set directly. The effective batch size is a product of three factors — the
+microbatch that fits in one device's memory, the number of gradient accumulation steps you run before
+applying an update, and the data-parallel degree across devices.
+
+$$
+B_\text{eff} = b_\text{micro} \times n_\text{accum} \times d_\text{dp}
+$$
+
+Modern pretraining runs target global batches in the range of 4M to 16M tokens, far more than any
+single device can hold, and gradient accumulation is what makes that reachable: you run many
+microbatches forward and backward, summing their gradients, and only step the optimizer once the
+target token count has been accumulated, trading wall-clock for the large effective batch the
+schedule was tuned for.
+
+<TokenBudgetCalculator />
+
+How many tokens you should push through that pipeline, finally, is a question about the compute budget
+rather than the architecture. At a fixed budget $C$, the [Chinchilla](/papers/chinchilla) analysis found that loss is
+minimized when parameters and tokens scale together, roughly $N_\text{tokens} \approx 20 \, N_\text{params}$,
+which revealed that most pre-2022 models were badly under-trained — too large for the number of tokens
+they had seen. That ratio is compute-optimal for *training*, but it is not always what you want to
+ship: LLaMA-1 was deliberately trained well past the Chinchilla point, spending extra training FLOPs to
+get a smaller model that is cheaper at inference, because a deployed model runs vastly more forward
+passes over its lifetime than it ever took to train.
+
+Three posts in, the model normalizes its activations, adapts its step sizes, and consumes its data
+without waste. What none of that has touched yet is the forward pass itself — how positions are
+encoded and how attention is actually computed. Part 4 goes inside it.

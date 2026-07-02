@@ -1,0 +1,92 @@
+---
+title: "Comparing Large Model Architectures: Attention, Normalization, and Scale"
+slug: "large-model-architecture-comparison"
+summary: "GPT-4, Gemini, LLaMA, Mistral, DeepSeek, Qwen — they all build on the same transformer skeleton. But the architectural choices diverge sharply. Here's a systematic comparison across model families."
+abstract: ""
+date: "2024-06-19"
+version: ""
+contentType: "blog-post"
+tags:
+  - architecture
+  - transformers
+  - llm
+  - comparison
+  - moe
+authors:
+  - name: "Admin"
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+image: ""
+canonicalUrl: ""
+doi: ""
+zenodoUrl: ""
+pdf: ""
+license: ""
+bibliography: ""
+citationKey: ""
+---
+
+Architecture choices aren't cosmetic. The gap between multi-head attention and grouped-query attention is a 4–8× reduction in the KV cache you have to hold in memory at inference. The gap between a dense model and a mixture-of-experts is an active parameter count that runs 10–20% of the total — same FLOPs per token, a much larger model behind them. The gap between rotary positions and learned absolute positions is whether the model can run on a context longer than the one it was trained on at all. Strip away the press releases and the frontier model families differ along a small number of axes, each of which buys a concrete property. Here is how they actually line up, taken from the technical reports.
+
+| Model | Attention | Norm | Pos. encoding | FFN | Context | Active params | Architecture notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| GPT-2 | MHA | Pre-LN | Learned absolute | GeLU | 1024 | 117M–1.5B | Standard decoder, no novelties |
+| GPT-3 | MHA | Pre-LN | Learned absolute | GeLU | 2048 | 175B | GPT-2 at 100× scale |
+| PaLM | MHA | Pre-LN (RMSNorm) | RoPE | SwiGLU | 2048 | 540B | Parallel attn+FFN blocks |
+| LLaMA 1 | MHA | Pre-LN (RMSNorm) | RoPE | SwiGLU | 2048 | 7B–65B | First frontier-quality open model |
+| LLaMA 2 | GQA (70B only) | Pre-LN (RMSNorm) | RoPE | SwiGLU | 4096 | 7B–70B | GQA only on the 70B |
+| LLaMA 3 | GQA | Pre-LN (RMSNorm) | RoPE | SwiGLU | 8192 | 8B–70B | GQA across all sizes |
+| Mistral 7B | GQA | Pre-LN (RMSNorm) | RoPE | SwiGLU | 8192 (SWA) | 7B | Sliding window attention |
+| Mixtral 8×7B | GQA + MoE | Pre-LN (RMSNorm) | RoPE | SwiGLU, 8 experts top-2 | 32768 | ~13B of 47B | Sparse MoE, top-2 routing |
+| Gemini 1.5 | MQA (unconfirmed) | Pre-LN (RMSNorm) | RoPE | SwiGLU + MoE | 1M | Unknown | Natively multimodal, 1M ctx; attention not disclosed |
+| DeepSeek-V2 | MLA | Pre-LN (RMSNorm) | RoPE | SwiGLU + MoE | 128k | ~21B of 236B | Multi-head latent attention |
+| DeepSeek-V3 | MLA | Pre-LN (RMSNorm) | RoPE | SwiGLU + MoE | 128k | ~37B of 671B | Fine-grained MoE + MLA |
+| Qwen2.5 | GQA | Pre-LN (RMSNorm) | RoPE | SwiGLU | 128k | 0.5B–72B | Conservative, well-tuned |
+
+The table reads as convergence with a few deliberate departures. Five columns have collapsed onto a single answer since roughly 2023 — normalization, position encoding, and the FFN nonlinearity are effectively settled, and attention has converged on a narrow family. The interesting variation lives in the last three columns: how the KV cache is compressed, whether the FFN is dense or sparse, and how far the context stretches.
+
+## Attention: the convergence on GQA, and the one real departure
+
+<GQAHeadComparison />
+
+Multi-head attention was the original design, and it has a memory problem that only shows up at serving time. The [attention variants post](/blog/transformer-training-attention-variants) walks through the mechanism in detail; the short version is that the KV cache — the keys and values you must retain for every past token so you don't recompute them — scales with the number of attention heads. At long context and large batch, that cache, not the parameters, is what fills the accelerator.
+
+Multi-query attention (Shazeer, 2019) attacked this by collapsing all query heads onto a single shared key/value head, cutting the cache by the head count. It worked, but it cut too far: a single KV head measurably degraded quality on harder tasks. [Grouped-query attention](/papers/gqa) (Ainslie et al., 2023) is the stable middle. Query heads are partitioned into groups, each group sharing one KV head — typically 8 KV heads for 64 query heads — recovering most of MHA's quality at a fraction of the cache. That balance is why GQA, not MQA, is the default across LLaMA 2/3, Mistral, and Qwen.
+
+DeepSeek-V2's multi-head latent attention is the one genuinely novel move in the column. Instead of storing keys and values per head, it caches a single low-rank latent and reconstructs the per-head keys and values from it on the fly. The latent for token $t$ is a down-projection of that token's hidden state,
+
+$$
+\mathbf{c}^{KV}_t = W^{DKV}\, \mathbf{h}_t, \qquad \mathbf{c}^{KV}_t \in \mathbb{R}^{d_c}, \quad d_c \ll n_h \cdot d_h,
+$$
+
+where $W^{DKV}$ is the down-projection and $d_c$ is the latent dimension, far smaller than the combined per-head key/value width $n_h \cdot d_h$. At attention time the per-head keys and values are recovered by up-projecting $\mathbf{c}^{KV}_t$, so only the latent has to live in the cache. The cache cost per token drops from $2 n_h d_h$ to roughly $d_c$ — a 5–13× reduction relative to MHA — and unlike MQA it pays for that compression with almost no quality loss, because each head still gets its own reconstructed projection rather than sharing one.
+
+## Normalization: uniform Pre-LN with RMSNorm since 2023
+
+There is no debate left in this column. Every frontier model trained after 2022 normalizes before the residual branch (Pre-LN) and uses RMSNorm rather than LayerNorm. The [normalization post](/blog/transformer-training-normalization) explains why Pre-LN wins — it keeps gradients well-scaled through deep stacks without the warmup gymnastics Post-LN demands — and the [RMSNorm explainer](/papers/rmsnorm) covers why dropping the mean-centering and bias terms costs nothing measurable while saving a reduction and a parameter vector per layer. The last notable Post-LN holdouts predate this consensus: the [original 2017 Transformer](/papers/attention-is-all-you-need) and GPT-1 normalized after the residual branch, but the GPT line switched early — GPT-2 already shipped with Pre-LN, and GPT-3 kept it there. Past that point the column is a single value all the way down.
+
+## Positional encoding: RoPE everywhere
+
+Learned absolute position embeddings fix the maximum sequence length at training time — there is simply no embedding for position 4097 if you trained at 4096. Sinusoidal encodings are defined at every position but generalize poorly past the training length in practice. ALiBi extends gracefully but biases attention additively, which interacts awkwardly with some of the cache-compression tricks above. Rotary position embedding (RoPE) rotates the query and key vectors by an angle proportional to position, so relative position falls out of the dot product multiplicatively; it extends to longer contexts through interpolation of the rotation frequencies and composes cleanly with GQA and MLA. Every model in the table uses RoPE except the two original GPT entries.
+
+## FFN: SwiGLU at the base, MoE at the top
+
+<MoECapacityDemo />
+
+The feed-forward nonlinearity has settled on SwiGLU — a gated linear unit with a SiLU gate — which replaced GeLU in essentially every post-2022 frontier model; the [architecture internals post](/blog/transformer-training-architecture-internals) covers why the gating buys a consistent quality bump for a modest parameter increase. The more consequential split is whether that FFN is dense or sparse. Mixture-of-experts replaces the single FFN with many expert FFNs and a router that sends each token to a small subset. Mixtral routes each token to 2 of 8 experts; DeepSeek-V3 takes it further with fine-grained experts — 256 routed experts with the top-8 activated per token, plus one shared expert that every token always uses to absorb the common-case computation. The payoff is the decoupling that runs through the whole comparison: parameter count drives quality, active parameter count drives cost, and MoE lets you scale the first without the second. A 671B-parameter DeepSeek-V3 runs at the inference cost of a 37B dense model.
+
+## Context length: the long-context race
+
+<ContextWindowTimeline />
+
+The context column moved faster than any other over this period. GPT-3 and LLaMA-1 sat at 2048; LLaMA-2 doubled to 4096; Mistral-7B reached an effective 8192 through sliding-window attention; LLaMA-3 trained natively at 8192. Then the jump: Gemini 1.5 to a million tokens, DeepSeek-V2/V3 to 128k. That leap from a few thousand to six figures is not one trick but two working together. RoPE scaling methods — positional interpolation, NTK-aware scaling, YaRN — let a model trained at one length operate at a much longer one without retraining from scratch. And cache compression, MLA most of all, makes a 128k context fit in memory at serving time, which is the constraint that actually bites. Long context is as much a KV-cache story as a positional-encoding one.
+
+## The multimodal column the table doesn't show
+
+The single biggest architectural fork the table can't capture is how vision and audio enter the model at all. Two designs dominate. Joint-sequence models tokenize every modality into the same stream — Gemini processes image, audio, and video patches as tokens interleaved with text, attended over by the same layers. Adapter models keep a frozen or lightly-tuned language model and bolt on a separate vision tower: GPT-4V routes image features through a vision encoder into the LLM via cross-attention, and LLaMA-3's vision variants attach adapters to the text backbone. The trade is predictable from the structure. Joint models reason across modalities more tightly because the cross-modal interaction happens at every layer; adapter models are far cheaper to train because the expensive language pretraining is reused untouched.
+
+## What's actually settled
+
+By 2024 the frontier dense models share almost the same skeleton — Pre-LN, RMSNorm, RoPE, GQA, SwiGLU — to the point where you could describe LLaMA-3, Qwen2.5, and the dense layers of Mistral in one sentence and be right about all three. What separates them is no longer the diagram. It is scale, the quality and quantity of the training data, the compute budget spent, and, for the labs chasing efficiency, two specific levers: how the mixture-of-experts routes its tokens and how the attention compresses its cache. The architecture wars produced a consensus. The engineering wars over data, routing, and memory are the ones still being fought.

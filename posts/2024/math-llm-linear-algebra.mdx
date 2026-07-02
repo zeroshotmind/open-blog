@@ -1,0 +1,124 @@
+---
+title: "Linear Algebra for LLMs: Vectors, Matrices, and What They Do"
+slug: "math-llm-linear-algebra"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 1
+tags: ["math", "linear-algebra", "transformers"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Every forward pass is a sequence of matrix multiplications. Understanding what those matrices do — rotate, scale, project — is the foundation for understanding why transformers work."
+---
+
+A forward pass through a transformer is, stripped of its names, a long chain of matrix multiplications
+interrupted by a few nonlinearities. If you want to know why attention attends, why LoRA can fine-tune a
+seven-billion-parameter model by training a few million numbers, or why weight matrices can be compressed
+without much loss, the answers all live in linear algebra — not as abstract theorems but as concrete facts
+about what a matrix *does* to a vector. So that is where this series starts.
+
+The first object is the vector. A token embedding is a point in $\mathbb{R}^d$ — the word "cat" becomes a
+specific list of $d$ numbers, a single location in a 768-dimensional space for a small model or a
+4096-dimensional one for a large model. There is nothing metaphorical about the geometry: the model
+genuinely places words as points, and the distances between those points encode whatever semantic
+structure training has managed to discover. Words the model treats as similar end up close together; words
+it treats as unrelated end up far apart. The embedding matrix is just a lookup table whose $i$-th row is
+the point assigned to token $i$.
+
+A matrix turns one such space into another. A matrix $W \in \mathbb{R}^{m \times n}$ is a linear map that
+takes a vector in $\mathbb{R}^n$ and returns a vector in $\mathbb{R}^m$, and the cleanest way to read it is
+column by column: the $j$-th column of $W$ is the place where the $j$-th standard basis vector lands after
+the transformation.
+
+$$
+W x = \sum_{j=1}^{n} x_j \, W_{:,j}
+$$
+
+So applying $W$ to $x$ is nothing more than mixing the columns of $W$ with the coordinates of $x$ as the
+recipe — every attention projection that produces queries, keys, and values, and every weight in the
+feed-forward block, is one of these maps reshaping the residual stream into a new space.
+
+The most important property of such a map is its rank, because rank is a hard ceiling on what the map can
+express. The rank of $W$ is the dimension of the space its outputs can actually fill, and a matrix of rank
+$r$ can only ever produce vectors lying in some $r$-dimensional subspace of its output space, no matter how
+many distinct inputs you feed it. This is the entire premise behind LoRA: instead of updating a full weight
+matrix during fine-tuning, you add a low-rank correction.
+
+$$
+\Delta W = B A, \qquad B \in \mathbb{R}^{d \times r}, \quad A \in \mathbb{R}^{r \times k}, \quad r \ll \min(d, k)
+$$
+
+Because a product through an $r$-dimensional bottleneck can have rank at most $r$, this update is forced to
+be low-rank by construction — and the bet, which holds up empirically, is that the *useful* part of a
+fine-tuning update already lives in a small subspace, so constraining it there costs almost nothing while
+slashing the number of trainable parameters.
+
+<LoRARankExplorer />
+
+Multiplication by a matrix is one way vectors interact; the dot product is the other, and it measures
+alignment. For two vectors the dot product factors into their lengths and the cosine of the angle between
+them, which means it is large when they point the same way and small or negative when they do not.
+
+$$
+a \cdot b = \lVert a \rVert \, \lVert b \rVert \cos\theta
+$$
+
+This is exactly the machinery of attention: the score $Q_i \cdot K_j / \sqrt{d_k}$ is a scaled dot product
+between a query and a key, so a high score means the query and key vectors are aligned, which after the
+softmax becomes a high attention weight — attention is, at bottom, the geometry of which keys point in the
+same direction as which queries.
+
+<DotProductGeometry />
+
+Where do all these transformed vectors go? Into the residual stream, and the way they accumulate there is
+itself a linear-algebraic fact worth stating plainly. At layer $l$ the stream is a vector $x_l \in
+\mathbb{R}^d$, and each sublayer does not replace it but adds to it.
+
+$$
+x_{l+1} = x_l + \text{Sublayer}(x_l)
+$$
+
+Because every layer reads from and writes to the same $d$-dimensional space, the residual stream behaves
+like a shared communication channel that runs the full depth of the network — early layers can deposit
+information that much later layers retrieve, which is part of why residual connections matter so much for
+training stability and why this picture is central to the [architecture
+internals](/blog/transformer-training-architecture-internals) of how transformers actually train.
+
+<ResidualStreamDemo />
+
+To analyze what a matrix is doing, it helps to find the directions it treats most simply. For a symmetric
+matrix $A$ there is a basis in which the action of $A$ is pure scaling — no rotation, no mixing — and that
+basis is given by the eigendecomposition.
+
+$$
+A = Q \Lambda Q^{\top}
+$$
+
+Here $Q$ is orthogonal, its columns are the eigenvectors, and $\Lambda$ is diagonal with the eigenvalues:
+along each eigenvector the matrix simply stretches by the corresponding eigenvalue and does nothing else.
+Covariance matrices have exactly this form, and so does the Fisher information matrix that describes the
+local curvature of the loss — which is why eigendecomposition is the right lens for understanding how
+adaptive optimizers like Adam implicitly approximate the natural gradient, a thread we pick up in [Part
+3](/blog/math-llm-optimization).
+
+For a general, non-square matrix there is no eigendecomposition, but there is something just as powerful:
+the singular value decomposition factors *any* matrix into a rotation, a scaling, and another rotation.
+
+$$
+W = U \Sigma V^{\top}
+$$
+
+The diagonal entries of $\Sigma$ are the singular values, and they say how much $W$ stretches the input
+along each of its principal directions; the directions with the largest singular values carry the most of
+the matrix's "energy." Keeping only the top $r$ singular directions gives the best possible rank-$r$
+approximation of $W$, which is both the formal justification for why low-rank fine-tuning like LoRA can
+work and the reason trained weight matrices so often turn out to be approximately low-rank in practice — a
+few directions do most of the work.
+
+Once you can see a matrix as something that rotates, scales, and projects vectors, the architecture stops
+being a wall of symbols and becomes a sequence of geometric operations you can reason about. The next
+question is what those vectors *represent* when the model is uncertain — and uncertainty is the language of
+probability, which is where [Part 2](/blog/math-llm-probability) goes.

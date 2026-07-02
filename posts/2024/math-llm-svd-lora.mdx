@@ -1,0 +1,140 @@
+---
+title: "SVD and Low-Rank Approximation: The Math Behind LoRA"
+slug: "math-llm-svd-lora"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 6
+tags: ["math", "svd", "lora", "fine-tuning", "linear-algebra"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "LoRA works because weight matrices are empirically low-rank. SVD explains why, and the math of low-rank approximation explains how LoRA exploits it to fine-tune billion-parameter models on a laptop."
+---
+
+[Part 1](/blog/math-llm-linear-algebra) ended on the claim that any matrix factors into a rotation, a
+scaling, and another rotation, and that keeping only the largest pieces of the scaling gives the best
+low-rank approximation. That sentence is the entire theoretical foundation of LoRA, so it is worth slowing
+down and saying exactly what it means and why it licenses fine-tuning a seven-billion-parameter model by
+training a few million numbers. The singular value decomposition writes a weight matrix $W \in
+\mathbb{R}^{m \times n}$ as a product of three matrices.
+
+$$
+W = U \Sigma V^{\top}, \qquad U \in \mathbb{R}^{m \times m}, \quad V \in \mathbb{R}^{n \times n}, \quad \Sigma \in \mathbb{R}^{m \times n}
+$$
+
+Here $U$ and $V$ are orthogonal — their columns are orthonormal, so they only rotate and reflect, never
+stretch — and $\Sigma$ is diagonal with the singular values $\sigma_1 \geq \sigma_2 \geq \cdots \geq
+\sigma_{\min(m,n)} \geq 0$ in descending order down its diagonal. Reading the factorization left to right,
+$W$ first rotates the input by $V^{\top}$, then scales the result axis by axis by the singular values, then
+rotates again by $U$, so the singular values are the complete record of how much the map stretches space
+and in which directions it stretches it most.
+
+That descending order is what makes the decomposition useful, because it lets you ask: if I am only allowed
+to keep $r$ of these directions, which should I keep? The Eckart–Young theorem answers definitively that the
+best rank-$r$ approximation to $W$, in the Frobenius norm, is obtained by truncating the SVD to its top $r$
+components.
+
+<SVDDecompositionViz />
+
+$$
+W_r = U_r \Sigma_r V_r^{\top}
+$$
+
+In this expression $U_r$ and $V_r$ are the first $r$ columns of $U$ and $V$ and $\Sigma_r$ is the top-left
+$r \times r$ block of $\Sigma$, so $W_r$ keeps the $r$ largest stretch directions and discards the rest. The
+theorem also tells you precisely how much you lose by doing so, and the answer is the sum of the squared
+singular values you threw away.
+
+$$
+\lVert W - W_r \rVert_F^2 = \sum_{i=r+1}^{\min(m,n)} \sigma_i^2
+$$
+
+The practical reading of this identity is that the error of a low-rank approximation is governed entirely by
+the tail of the singular value spectrum, so if the singular values decay quickly — if $\sigma_1$ dwarfs
+$\sigma_{50}$ — then a handful of directions already account for almost all of the matrix's "energy" and the
+discarded tail contributes almost nothing.
+
+The reason this matters for real models is an empirical fact, not a theorem: the weight matrices inside
+trained LLMs have rapidly decaying singular value spectra. If you take a weight matrix from a converged
+model and plot its singular values, the curve drops off steeply, and the top ten or twenty percent of the
+singular values typically account for eighty to ninety percent of the Frobenius norm. The weight, in other
+words, does not use its full nominal rank; it lives in a far lower-dimensional subspace of the parameter
+space than its dimensions $m \times n$ would suggest, and most of what it does it does along a small number
+of dominant directions.
+
+Fine-tuning sharpens this observation into a hypothesis. When you adapt a pretrained model to a new task,
+you are not learning the language from scratch — you are nudging an already-capable model toward a narrow
+behavior — and the natural conjecture is that the *update* you need is even more concentrated than the
+weights themselves. The weight change $\Delta W$ that specializes the model should require only a few
+task-relevant directions, leaving the bulk of the parameter space untouched. Hu et al. (2021), the LoRA
+paper, tested exactly this and found that the intrinsic rank of the fine-tuning update is far lower than the
+matrix dimensions; a rank of one or two often recovers most of the gain, and a rank in the low double
+digits closes the gap on most tasks.
+
+LoRA turns that hypothesis into an architecture. Rather than fine-tuning $W$ in place, you freeze it
+entirely and learn the update as an explicit low-rank product, so the adapted weight is the frozen original
+plus a rank-constrained correction.
+
+<LoRAAdapterDemo />
+
+$$
+W' = W + \Delta W = W + BA, \qquad B \in \mathbb{R}^{d \times r}, \quad A \in \mathbb{R}^{r \times k}, \quad r \ll \min(d, k)
+$$
+
+Because the correction passes through an $r$-dimensional bottleneck, its rank is capped at $r$ by
+construction — exactly the low-rank structure the hypothesis says is all you need — and the initialization
+is chosen so that training starts from the unmodified model: $A$ gets small Gaussian values and $B$ is set
+to zero, which makes $\Delta W = BA = 0$ at step one so the first forward pass reproduces the pretrained
+behavior before any gradient has flowed. The payoff is in the parameter count: a full update would train
+$d \cdot k$ numbers, whereas the factored update trains only $r\,(d+k)$, and for the common case $d = k =
+4096$ with $r = 16$ that is $16 \times (4096 + 4096) \approx 131{,}000$ parameters in place of $4096^2
+\approx 16.7$ million — a 128-fold reduction in what the optimizer has to touch.
+
+There is one more detail that makes LoRA robust to hyperparameter choices, which is how the update is
+scaled before it is added back. In practice the correction carries a constant factor $\alpha / r$ in front
+of it, where $\alpha$ is a fixed hyperparameter.
+
+$$
+\Delta W = \frac{\alpha}{r}\, BA
+$$
+
+Dividing by $r$ keeps the effective magnitude of the update roughly independent of the rank you chose, so
+when you decide to double $r$ to give the adapter more capacity, the per-step contribution of the update
+does not double along with it and you do not have to re-tune the learning rate or $\alpha$ — the scaling
+decouples "how many directions" from "how large a step," which is precisely what you want from a knob you
+expect to sweep.
+
+Where you attach these adapters matters as much as how you size them. A transformer block has several weight
+matrices that are candidates: the query, key, value, and output projections $W_Q, W_K, W_V, W_O$ in the
+attention sublayer, and the two (or three, for a [gated SwiGLU](/blog/math-llm-activation-functions))
+projections in the feed-forward block. Empirically the attention projections carry most of the
+fine-tuning signal, and applying LoRA to all four of them — or, in the now-common recipe, to every linear
+layer in the block — captures the adaptation well while still touching a tiny fraction of the parameters;
+the [attention projections](/blog/transformer-training-attention-variants) are where the model decides what
+to read, and that is usually what a new task most needs to change.
+
+<LoRAMergeAtInference />
+
+The technique that pushed LoRA from "efficient" to "runs on a single GPU" is QLoRA, which attacks the other
+half of the memory budget: the frozen base model itself. The trick is that the frozen weights never receive
+gradients, so they do not need to be stored in full precision — QLoRA quantizes them to a 4-bit format
+called NF4 (normal float 4), a quantization grid whose levels are placed to be information-optimal for the
+roughly normally distributed values that trained weights take, so 4 bits per weight loses far less than a
+naive uniform 4-bit grid would. The LoRA adapters, by contrast, are kept in bf16 and trained at full
+precision, which costs almost nothing because they are minuscule — a few hundred megabytes against the
+base model's tens of gigabytes. A 70-billion-parameter model quantized to 4 bits occupies roughly 35 GB and
+therefore fits on a single A100, the frozen weights are dequantized on the fly during each forward pass, and
+the gradient flows only into the tiny high-precision adapters; the reported quality lands within one or two
+percent of full bf16 fine-tuning on most benchmarks, which is a remarkable amount of capability to recover
+for the memory saved.
+
+The arc of this post is that the math came first and the empirics confirmed it: Eckart–Young guarantees that
+truncating to the top singular directions is the optimal low-rank approximation, the measured spectra of
+trained weights show those directions really do dominate, and the LoRA experiments show the same low-rank
+structure governs the fine-tuning update — so freezing the base and learning a rank-$r$ correction is not a
+hack but the exploitation of real structure in the loss landscape. Having a cheap way to specialize a model,
+the next question is how you tell whether the specialization actually worked, which means turning from the
+geometry of weights to the statistics of [evaluation](/blog/math-llm-evaluation-metrics).

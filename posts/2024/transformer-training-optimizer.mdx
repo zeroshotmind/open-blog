@@ -1,0 +1,104 @@
+---
+title: "Optimizers for LLMs: Adam, Weight Decay, and Why Learning Rate Matters More Than You Think"
+slug: "transformer-training-optimizer"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "transformer-training"
+seriesOrder: 2
+tags: ["transformers", "optimizer", "llm-training", "adam"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Adam is the default optimizer for language model training, but using it correctly — the right β values, weight decay, learning rate schedule — makes a larger difference than most people expect."
+---
+
+Adam earns its place at the bottom of nearly every language-model training script by tracking two
+running statistics of the gradient and using them to give every parameter its own effective step
+size. It keeps an exponential moving average of the gradient — the first moment, a smoothed direction
+— and one of the squared gradient — the second moment, a per-parameter estimate of magnitude.
+
+$$
+m_t = \beta_1 m_{t-1} + (1-\beta_1)\, g_t, \qquad v_t = \beta_2 v_{t-1} + (1-\beta_2)\, g_t^2
+$$
+
+Both averages start at zero, so early in training they are biased toward zero, and Adam corrects for
+that with a closed-form rescaling before they are used.
+
+$$
+\hat{m}_t = \frac{m_t}{1-\beta_1^{\,t}}, \qquad \hat{v}_t = \frac{v_t}{1-\beta_2^{\,t}}
+$$
+
+The actual update divides the smoothed direction by the square root of the smoothed magnitude, so a
+parameter with consistently large gradients takes small steps and a parameter with tiny gradients
+takes proportionally larger ones.
+
+$$
+\theta_t = \theta_{t-1} - \alpha\, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+That per-parameter rescaling is exactly why Adam, and not plain SGD with momentum, dominates language
+modeling. The gradients in a transformer are wildly heterogeneous: an embedding row for a rare token
+is touched a handful of times per epoch and carries a sparse, spiky gradient, while an attention
+projection in the middle of the stack sees dense gradients of an entirely different scale, and the
+FFN weights sit somewhere else again. SGD applies one global learning rate to all of them and is
+forced to compromise; Adam's $\sqrt{\hat{v}_t}$ denominator normalizes each parameter's step to its
+own gradient history, so the rare embedding and the busy attention head can both move at a sensible
+rate in the same update.
+
+There is a subtlety in how regularization interacts with that denominator, and getting it wrong is a
+common silent bug. Classic L2 regularization adds $\lambda \theta$ to the gradient before Adam sees
+it, which means the decay term gets divided by $\sqrt{\hat{v}_t}$ along with everything else —
+parameters with large gradients get *less* decay, exactly backwards from what you want. AdamW fixes
+this by decoupling weight decay from the adaptive update entirely, applying it as a direct shrink on
+the weights.
+
+$$
+\theta_t = (1 - \alpha\lambda)\, \theta_{t-1} - \alpha\, \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+$$
+
+The decay now acts uniformly, independent of each parameter's gradient scale, which is why AdamW —
+
+<AdamVsAdamW />
+
+not vanilla Adam with L2 — is what LLaMA, GPT, and essentially every modern large model train with.
+
+The momentum coefficients themselves are not the textbook defaults. Classic Adam ships with
+$\beta_2 = 0.999$, but LLaMA and most contemporary recipes use $\beta_1 = 0.9$ and $\beta_2 = 0.95$.
+A lower $\beta_2$ shortens the effective window of the second-moment average, making it less sticky:
+early in training, when the gradient distribution is shifting rapidly batch to batch, a $\beta_2$ of
+$0.999$ averages over roughly a thousand steps and lags badly behind the true scale, while $0.95$
+averages over about twenty and tracks the moving target. The cost is a slightly noisier denominator;
+the benefit is that the adaptive step actually reflects current gradient statistics.
+
+The learning rate schedule that wraps all of this is nearly universal: a linear warmup into a cosine
+decay. Warmup exists because the bias-corrected moment estimates are unreliable for the first few
+hundred steps — $\hat{v}_t$ is built from almost no samples — and taking full-size steps against a bad
+denominator is how runs diverge in the first epoch. Ramping the learning rate from zero up to its peak
+over the first 1–2% of steps holds the updates small until the moments stabilize, after which cosine
+decay walks the rate smoothly down to roughly 10% of peak by the end. Both knobs matter: the peak rate
+is calibrated to model size — larger models are more sensitive and want smaller peaks — and the warmup
+
+<LRScheduleVisualizer />
+
+length trades early stability against wasted compute.
+
+One more guardrail catches the batches that warmup and a good schedule cannot anticipate. A single
+pathological minibatch can produce a gradient large enough to undo thousands of good steps, so the
+global gradient norm is clipped to a fixed ceiling, usually $1.0$, before the update is applied.
+
+$$
+g_\text{clipped} = g \cdot \min\!\left(1, \frac{c}{\lVert g \rVert}\right)
+$$
+
+
+<GradientClippingDemo />
+
+When the norm is under the threshold $c$ the gradient passes through untouched, and when it spikes the
+whole vector is scaled down to length $c$, preserving its direction while capping its magnitude so no
+one batch can destabilize the run.
+
+A well-tuned optimizer gets you to a good minimum, but it says nothing about how much compute you burn
+getting there. Throughput is its own problem, and the largest lever on it is how efficiently tokens
+flow through each forward pass — which means packing, masking, and batching. That is Part 3.

@@ -1,0 +1,79 @@
+---
+title: "Why Dropout Disappeared from Large Language Models"
+slug: "dropout-in-llms"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+tags: ["training", "regularization", "llm"]
+authors:
+  - name: "Admin"
+    orcid: "0009-0009-0632-6830"
+summary: "BERT used dropout everywhere. LLaMA uses none. The reason isn't that regularization stopped mattering — it's that at trillion-token scale, data diversity IS the regularizer."
+---
+
+BERT sprays dropout across the whole network: $p = 0.1$ on the attention weights, on the feed-forward
+outputs, on the embedding sums, and on the pooler. LLaMA 1, 2, and 3 use none. Neither does Mistral.
+Gemini's architecture is not publicly documented, but inference from its outputs and contemporary
+trends suggests similarly minimal dropout usage. A technique that was reflexive in 2018 is simply absent from the architecture tables of the
+models that followed, and the reason is not that someone decided regularization stopped mattering.
+
+## What dropout does
+
+<DropoutMaskDemo />
+
+During training, dropout multiplies each activation by an independent Bernoulli mask: with probability
+$p$ a unit is zeroed, and the survivors are rescaled by $1/(1-p)$ so the expected sum is preserved.
+
+$$
+\tilde h_i = \frac{m_i}{1-p}\, h_i, \qquad m_i \sim \text{Bernoulli}(1-p)
+$$
+
+At inference the mask is dropped and the full, unscaled network runs, which is why the $1/(1-p)$
+rescaling exists — it makes the training-time expectation match the deterministic test-time forward
+pass. The effect is to stop neurons from co-adapting: because any given unit might vanish on any step,
+the network cannot rely on a fragile conspiracy of specific units firing together and is pushed toward
+redundant, more robust representations.
+
+## When that medicine is needed
+
+<DropoutVsNormComparison />
+
+Dropout earns its keep when model capacity overwhelms data diversity. BERT was trained on roughly 3B
+tokens with 110M–340M parameters, and over that many epochs of a comparatively small corpus the model
+has ample capacity to memorize repeated patterns — classic overfitting, where training loss keeps
+falling while held-out loss turns back up. Dropout is a direct counter: by injecting noise it makes
+memorization harder and forces the network to learn features that generalize.
+
+## Why the medicine became unnecessary
+
+At LLM pretraining scale the premise inverts. LLaMA trains on 1–2T tokens of heterogeneous web text,
+code, and books, mostly in a single pass, so the model essentially **never sees the same example
+twice**. The data distribution is now so large and varied relative to the parameter count that it acts
+as the regularizer — there is nothing to overfit to when every batch is fresh. Dropout's noise is not
+only superfluous in this regime, it is actively costly: it perturbs activations on every step, which
+slows convergence, and the masking is overhead that buys you protection against a failure mode that no
+longer occurs. Ablations on large models bear this out — removing dropout does not hurt generalization
+once the corpus is big enough, and it improves training throughput.
+
+## Where it still shows up
+
+<DropoutPlacementsMap />
+
+Dropout did not die; it retreated to the regimes where overfitting is still real.
+
+The clearest case is **LoRA fine-tuning**. The adapter matrices — the low-rank $A$ and $B$ factors —
+are tiny, and the fine-tuning dataset is often only thousands of examples, so the ratio of capacity to
+data swings back toward the BERT regime and overfitting returns. A dropout of $0.05$–$0.1$ on the
+adapter outputs is standard in essentially every LoRA implementation for exactly this reason. **Embedding
+dropout** reappears similarly, with some models applying a light mask to the input embeddings during
+fine-tuning. And **smaller models** — anything under roughly 1B parameters trained on under roughly
+100B tokens — still sit on the overfitting side of the line and benefit from dropout during
+pretraining itself.
+
+## The line that explains all of it
+
+Dropout is a treatment for overfitting, and where it appears tracks where overfitting appears with
+near-perfect fidelity. At trillion-token pretraining scale there is no overfitting, so there is no
+dropout. At fine-tuning scale on a few thousand examples there is overfitting, so dropout comes back.
+The technique never changed; the regime did.

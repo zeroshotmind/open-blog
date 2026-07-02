@@ -1,0 +1,247 @@
+---
+title: "Why Your Norms Are Screaming at You"
+slug: "training-norms-exploding-vanishing"
+date: "2025-06-01"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+tags: ["deep-learning", "training", "debugging", "gradients"]
+authors:
+  - name: "Admin"
+    orcid: "0009-0009-0632-6830"
+summary: "Activation norms, gradient norms, weight norms — what they tell you, why they explode or vanish, and every practical cause from hyperparameters to data bugs."
+---
+
+There is a category of neural network bug that does not manifest as a Python exception. The code runs. The loss goes down — or up, or sideways. The model trains for hours before you realise something is deeply wrong. Norms are how you catch these bugs before they become expensive.
+
+This post is about three numbers you should be logging on every training run: activation norms, gradient norms, and weight norms. We will cover what they mean mathematically, why they diverge in either direction, and every concrete cause — from a misplaced `zero_grad()` call to a bad dataset label distribution.
+
+---
+
+## What is a norm, and why does it matter?
+
+The L2 norm of a vector $\mathbf{v} \in \mathbb{R}^n$ is simply the length of the vector:
+
+$$\|\mathbf{v}\|_2 = \sqrt{\sum_{i=1}^n v_i^2}$$
+
+For a tensor, we usually flatten it and compute the same thing. When people talk about "the gradient norm" they typically mean the global L2 norm across all parameters concatenated into a single long vector.
+
+The norm tells you about *scale* — how large the numbers are, independent of their direction. A healthy network is one where the scale of activations, gradients, and weights stays within a reasonable range throughout training. When scale goes wrong, you get pathologies:
+
+- **Activations too large** at init → loss is nonsensical from step one
+- **Gradients too large** during backprop → parameters update by a huge amount in a single step, destabilising training
+- **Gradients too small** → early layers barely learn; training stalls
+- **Weights drifting large** over many steps → model becomes brittle, and norms of downstream activations blow up
+
+The norm is a scalar diagnostic you can log cheaply, inspect in a dashboard, and act on immediately.
+
+---
+
+## The three norms to watch
+
+### Activation norms
+
+Activation norms measure the magnitude of hidden states at each layer. You should expect them to stay roughly the same order of magnitude as you go from the input layer to the output layer. A line chart of activation norm vs. layer depth should look flat (or gently sloping), not exponential.
+
+If the norms grow exponentially with depth, activations overflow; if they shrink exponentially, the representation collapses to a near-zero vector by the time it reaches the loss, and the model cannot learn.
+
+In practice, layer normalisation (LayerNorm, RMSNorm) is placed precisely to keep activation norms stable. Without it, a 100-layer network almost certainly has broken activation scaling.
+
+### Gradient norms
+
+Gradient norms measure how strongly error is flowing back through the network. The gradient at a parameter $\theta$ tells you in what direction to move $\theta$ to decrease the loss, and how large that move should be. If the gradient norm is too large, a single optimiser step takes the parameters to a completely different region of the loss landscape. If it is too small, the parameter barely moves.
+
+The gradient norm per layer is particularly informative: you should see roughly uniform norms across depth (with residual connections) or a gentle decay toward the input layers. A sharp cliff — where the norm drops by many orders of magnitude in a few layers — is the gradient vanishing problem.
+
+### Weight norms
+
+Weight norms measure the absolute scale of learned parameters. They can drift badly:
+
+- With optimisers that do not have weight decay (or have it misconfigured), weights can grow monotonically — especially with Adam, which normalises gradient updates by the adaptive denominator, allowing large step sizes at small-gradient phases.
+- With bad initialisations, weights may already start at a pathological scale.
+- With gradient accumulation bugs, the effective step size can be proportionally enormous, shooting weights to large values.
+
+Weight norms are slower to change than gradient norms, so they are a lagging indicator — but they are also a useful sanity check: if you see the weight norm for a specific layer growing while others are stable, something in that layer is different.
+
+---
+
+## Exploding and vanishing gradients: the mathematics
+
+During backpropagation, the gradient of the loss with respect to the activations at layer $k$ is computed as a product of Jacobians:
+
+$$\frac{\partial \mathcal{L}}{\partial \mathbf{h}_k} = \frac{\partial \mathcal{L}}{\partial \mathbf{h}_N} \cdot \prod_{i=k+1}^{N} \frac{\partial \mathbf{h}_i}{\partial \mathbf{h}_{i-1}}$$
+
+Each term $\partial \mathbf{h}_i / \partial \mathbf{h}_{i-1}$ is a Jacobian matrix. In a simplified scalar model where each layer multiplies by a constant $\alpha$ (the per-layer gradient multiplier), the gradient at layer $k$ from the input becomes $\alpha^{N-k}$.
+
+- If $\alpha > 1$: the gradient at layer 0 (the input) is $\alpha^N$, which grows exponentially with depth → **exploding gradients**.
+- If $\alpha < 1$: the gradient shrinks exponentially → **vanishing gradients**.
+- If $\alpha = 1$: gradients flow evenly → **healthy training**.
+
+The slider below lets you explore this directly.
+
+<GradientFlowDepthDemo />
+
+### Activation functions and saturation
+
+The Jacobian $\partial \mathbf{h}_i / \partial \mathbf{h}_{i-1}$ depends on both the weight matrix and the derivative of the activation function. For sigmoid:
+
+$$\sigma'(x) = \sigma(x)(1 - \sigma(x))$$
+
+This is always in $(0, 0.25]$, and collapses to nearly 0 for large $|x|$ — the saturation regime. With tanh the same thing happens. A deep sigmoid network essentially multiplies each gradient by a number well below 1 at every layer, making vanishing unavoidable at depth.
+
+ReLU avoids this problem by having derivative either 0 (when the pre-activation is negative) or 1 (when positive). The gradient flows through without decay on the positive side. But ReLU introduces **dead neurons** — units that are always negative and therefore always have zero gradient. Once a neuron is dead it never recovers, because there is no gradient to update its incoming weights.
+
+Residual connections circumvent both problems by providing a gradient highway that bypasses the nonlinear stack:
+
+$$\mathbf{h}_{i} = \mathbf{h}_{i-1} + F(\mathbf{h}_{i-1}; \theta_i)$$
+
+The gradient through the skip path is 1, regardless of what happens in $F$. Even if $F$'s Jacobian is tiny, the total gradient flowing back is at least 1.
+
+---
+
+## Initialisation: where it all begins
+
+Every pathology starts somewhere. For many training runs, the pathology begins at step 0 — from the weight initialisation.
+
+In a linear layer with input dimension $d$, weights are typically initialised from $\mathcal{N}(0, \sigma^2)$. The expected norm of the output after one layer is approximately $\|\mathbf{x}\|_2 \cdot \sigma \sqrt{d}$. If the per-layer scale factor $\sigma \sqrt{d} \neq 1$, norms compound exponentially across depth:
+
+- **Xavier/Glorot initialisation** sets $\sigma = 1/\sqrt{d}$, making the scale factor exactly 1. Activation norms are stable.
+- **He/Kaiming initialisation** sets $\sigma = \sqrt{2/d}$ (the $\sqrt{2}$ corrects for ReLU zeroing half the units), so the scale after a ReLU layer is again 1.
+
+If you use the wrong $\sigma$ — say, the PyTorch default of $\sigma = 1$ for a hidden dim of 256 — the scale factor is $\sqrt{256} = 16$ per layer. After 20 layers: $16^{20} \approx 10^{24}$. The forward pass produces NaN before training begins.
+
+The explorer below makes this concrete.
+
+<InitStdExplorer />
+
+---
+
+## What causes norms to explode or vanish in practice?
+
+Let us be concrete and exhaustive. Here are the real causes, grouped by where they live.
+
+### Hyperparameter mistakes
+
+**Learning rate too high.** A large LR multiplies the gradient by a large factor when computing the parameter update. If the gradient norm is already 1 and your LR is 0.1, the weight update has norm 0.1 per parameter. If LR is 10, the weight update is 10× larger — enough to leave the loss basin entirely.
+
+**Init std too large.** As shown above, if $\sigma \sqrt{d} > 1$, activations explode in the forward pass at step 0, before any gradient has flowed. Loss starts at NaN or astronomically high.
+
+**Init std too small.** If $\sigma \sqrt{d} < 1$, activations vanish in the forward pass. The loss function receives a near-zero input and its gradient is correspondingly tiny.
+
+**No gradient clipping.** Gradient clipping replaces a gradient vector $\mathbf{g}$ with $\mathbf{g} \cdot \min(1, \rho / \|\mathbf{g}\|)$ when $\|\mathbf{g}\| > \rho$. Without clipping, a single bad batch (with high loss) can send gradients to large values and corrupt the parameters. Clipping is not a crutch — it is routine hygiene.
+
+### Bugs in training code
+
+**Forgetting `optimizer.zero_grad()`.** Gradients in PyTorch accumulate by default. If you call `loss.backward()` without first zeroing the gradients, the new gradients add to the previous batch's gradients. After two steps the effective gradient is doubled; after $k$ steps it is $k\times$ as large. This is subtle because the loss itself looks normal — only the gradient norm reveals the bug.
+
+**Loss summed instead of averaged across the batch.** `reduction='sum'` in PyTorch loss functions returns the total loss across all elements. If your batch size is 128, each gradient is 128 times larger than it would be with `reduction='mean'`. Training appears to work for batch size 1 but explodes at larger batch sizes — this is a confusing symptom because the loss value looks "large" but not obviously wrong.
+
+**Applying the optimizer step twice.** If you have `optimizer.step()` in two places — or a callback fires it again — parameters are updated twice per iteration. The effective learning rate doubles. Over a long run, weights drift toward much larger values.
+
+**RNN/LSTM: not detaching the hidden state between sequences.** In recurrent models, you typically call `hidden = hidden.detach()` at the start of each new sequence to prevent gradients from flowing across sequence boundaries. If you forget this, the gradient flows back through the entire concatenation of all past sequences — for long runs, this is effectively infinite depth, and gradients vanish to zero.
+
+**Gradient accumulation done wrong.** Intentional gradient accumulation (accumulate over $k$ steps, then step) requires dividing the loss by $k$ before each `backward()`, so that the accumulated gradient is equivalent to one large-batch gradient. If you forget the division, the accumulated gradient is $k\times$ larger, exploding as you increase accumulation steps.
+
+### Data properties
+
+**Input features with very low variance.** If an input feature has near-zero standard deviation — perhaps a constant column in a tabular dataset — and you divide by its standard deviation during normalisation, you divide by ≈0, producing numerical explosion.
+
+**Labels with high variance.** In a regression task, if target labels span values from 0 to 100,000 without normalisation, the MSE loss is proportional to the squared label magnitude. The gradient is correspondingly large from the first batch.
+
+**Very long sequences in RNNs.** Even with proper detachment, within a single sequence of length $T$, gradients must flow back through $T$ steps. For $T = 1000$, even a small per-step attenuation of 0.99 gives $0.99^{1000} \approx 4.3 \times 10^{-5}$. LSTMs mitigate this via the cell state's additive update path, but they do not eliminate it entirely.
+
+**Severely imbalanced classes.** Cross-entropy loss for a correct prediction the model is confident in is near 0. For a rare class the model always gets wrong, the loss per example is high. In a heavily imbalanced dataset, the average loss is low (most examples are easy), but the gradient occasionally spikes on the hard class — creating noisy, high-variance gradient updates that look like intermittent explosions.
+
+### Architecture
+
+**Very deep network without residual connections.** Even with correct init, a 100-layer network without skip paths has Jacobian products that become numerically unstable. In practice, networks deeper than about 20 layers without residual connections fail to train well.
+
+**Very wide network without careful init.** As shown in the init section, width $d$ enters the scale factor as $\sqrt{d}$. A 4096-dimensional hidden layer with the wrong $\sigma$ can be far more pathological than a narrow layer with the same $\sigma$.
+
+**Missing or misplaced normalisation layers.** LayerNorm re-centres and re-scales activations after each sub-layer. If it is placed in the wrong order (e.g., post-residual instead of pre-residual, or omitted from an attention sub-layer), activation norms can drift.
+
+---
+
+## How to diagnose and fix
+
+The diagnostic checklist below maps observed symptoms to likely causes.
+
+<NormDiagnosticChecklist />
+
+### What to log
+
+Every training run should log:
+
+```python
+# After loss.backward(), before optimizer.step()
+total_norm = 0.0
+for p in model.parameters():
+    if p.grad is not None:
+        total_norm += p.grad.detach().norm(2).item() ** 2
+grad_norm = total_norm ** 0.5
+wandb.log({"grad_norm": grad_norm})
+
+# Activation norms: hook-based
+def make_hook(name):
+    def hook(module, input, output):
+        if isinstance(output, torch.Tensor):
+            wandb.log({f"act_norm/{name}": output.detach().norm(2).mean().item()})
+    return hook
+
+for name, module in model.named_modules():
+    module.register_forward_hook(make_hook(name))
+```
+
+### Gradient clipping
+
+```python
+# Clip gradients before the optimizer step
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+optimizer.step()
+```
+
+The canonical max norm for transformer training is 1.0. Some modern recipes (e.g., Chinchilla-style) use values between 0.5 and 2.0. If you are regularly clipping (i.e., the gradient norm is almost always above the clip threshold), that is a signal to lower the learning rate — not just to keep clipping.
+
+### Proper initialisation
+
+For a linear layer with fan-in $n_{in}$ and fan-out $n_{out}$:
+
+| Scheme | $\sigma$ | Best for |
+|---|---|---|
+| Xavier/Glorot uniform | $\sqrt{6 / (n_{in} + n_{out})}$ | Tanh, sigmoid |
+| Xavier/Glorot normal | $\sqrt{2 / (n_{in} + n_{out})}$ | Tanh, sigmoid |
+| He/Kaiming normal | $\sqrt{2 / n_{in}}$ | ReLU, GELU |
+| LeCun normal | $\sqrt{1 / n_{in}}$ | SELU |
+
+PyTorch uses Kaiming uniform by default for `nn.Linear`, which is reasonable for most modern architectures with ReLU-family activations.
+
+### Normalisation layers at the right places
+
+In a pre-norm transformer block (the modern standard):
+
+```
+x = x + Attention(LayerNorm(x))
+x = x + MLP(LayerNorm(x))
+```
+
+The LayerNorm is applied *before* the sub-layer, not after. This pre-norm arrangement is more stable at large depth and larger learning rates. Post-norm (original "Attention is All You Need") can work but requires more careful initialisation and a warm-up period.
+
+### Learning rate schedule and warm-up
+
+Even with correct init and normalisation, training at full LR from step 0 can be unstable. A linear warm-up over the first few hundred steps lets the adaptive optimiser (Adam, AdamW) build up its variance estimates before using them. The effective LR during warm-up is:
+
+$$\text{lr}(t) = \text{lr}_{\text{max}} \cdot \min\left(1, \frac{t}{t_{\text{warmup}}}\right)$$
+
+After warm-up, a cosine decay schedule brings the LR down smoothly over training, which keeps gradient norms from growing as the model approaches convergence.
+
+---
+
+## A mental model to carry with you
+
+Think of your network as a telephone game across $N$ players (layers). Each player whispers the message (gradient or activation) to the next, and their voice can amplify or attenuate the signal.
+
+If every player whispers at $\alpha = 0.9$, by the time the message reaches player 30 it is $0.9^{30} \approx 0.04$ of the original — inaudible. If every player shouts at $\alpha = 1.1$, the message at player 30 is $1.1^{30} \approx 17\times$ louder — painful and distorted.
+
+The job of proper initialisation, normalisation, and architecture design is to keep $\alpha \approx 1$ — every player passing on the message at the same volume they received it.
+
+When your norms are screaming at you, they are not being dramatic. They are telling you that someone in the chain is whispering or yelling, and they know exactly which layer.

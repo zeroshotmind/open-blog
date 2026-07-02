@@ -1,0 +1,43 @@
+---
+title: "Cheatsheet: LLM Architectures"
+slug: "cheatsheet-architectures"
+date: "2025-01-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "cheatsheets"
+seriesOrder: 5
+tags: ["cheatsheet", "architecture", "transformers", "gpt2", "deepseek", "qwen", "moe", "mla", "gqa"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Five LLM architectures — GPT-2, Qwen3-8B, DeepSeek-V3, DeepSeek-R1, GPT-OSS-20B/120B — shown as interactive block diagrams. Click any block to expand equations and parameters. Each model is sourced from its official HF config.json."
+---
+
+Every modern LLM shares the same skeleton — Token Embedding → N × (Norm + Attention + Norm + FFN) → LM Head — but the interesting variation lives in three places: (1) the **attention mechanism** (MHA → GQA → MLA), (2) the **FFN type** (dense → MoE with routing), and (3) the **positional encoding** (absolute → RoPE). The jump from GPT-2 to Qwen3 captures the attention side; the jump to DeepSeek captures all three at once. DeepSeek-R1 adds a fourth dimension that the block diagram cannot show: the same architecture as V3 but a fundamentally different training pipeline, using reinforcement learning on verifiable rewards to elicit long reasoning chains without human-labelled chain-of-thought.
+
+The table below compares the six models on the dimensions that matter most for deployment: how many parameters are *active* per token (which determines FLOPs), the attention type (which determines KV cache size), and the context window (which determines how much of that cache you actually fill). The block diagrams that follow let you drill into the equations and parameter counts for each model.
+
+<ModelComparisonTable />
+
+## Block diagrams
+
+Click any tab to switch models. Use the **+** button on each block to expand the equation and parameter details for that sub-layer. Hover over a block for the core equation as a tooltip.
+
+<ArchitectureCheatsheet />
+
+The key insight from comparing these configs is that MLA (DeepSeek), MoE, and sliding attention each solve a different problem. **MLA** compresses the KV cache in memory — instead of caching 128 heads × 128 dims per token per layer, it caches a 512-dim latent and decompresses at attention time, cutting KV cache size by 64×. That is the primary innovation that lets DeepSeek-V3 run a 671B model on a manageable number of GPUs. **MoE** increases total model capacity without increasing active compute — each token routes through only 8 of 256 experts, so 37B parameters fire per token while the model has access to 671B worth of learned associations. **Sliding attention** (GPT-OSS) controls per-layer context reach: odd layers attend only to a 128-token local window (O(n·128)), even layers attend globally (O(n²)), alternating to blend local syntax with global semantics while halving average attention cost.
+
+For the attention equations behind GQA and MLA — and the KV cache arithmetic — see the [attention variants cheatsheet](/blog/cheatsheet-attention-variants). For what that KV cache means for GPU memory at inference time, including how MLA's compression translates to real memory savings on H100, see the [inference GPU architecture post](/blog/inference-gpu-architecture) and the [KV cache lifecycle post](/blog/kv-cache-lifecycle).
+
+## Source code — forward pass implementations
+
+The cleanest way to verify any architectural claim is to read the actual model code. All numbers in the diagrams above were sourced from the official `config.json` files; the links below point to the forward pass implementations where you can see how each block is wired together.
+
+| Model | Forward pass | What to look for |
+|---|---|---|
+| GPT-2 | [`modeling_gpt2.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py) | `GPT2Block.forward` — pre-norm + MHA + pre-norm + MLP; `GPT2Attention` for causal mask |
+| Qwen3-8B | [`modeling_qwen3.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `Qwen3Attention` for GQA + RoPE; `Qwen3MLP` for SwiGLU gate |
+| DeepSeek-V3 | [`modeling_deepseek_v3.py` (HF)](https://github.com/huggingface/transformers/blob/main/src/transformers/models/deepseek_v3/modeling_deepseek_v3.py) · [`model.py` (official)](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py) | `MLA` class for latent KV compression; `MoEGate` for aux-loss-free routing; `DeepseekV3MoE` for shared + routed experts |
+| DeepSeek-R1 | Same code as V3 — [`modeling_deepseek_v3.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/deepseek_v3/modeling_deepseek_v3.py) | Architecture is identical; differences are in weights, not code |
+| GPT-OSS-20B / 120B | [`modeling_gpt_oss.py` (HF)](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py) · [`openai/gpt-oss` (official)](https://github.com/openai/gpt-oss) | `GptOssAttention` for alternating sliding/full layers; `GptOssMoE` for top-4 routing; `layer_types` list controls which attention type each layer uses |

@@ -1,0 +1,208 @@
+---
+title: "The Bradley–Terry Model: From ELO Scores to Reward Models"
+slug: "bradley-terry-elo"
+date: "2026-06-20"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ranking-and-rank"
+seriesOrder: 1
+tags: ["preference-learning", "rlhf", "reward-models", "elo", "ranking"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Chatbot Arena ranks LLMs with ELO, InstructGPT trains a reward model on pairwise preferences, and chess has rated players for seventy years. All three rest on the same one-line probabilistic model — Bradley–Terry — which turns out to be logistic regression over comparisons."
+---
+
+There is a question that sounds simple and is not: which of two language models is better? You cannot
+answer it with a single number the way you can report a test-set accuracy, because "better" depends on the
+prompt, the rater, and a thousand judgment calls that no automatic metric captures. So the field fell back
+on the oldest trick in competitive ranking: instead of scoring models in isolation, compare them in pairs
+and let the comparisons accumulate into a ranking. Chatbot Arena does exactly this — it shows two anonymous
+model responses side by side, lets a human pick the winner, and converts a stream of these votes into an
+ELO leaderboard. The same idea, almost unchanged, is how [InstructGPT](/papers/instructgpt) and every RLHF
+pipeline since trains its reward model: collect pairs of responses, have a human mark the preferred one,
+and fit a model that predicts those preferences. Chess ratings, arena leaderboards, and reward models look
+like three different things, but they are three faces of one probabilistic model, and it is worth seeing
+the model plainly because once you do, a lot of machinery that looks ad hoc turns out to be inevitable.
+
+## The model in one line
+
+The Bradley–Terry model assigns each item $i$ a positive **strength** $s_i > 0$ and says that the
+probability item $i$ beats item $j$ in a comparison is its share of the combined strength.
+
+$$
+P(i \succ j) = \frac{s_i}{s_i + s_j}
+$$
+
+That is the whole model. It is intuitive in the extremes — if $s_i = s_j$ the probability is exactly
+one half, and if $s_i$ is ten times $s_j$ then $i$ wins about ten times out of eleven — and it has the
+right invariances, because scaling every strength by the same constant leaves all the probabilities
+unchanged. That last fact means the strengths are only defined up to a common scale, which is why every
+rating system gets to choose its own units; we will see ELO choose a particularly strange and historically
+sticky one in a moment.
+
+The model becomes far more recognizable if you take logs. Write $\beta_i = \log s_i$, so the strength is
+$s_i = e^{\beta_i}$, and look at the log-odds that $i$ beats $j$.
+
+$$
+\log \frac{P(i \succ j)}{P(j \succ i)} = \log \frac{s_i}{s_j} = \beta_i - \beta_j
+$$
+
+The log-odds of a win is simply the difference of the two strengths on the log scale. Equivalently, in
+terms of the logistic function $\sigma(z) = 1/(1 + e^{-z})$,
+
+$$
+P(i \succ j) = \sigma(\beta_i - \beta_j)
+
+<ELOWinProbability />
+
+$$
+
+and that should set off an alarm: this is **logistic regression**. The "features" are indicator vectors
+that are $+1$ for the first competitor and $-1$ for the second, the "weights" are the strengths $\beta$,
+and the label is who won. Fitting a Bradley–Terry model to a pile of pairwise comparisons is nothing more
+than maximum-likelihood logistic regression where the design matrix happens to be sparse and structured.
+Everything that is true of logistic regression — convex loss, a unique maximum-likelihood solution under
+mild connectivity conditions, the works — is automatically true of Bradley–Terry.
+
+Writing out that likelihood makes the connection to training concrete. Given a dataset of comparisons in
+which $i$ beat $j$, the negative log-likelihood is
+
+$$
+\mathcal{L}(\beta) = -\sum_{(i \succ j)} \log \sigma(\beta_i - \beta_j)
+$$
+
+and minimizing it over the strength vector $\beta$ is the fit. Hold that expression; it is about to reappear
+verbatim as the loss function of an RLHF reward model.
+
+## ELO is online Bradley–Terry
+
+Arpad Elo designed his chess rating system in the 1960s without the language of logistic regression, but
+he reinvented Bradley–Terry exactly. The only real differences are cosmetic units and the fact that ELO is
+**online** — it never refits the whole model, it just nudges two ratings after each game.
+
+Start with the prediction. ELO writes the expected score of player $i$ against player $j$ as
+
+$$
+E_i = \frac{1}{1 + 10^{(\beta_j - \beta_i)/400}}
+$$
+
+which looks unlike $\sigma(\beta_i - \beta_j)$ only because of the base and the $400$. Those are pure
+convention: using base $10$ instead of $e$ and dividing by $400$ just rescales the rating units, so an ELO
+point is a different-sized unit than a Bradley–Terry log-strength, related by a factor of $400/\ln 10
+\approx 174$. The $400$ was chosen so that a $400$-point gap means the stronger player is expected to score
+about $10$ to $1$. Underneath the costume it is the identical sigmoid.
+
+Now the update. After a game with actual outcome $S_i$ (one for a win, zero for a loss, a half for a draw),
+ELO adjusts the rating by the prediction error, scaled by a step size $K$.
+
+$$
+\beta_i \leftarrow \beta_i + K\,(S_i - E_i), \qquad \beta_j \leftarrow \beta_j + K\,(S_j - E_j)
+$$
+
+This is not an arbitrary heuristic — it is **stochastic gradient ascent on the Bradley–Terry
+log-likelihood**, one comparison at a time. To see it, differentiate the log-likelihood of a single game
+$\log \sigma(\beta_i - \beta_j)$ with respect to $\beta_i$. The derivative of $\log \sigma(z)$ is
+$1 - \sigma(z)$, so the gradient is $1 - E_i = S_i - E_i$ when $i$ won, which is exactly the ELO update
+direction; $K$ plays the role of the learning rate. The symmetric structure — whatever $i$ gains, $j$ loses
+— falls out because the two ratings enter the log-odds as a difference, so their gradients are equal and
+opposite. ELO is gradient descent that nobody at the time called gradient descent.
+
+The step size $K$ controls the speed–stability tradeoff that every online learner faces. FIDE uses $K =
+32$ for most players (smaller for masters, whose ratings should move slowly), so a single upset can swing a
+rating by tens of points. Chatbot Arena uses a far gentler $K$ — around $4$ in its online estimator —
+because it is averaging over a noisy crowd of human voters and wants the leaderboard to be stable rather
+than twitchy, and it ultimately prefers to refit the whole model in batch and report bootstrap confidence
+intervals rather than trust any single online trajectory.
+
+## The reward model loss is Bradley–Terry
+
+Here is the payoff for LLM training. In RLHF you collect, for a prompt $x$, two responses $y_w$ (the one a
+human preferred, the "winner") and $y_l$ (the "loser"), and you want to train a scalar **reward model**
+$r_\theta(x, y)$ whose value is higher for responses people like. The loss used to train it, straight out of
+the [InstructGPT](/papers/instructgpt) paper and every descendant, is
+
+$$
+\mathcal{L}(\theta) = -\,\mathbb{E}_{(x,\,y_w,\,y_l)}\big[\log \sigma\big(r_\theta(x, y_w) - r_\theta(x, y_l)\big)\big]
+$$
+
+Compare it to the Bradley–Terry negative log-likelihood from earlier. It is the same expression. The reward
+
+<RewardModelLoss />
+
+
+$r_\theta(x, y)$ plays the role of the log-strength $\beta$, so the model is implicitly setting the
+Bradley–Terry strength of a response to $s = e^{r_\theta(x, y)}$, and the probability the human prefers the
+winner is $\sigma(r_w - r_l)$. The only thing that has changed from chess is that the strength is no longer
+a free parameter looked up per player — it is the output of a neural network that has to generalize the
+notion of "strength" to responses it has never seen. Training the reward model is fitting one gigantic
+Bradley–Terry model whose items are all possible responses and whose strengths are tied together by a shared
+network.
+
+This is also the cleanest way to understand [Direct Preference Optimization](/papers/dpo): DPO starts from
+the very same Bradley–Terry likelihood but, instead of fitting an explicit reward and then optimizing
+against it with RL, it substitutes the closed-form reward implied by the optimal RLHF policy and collapses
+the two stages into a single classification-style loss on the policy itself. The Bradley–Terry assumption is
+the load-bearing wall under both the classical reward-model route and its direct-optimization shortcut.
+
+## Ties, and what the model assumes
+
+The plain model has no room for a draw — $P(i \succ j) + P(j \succ i) = 1$ leaves no probability for "they
+were equally good," which is awkward when arena voters are given an explicit *tie* button and use it
+constantly. The standard fix is the **Bradley–Terry–Davidson** extension, which adds a tie parameter $\nu$
+and a third outcome whose probability grows when the two strengths are close:
+
+$$
+P(i \approx j) = \frac{\nu \sqrt{s_i s_j}}{s_i + s_j + \nu \sqrt{s_i s_j}}
+$$
+
+with the win probabilities rescaled by the same denominator. The geometric mean $\sqrt{s_i s_j}$ is largest,
+relative to the sum, exactly when the strengths match, so ties become likely between evenly matched
+competitors and rare in lopsided ones — which is what real data shows.
+
+It is also worth naming the road not taken. Bradley–Terry is the logistic model of comparison; its older
+Gaussian cousin is **Thurstone's** model, which imagines each competitor's performance as a draw from a
+normal distribution and predicts a win whenever one draw exceeds the other, giving $P(i \succ j) =
+\Phi(\beta_i - \beta_j)$ with the normal CDF $\Phi$ in place of the logistic $\sigma$. The two curves are
+nearly indistinguishable in practice, and the logistic version won out for the same reason it wins
+everywhere: $\sigma$ and its gradient are trivial to compute, while $\Phi$ requires an error function. The
+difference between a reward model and a "Thurstone reward model" is, quite literally, which S-shaped curve
+you wrap around the score difference.
+
+
+<LogisticVsNormal />
+
+
+## A worked example
+
+Take two models with ELO ratings $\beta_A = 1200$ and $\beta_B = 1000$, a $200$-point gap. The predicted
+probability that $A$ beats $B$ is
+
+$$
+E_A = \frac{1}{1 + 10^{(1000 - 1200)/400}} = \frac{1}{1 + 10^{-0.5}} = \frac{1}{1 + 0.316} \approx 0.76
+$$
+
+so $A$ is expected to win about three times out of four, and symmetrically $E_B \approx 0.24$. Now suppose
+they play and $A$ wins, so $S_A = 1$. With the FIDE step size $K = 32$, the updates are
+
+$$
+\beta_A \leftarrow 1200 + 32\,(1 - 0.76) = 1200 + 7.7 = 1207.7
+$$
+$$
+\beta_B \leftarrow 1000 + 32\,(0 - 0.24) = 1000 - 7.7 = 992.3
+$$
+
+The favorite winning moves the ratings only a little, because the model already expected it; the
+information content of an expected result is low, and the gradient $S_A - E_A = 0.24$ is small. Had the
+underdog $B$ won instead, its error would have been $S_B - E_B = 1 - 0.24 = 0.76$, more than three times
+larger, and the ratings would have lurched by $32 \times 0.76 \approx 24$ points apiece. The update size
+*is* the surprise, which is the same reason cross-entropy loss punishes confident mistakes — both are the
+gradient of a log-likelihood. With Chatbot Arena's $K = 4$ the same upset moves each rating by only about
+three points, trading responsiveness for the stability you want when the "games" are single human votes.
+
+Seen this way, the leaderboard you read, the reward model you train, and the chess rating you earned in
+high school are the same object viewed from three angles. The next two posts turn to the other meaning of
+the word *rank* — not the ranking of competitors but the rank of a matrix — starting with the
+[singular value decomposition](/blog/svd-singular-value-decomposition), the factorization that explains why
+billion-parameter weight matrices can be compressed almost for free.

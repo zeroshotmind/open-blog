@@ -1,0 +1,87 @@
+---
+title: "World Models: The Bigger Picture Behind JEPA"
+slug: "ssl-world-models-vision"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ssl-world-models"
+seriesOrder: 7
+tags: ["ssl", "world-models", "jepa", "embodied-ai", "planning"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "JEPA is a learning architecture. World models are the goal it points toward — internal simulators that can predict the consequences of actions and support planning without interacting with the real world."
+---
+
+Yann LeCun's wager is that the road to human-level intelligence does not run through bigger language models. A
+language model, however large, models a distribution over sequences of tokens; what it learns is which symbol tends
+to follow which, not how the world behaves when you act on it. The capability LeCun argues is missing — and that
+animals and humans have from infancy — is an internal model of the world's dynamics that you can run forward in your
+head to anticipate what happens next and to choose actions before committing to them. Building that, not predicting
+the next word, is where he places the bottleneck.
+
+A world model is the formal object behind that intuition: a function that takes the current state and a candidate
+action and returns the state that would follow. In practice it does not operate on raw observations but on a learned
+latent representation, so the prediction is an evolution of an abstract state rather than a frame of pixels.
+
+$$
+\hat{s}_{t+1} = f(s_t, a_t)
+$$
+
+The model never renders the future; it rolls the representation forward, and the agent reads off whatever it needs —
+reward, collision, success — from the predicted latent state $\hat{s}_{t+1}$ instead of from an imagined image.
+
+<WorldModelRolloutDemo />
+
+What makes this genuinely hard is that the world refuses to be a clean function. It is partially observable, so $s_t$
+can never hold everything that matters — you cannot see what is behind the object you are about to reach for. It is
+stochastic, so the same state and action can lead to different outcomes and a point prediction is the wrong shape for
+the problem. And it is multi-scale, with consequences that unfold over a single step and consequences that unfold over
+minutes, which a fixed-horizon predictor handles badly. A world model worth the name has to absorb all three at once.
+
+This is where the architecture from the previous two parts reappears in a new role. Strip the action out of the
+definition and [V-JEPA's](/papers/v-jepa) predictor — which maps context representations plus a target position to the representation
+that should appear there — *is* a world model for the actionless case, predicting future latent state from current
+context exactly as $f$ does. Adding a conditioning input for $a_t$ to that predictor is the difference between a model
+that forecasts how a scene will evolve on its own and one that forecasts how it will evolve *because of what the agent
+did*. The [V-JEPA](/blog/ssl-vjepa) objective gets you most of the way to the former; the latter is the natural
+extension nobody has fully cashed out yet.
+
+The clearest demonstration that a learned world model can actually drive behavior comes from a different lineage.
+DreamerV3 trains a world model directly from pixels — a Recurrent State Space Model that compresses observations into a
+latent state and predicts how that state, and the reward, evolve — and then trains its policy *entirely inside* that
+learned model, by rolling imagined trajectories forward and improving the policy on them without touching the real
+environment during policy learning. The result is superhuman performance across Atari and continuous-control tasks from
+pixels, reached with far less real interaction than model-free reinforcement learning needs, because most of the
+learning happens in imagination rather than in the world.
+
+Set the two lineages side by side and they are solving different halves of the same problem. JEPA is a recipe for
+learning representations that are abstract and informative — it answers "what should the state be?" Dreamer is a recipe
+for learning dynamics you can simulate and plan inside — it answers "how does the state change?" A JEPA-style encoder
+feeding a Dreamer-style dynamics model is the obvious synthesis, an abstract representation that is also rollable, and
+the reason it is worth pointing at is that neither system delivers both today. Combining them is open research, not
+settled engineering.
+
+<JEPAWorldModelDemo />
+
+For an embodied agent the payoff of getting there is concrete. A robot with a world model can ask "what happens if I
+push this object?" and answer it by rolling the model forward, comparing a few imagined outcomes, and only then moving —
+the difference between an agent that plans and an agent that merely reacts to whatever its current observation triggers.
+That single capability, simulate-then-act, is most of what we mean when we call something an agent rather than a policy.
+
+<ModelBasedVsModelFreeDemo />
+
+The frontier is defined by where these models still fail. They do not transfer across domains: a world model trained in
+one environment does not carry to a meaningfully different one, because it has memorized that environment's dynamics
+rather than learned dynamics in general. They degrade over long horizons, because each predicted state feeds the next
+and small errors compound into trajectories that drift away from anything real. And they have no causal structure —
+they capture the correlations present in their training distribution, so they cannot reliably answer what would happen
+under an intervention they never observed. Domain transfer, long-horizon stability, and causality are the open problems,
+and they are open for everyone.
+
+Trace the series from end to end and it is one question asked twice. The [contrastive](/blog/ssl-contrastive-learning) and [masked](/blog/ssl-masked-autoencoders) methods at the start,
+[I-JEPA](/blog/ssl-ijepa) and [V-JEPA](/blog/ssl-vjepa) in the middle — all of them are attempts to build
+representations rich enough that prediction on top of them is worth doing, and JEPA is the sharpest current answer to
+that half. World models are the second half: predictions abstract enough that planning on top of *them* is worth doing.
+The first answer is in good shape. The second is still being written.

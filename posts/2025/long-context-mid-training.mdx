@@ -1,0 +1,120 @@
+---
+title: "Why Long-Context Mid-Training Is Its Own Stage: RoPE Scaling, Attention Entropy, and Lost-in-the-Middle"
+slug: "long-context-mid-training"
+summary: "Training a model to handle 128K context isn't just running inference on longer sequences — it requires a dedicated mid-training phase because positional encoding, attention entropy, and information retrieval all break in distinct ways beyond the training window."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - long-context
+  - mid-training
+  - rope
+  - positional-encoding
+  - attention
+  - kv-cache
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "llm-training-lifecycle"
+seriesOrder: 2
+references:
+  - authors: "Su, J., et al."
+    title: "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    year: "2021"
+    venue: "arXiv preprint arXiv:2104.09864"
+    doi: "10.48550/arXiv.2104.09864"
+  - authors: "Peng, B., et al."
+    title: "YaRN: Efficient Context Window Extension of Large Language Models"
+    year: "2023"
+    venue: "arXiv preprint arXiv:2309.00071"
+    doi: "10.48550/arXiv.2309.00071"
+  - authors: "Ding, Y., et al."
+    title: "LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens"
+    year: "2024"
+    venue: "arXiv preprint arXiv:2402.13753"
+    doi: "10.48550/arXiv.2402.13753"
+  - authors: "Liu, N. F., et al."
+    title: "Lost in the Middle: How Language Models Use Long Contexts"
+    year: "2023"
+    venue: "Transactions of the Association for Computational Linguistics"
+    doi: "10.48550/arXiv.2307.03172"
+  - authors: "Touvron, H., et al."
+    title: "Llama 2: Open Foundation and Fine-Tuned Chat Models"
+    year: "2023"
+    venue: "arXiv preprint arXiv:2307.09288"
+    doi: "10.48550/arXiv.2307.09288"
+---
+
+A model pre-trained at 4K context length doesn't simply "work" at 128K by passing longer inputs — it fails in three distinct and non-obvious ways, each requiring the mid-training phase to fix. This post explains what each failure mode is, why it occurs mechanically, and what the fixes look like.
+
+## 1. The Out-of-Distribution Position Problem
+
+<RoPEScalingDemo />
+
+RoPE (Su et al., 2021) encodes position by rotating query and key vectors by angles proportional to the token's position index. Each dimension pair $d$ uses a base frequency $\theta_d = 10000^{-2d/D}$, so dimension 0 rotates at frequency 1 (one full cycle per token) and the last dimension rotates at frequency $10000^{-1}$ (one full cycle per 10K tokens). During pre-training on sequences of length 4K, the model sees rotation angles up to $4096 \cdot \theta_d$ for each dimension. At position 8192, it sees $8192 \cdot \theta_d$ — angles it has never encountered during training.
+
+The high-frequency dimensions (which rotate many full cycles within 4K tokens) are less affected because the model has seen many cycles and the extrapolation is periodic. The low-frequency dimensions (which haven't even completed one cycle at 4K tokens) extrapolate into genuinely unseen territory — the attention score computation $\text{Re}[q e^{im\theta} (k e^{in\theta})^*] = \text{Re}[qk^* e^{i(m-n)\theta}]$ receives relative-rotation angles $(m-n)\theta$ that are out of distribution for the slow dimensions, causing the dot products to land in unexpected regions of the model's learned score range.
+
+## 2. RoPE Scaling Approaches
+
+**Linear interpolation** (Chen et al., 2023 / Position Interpolation): rather than extrapolating to position $m > L_{\text{train}}$, rescale: replace position $m$ with $m \cdot (L_{\text{train}} / L_{\text{target}})$. This maps all positions in the new target length back into the range $[0, L_{\text{train}}]$ where the model has seen training signal. Downside: it compresses the position representations of nearby tokens, degrading short-range relative position resolution. A short fine-tuning phase on longer sequences restores most of this degradation.
+
+**NTK-aware scaling** (reddit/bloc97, 2023): instead of uniformly scaling all frequencies, recognize that high-frequency dimensions are robust to extrapolation but low-frequency ones are not. Scale the base $\theta$ upward so that the critical low-frequency dimensions are compressed into the training range, while high-frequency dimensions are barely affected. No fine-tuning required in some cases.
+
+**YaRN** (Peng et al., 2023): extends NTK-aware scaling with two additional fixes. First, applies different scaling factors to different frequency bands (interpolation for medium frequencies, extrapolation for high frequencies, interpolation for low). Second, adds an attention temperature correction:
+
+$$\text{softmax}\!\left(\frac{q^\top k}{\sqrt{d} \cdot t}\right)$$
+
+where $t > 1$ compensates for the entropy shift described in the next section. YaRN achieves competitive long-context performance with far less fine-tuning than linear interpolation, making it practical for mid-training.
+
+**LongRoPE** (Ding et al., 2024): goes further by searching for non-uniform rescaling factors per RoPE dimension rather than using a fixed formula. Uses evolutionary search to find the per-dimension scaling that minimizes perplexity at the target length. Also introduces a two-stage approach: extend to an intermediate length first, then extend again — each stage requires a short fine-tuning phase, but the combination reaches 2M+ token context lengths.
+
+## 3. Attention Entropy Collapse
+
+<AttentionEntropyDemo />
+
+Even after fixing the positional encoding distribution, a second problem remains: **attention entropy increases with sequence length**, and the model hasn't been trained to handle high-entropy attention.
+
+At 4K context, the attention softmax over $L = 4096$ keys can be sharp — a head might concentrate 80% of its weight on 5–10 tokens. At $L = 128\text{K}$, the same query-key dot product distribution produces a much flatter softmax over 128K candidates. The softmax entropy scales as $\log L$ at uniform attention, so moving from 4K to 128K adds about $\log(32) \approx 3.5$ nats of entropy. Heads that learned to function as "retrieval" heads (concentrating on specific relevant tokens) become diffuse and ineffective — they retrieve a smear rather than a target.
+
+YaRN's temperature parameter $t$ addresses this directly. By dividing attention logits by $t > 1$, it sharpens the softmax distribution back toward the entropy the model was trained to produce. The optimal $t$ is empirically tuned (YaRN finds $t \approx 0.1 \cdot \ln(s) + 1$ where $s$ is the scale factor).
+
+Why fine-tuning is still needed: the temperature correction approximates but doesn't perfectly restore the original distribution, and the model's MLP layers and layer-norm statistics have implicitly adapted to the attention entropy regime of 4K context. A mid-training phase on long sequences lets these statistics readjust through gradient updates.
+
+## 4. Lost in the Middle
+
+<LostInTheMiddleDemo />
+
+Liu et al. (2023) documented a third failure mode that persists even after positional encoding is fixed: **models trained at short contexts systematically underweight information in the middle of long inputs**.
+
+Their finding: when a relevant document is placed at the beginning or end of a long context window, retrieval accuracy is high. When it's placed in the middle, accuracy drops sharply — often to near-random performance. This U-shaped performance curve holds across model families and sizes.
+
+Why does this happen? Two contributing factors:
+
+- **Recency and primacy bias in attention**: attention heads trained on short sequences develop strong biases toward early tokens (which appeared in context for many training steps) and recent tokens (which are most predictive for next-token loss). Middle positions receive weaker gradient signal in short-context training because they're neither primed by primacy nor boosted by recency.
+- **Training data distribution**: in pre-training, the "answer" to any implicit query is almost always nearby — the passage that explains a fact usually appears within a few hundred tokens of the question, not 60K tokens away. The model learns that middle-distance information is less likely to be relevant, and this prior is encoded in the learned attention patterns.
+
+**Fix**: the mid-training corpus for long-context extension must include examples where relevant information is explicitly placed in the middle, and the training objective must reward using that information. Synthetic "needle-in-a-haystack" tasks — where a planted fact in the middle of a long document must be retrieved — are the canonical approach. Code Llama's long-context extension included synthetic retrieval tasks for this reason.
+
+## 5. KV Cache Memory Implications
+
+A practical side effect of long-context mid-training: the KV cache grows linearly with sequence length. At 4K context, a 7B model with 32 layers, 32 heads, and 128-dimensional keys uses roughly $2 \times 32 \times 32 \times 128 \times 4096 \times 2$ bytes $\approx$ 2 GB per sequence (in float16). At 128K context, this becomes 64 GB — larger than a single A100. Mid-training at long contexts therefore requires chunked attention (processing keys in blocks), gradient checkpointing, and often ring attention (distributing the KV cache across devices). The training infrastructure for long-context mid-training is qualitatively different from standard pre-training.
+
+## 6. Why It Must Be a Separate Stage
+
+Pulling the threads together: long-context training cannot be done from scratch at full scale because:
+
+1. Attention is quadratic in sequence length — training on 128K sequences is 1024× more expensive per sequence than 4K
+2. Most pre-training signal is short-range and the model benefits from learning short-context representations first
+3. The RoPE scaling techniques assume a pre-trained model with a known training length to scale from
+
+And it cannot be skipped in favor of just inference-time tricks because:
+
+1. The entropy collapse is encoded in the model weights, not fixable by changing the input
+2. Lost-in-the-middle requires gradient updates to the attention patterns, not prompt engineering
+3. Position interpolation degrades short-range performance slightly, which must be recovered via fine-tuning
+
+Hence: a dedicated mid-training phase, typically 5–20B tokens on documents exceeding the target context length, with RoPE scaling applied and a synthetic retrieval component in the training mix.

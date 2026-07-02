@@ -1,0 +1,164 @@
+---
+title: "GRPO vs PPO: Why Removing the Value Head Changes Everything"
+slug: "grpo-vs-ppo"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+tags: ["rl", "grpo", "ppo", "llm-training", "alignment"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "GRPO achieves competitive alignment results without a value function. Here's exactly what changes in the math and implementation, and why that matters for training efficiency and stability."
+---
+
+The value head is the single most expensive piece of machinery [PPO](/papers/ppo) carries into LLM
+training. It is a learned critic the size of a second model, it needs its own clipped loss and its own
+regression targets, and its training stability feeds directly back into the quality of every advantage
+the policy consumes — when the critic is wrong, the policy is steered by noise.
+[GRPO](/papers/grpo) (Group Relative Policy Optimization, DeepSeek 2024) deletes that whole apparatus
+and replaces it with a statistic you can compute from a handful of samples.
+
+## What the value head was buying
+
+The full role of the critic — estimating $V_\phi(x, y_{<t})$ and feeding it through GAE — is the
+subject of the [companion post](/blog/ppo-full-training-step), so here only the consequence matters.
+The value estimate is the baseline GAE subtracts from the return to turn a high-variance reward into a
+low-variance advantage. Strip the critic out with nothing in its place and the advantage falls back to
+the raw return $R$, whose variance across completions is enormous — different samples for the same
+prompt earn wildly different rewards, and all of that spread becomes noise injected straight into the
+policy gradient. GRPO's bet is that you can kill the variance without a learned baseline at all.
+
+## Group normalization as the baseline
+
+Instead of asking a network what the expected reward is, GRPO measures it empirically: for one prompt
+it samples a group of $G$ completions (typically $8$ to $16$), scores each with the reward model, and
+treats the group's own statistics as the baseline. The advantage of completion $y_i$ is its reward
+standardized against its peers.
+
+$$
+\hat A_i = \frac{r_i - \operatorname{mean}(\{r_1, \dots, r_G\})}{\operatorname{std}(\{r_1, \dots, r_G\})}
+$$
+
+This is relative performance within the group and nothing more: a completion that scored $0.8$ when
+its siblings averaged $0.6$ comes out positive, one that scored $0.4$ comes out negative, and the
+standard deviation in the denominator rescales the whole thing to unit variance for free. No value
+network, no GAE recursion, no per-token bootstrap — the baseline is just the mean of the batch you
+already had to generate.
+
+<GroupNormalizationDemo />
+
+## Per-token mechanics carry over unchanged
+
+Because the reward is one scalar per completion rather than a per-step signal, the group advantage
+$\hat A_i$ is broadcast identically across every token of $y_i$, exactly as outcome-RM PPO broadcasts
+its single advantage. The clipped surrogate is then the same object you already know, summed over
+tokens and groups with a KL leash to the reference model.
+
+$$
+\mathcal{L}_\text{GRPO} = -\frac{1}{G}\sum_{i=1}^{G} \frac{1}{|y_i|} \sum_{t}
+\min\!\big(r_t^i \, \hat A_i,\ \operatorname{clip}(r_t^i, 1-\epsilon, 1+\epsilon)\, \hat A_i\big)
++ \beta \, \mathrm{KL}\!\big(\pi_\theta \,\|\, \pi_\text{ref}\big)
+$$
+
+The per-token ratio $r_t^i = \exp\!\big(\log \pi_\theta(y_t^i \mid x, y_{<t}^i) - \log \pi_{\theta_\text{old}}(y_t^i \mid x, y_{<t}^i)\big)$
+is identical to PPO's, and the KL penalty is taken directly against the reference model rather than
+folded into a reward and pushed through GAE. Everything that made the clip the clip survives; only the
+source of $\hat A$ has changed.
+
+## The accounting: removed versus retained
+
+What GRPO deletes is the entire value-side of PPO: the value head $W_v$, the value loss
+$\mathcal{L}_V$, the GAE computation, the returns it regressed onto, the value clipping, and — in the
+common configuration — the entropy bonus as well. What it keeps is everything that defines the policy
+update: the clipped surrogate, the old-policy snapshot that defines the ratios, the reference model
+that anchors the KL, the reward model that scores completions, and the inner epochs over each batch.
+
+The memory consequence is concrete. Dropping the value head removes one model copy's worth of
+parameters plus the optimizer state that shadowed them, and under AdamW the optimizer state is the
+expensive part — two moment buffers per parameter. For a 7B critic in bf16 that is roughly
+$2 \times 7\text{B} \times 2\,\text{bytes} \approx 28\,\text{GB}$ reclaimed from the value head alone,
+which on constrained hardware is often the difference between fitting the run and not.
+
+<MemoryComparison />
+
+## Where the trade turns against GRPO
+
+The group baseline is only as good as the variance inside the group. It works precisely when the
+reward model discriminates among siblings — when different completions for the same prompt earn
+meaningfully different scores — because that is what makes $\operatorname{std}(\{r_j\})$ nonzero and
+the standardized advantage informative. When the reward model is poorly calibrated, or the prompt is
+easy enough that every completion scores about the same, the numerator collapses toward zero, the
+advantages vanish, and the policy receives no gradient on that prompt at all. A learned critic does
+not have this failure mode: it tracks a baseline that moves over the course of training, so it can
+still report a nonzero advantage even when within-batch reward variation is small. GRPO's baseline is
+purely local to the group in front of it, with no memory of what the policy looked like a thousand
+steps ago.
+
+This is the structural reason GRPO shines on verifiable-reward tasks — math, code, anything with a
+checkable answer. There the reward is effectively binary, correct or incorrect, so as long as the
+policy is neither hopeless nor perfect the group is guaranteed to contain both winners and losers, and
+the standardized advantage is always well defined.
+
+## DeepSeek-R1-Zero: the value head's absence as a feature
+
+DeepSeek-R1-Zero pushed this to its conclusion by running GRPO with no SFT warmup, starting directly
+from the base model. (The [DeepSeek-R1 technical report](/papers/deepseek-r1), published January 2025, describes two models:
+R1-Zero, trained with pure RL and no SFT at all, and R1 itself, which adds a cold-start SFT stage
+before the RL. The published reasoning results that motivate GRPO are the ones demonstrated with
+R1-Zero.) The chain-of-thought reasoning traces were not imitated from supervised examples; they
+emerged from RL alone, because correct final answers earned positive group advantage and incorrect
+ones earned negative, and the policy discovered that longer, more careful intermediate reasoning was a
+reliable route to the correct answer. That discovery is fragile in the early phase of training when the
+policy is unstable and its samples are erratic — and that is exactly the regime where a learned value
+function is least trustworthy, since it is being asked to regress onto returns produced by a policy
+that is changing under it. GRPO sidesteps the problem by never asking a network to predict the
+baseline; the group recomputes it from scratch every step.
+
+## In code
+
+The full loss is short, and its brevity relative to PPO is the entire pitch — there is no second
+network to forward, no GAE recursion, no returns to assemble.
+
+```python
+def grpo_loss(policy, ref_policy, prompts, G=8, clip_eps=0.2, beta=0.04):
+    all_losses = []
+    for prompt in prompts:
+        # Generate G completions for the same prompt
+        completions = [policy.generate(prompt) for _ in range(G)]
+        rewards = torch.tensor([reward_model(prompt, c) for c in completions])
+
+        # Group advantage — the baseline is the group mean, no value head
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+        comp_losses = []
+        for completion, adv in zip(completions, advantages):
+            new_logp = policy.log_probs(prompt, completion)           # (L,)
+            old_logp = policy.log_probs_detached(prompt, completion)  # frozen snapshot
+            ref_logp = ref_policy.log_probs(prompt, completion)       # reference model
+
+            ratio = torch.exp(new_logp - old_logp)
+            kl = (new_logp - ref_logp).mean()                        # per-token KL
+
+            clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+            policy_loss = -torch.min(ratio * adv, clipped * adv).mean()
+
+            comp_losses.append(policy_loss + beta * kl)
+
+        all_losses.append(torch.stack(comp_losses).mean())
+
+    return torch.stack(all_losses).mean()
+```
+
+## The actual decision
+
+GRPO trades the learned critic's accurate, slow-moving baseline for simplicity and a large chunk of
+reclaimed memory, and whether that trade is good is a property of your reward model, not of the
+algorithm. When the reward is a reliable binary signal and every group carries real variance, the
+value head is dead weight and GRPO wins outright. When the reward is a continuous, lightly varying
+score — nuanced helpfulness, stylistic preference, anything where most siblings cluster — the learned
+baseline earns its cost by keeping the gradient alive on prompts where the group cannot tell its own
+samples apart. The choice is set by how well your reward model can separate two answers to the same
+question, and any claim that one algorithm dominates the other has quietly assumed an answer to that.
+
+<AlgorithmDiff />

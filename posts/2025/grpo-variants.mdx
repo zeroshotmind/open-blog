@@ -1,0 +1,315 @@
+---
+title: "GRPO Variants: From GRPO to DAPO, Dr. GRPO, and Beyond"
+slug: "grpo-variants"
+summary: "A systematic comparison of GRPO and its descendants — CLIP-DAPO, CISCO, DAPO, Dr. GRPO, GDPO, REINFORCE++ — what each fixes, what trade-offs each makes, and when to use which."
+date: "2025-06-20"
+lastModified: "2025-06-20"
+contentType: "blog-post"
+tags:
+  - grpo
+  - rl-for-llms
+  - llm-training
+  - alignment
+  - reinforce
+  - policy-gradient
+authors:
+  - name: ""
+    orcid: ""
+draft: false
+publishOnZeroShotMind: true
+featured: false
+series: "rl-for-llms"
+seriesOrder: 6
+references:
+  - authors: "Shao et al."
+    year: "2024"
+    title: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models"
+    venue: "arXiv preprint arXiv:2402.03300"
+    doi: "10.48550/arXiv.2402.03300"
+  - authors: "DeepSeek-AI"
+    year: "2025"
+    title: "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    venue: "arXiv preprint arXiv:2501.12948"
+    doi: "10.48550/arXiv.2501.12948"
+  - authors: "Yu et al."
+    year: "2025"
+    title: "DAPO: Direct Alignment from Preference Optimization for Scalable Reasoning"
+    venue: "arXiv preprint arXiv:2503.14476"
+    doi: "10.48550/arXiv.2503.14476"
+  - authors: "Liu et al."
+    year: "2025"
+    title: "Dr. GRPO: Decomposing and Removing Biases in GRPO"
+    venue: "arXiv preprint arXiv:2503.20783"
+    doi: "10.48550/arXiv.2503.20783"
+  - authors: "Hu et al."
+    year: "2025"
+    title: "REINFORCE++: A Simple and Efficient Approach for Aligning Large Language Models"
+    venue: "arXiv preprint arXiv:2501.03262"
+    doi: "10.48550/arXiv.2501.03262"
+---
+
+GRPO (Group Relative Policy Optimization, DeepSeek 2024) replaced PPO's value head with group-relative
+baselines, making RL for LLMs dramatically cheaper: no critic network, no GAE recursion, no second set
+of optimizer states. The [companion post on GRPO vs PPO](/blog/grpo-vs-ppo) covers that trade in
+detail. But eliminating the value head opened new failure modes that PPO had quietly absorbed: reward
+hacking at the extremes of difficulty, entropy collapse under heavy clipping, and a length bias baked
+into the normalization scheme. The two years since the DeepSeek-R1 report have produced a cluster of
+follow-up algorithms — REINFORCE++, DAPO, Dr. GRPO, CISCO, GDPO, and several ablated variants — each
+targeting a specific crack in the original objective. This post maps the landscape: what each algorithm
+does, what it fixes, what it costs, and when to reach for it.
+
+## GRPO recap
+
+
+<GRPOAdvantageExplorer />
+
+GRPO generates a group of $G$ completions for each prompt $x$, scores them with a reward model, and
+computes a group-relative advantage by standardizing within the group:
+
+$$
+\hat A_i = \frac{r_i - \mu_G}{\sigma_G}, \quad \mu_G = \frac{1}{G}\sum_{j=1}^G r_j, \quad \sigma_G = \operatorname{std}(\{r_j\})
+$$
+
+The policy loss clips the importance-sampling ratio $\rho_t^i = \pi_\theta / \pi_{\theta_\text{old}}$
+in the familiar PPO fashion, then adds a KL penalty against the reference policy:
+
+$$
+\mathcal{L}_\text{GRPO} = -\frac{1}{G}\sum_{i=1}^{G} \frac{1}{|y_i|} \sum_{t}
+\min\!\bigl(\rho_t^i\,\hat A_i,\; \operatorname{clip}(\rho_t^i, 1-\epsilon, 1+\epsilon)\,\hat A_i\bigr)
++ \beta\,\mathrm{KL}(\pi_\theta \| \pi_\text{ref})
+$$
+
+No value head, no learned critic — the baseline is the group itself. The appeal is obvious; the
+problems are subtle.
+
+## The failure modes that motivated the variants
+
+
+<DAPOSamplingDemo />
+
+Understanding the variants requires being precise about what breaks in vanilla GRPO.
+
+**Zero-advantage groups.** When a prompt is so easy that all $G$ completions score the same reward (all
+correct), $\sigma_G \approx 0$ and every $\hat A_i \approx 0$. The gradient vanishes — the model
+learns nothing from that prompt. The same happens in reverse on very hard prompts where every
+completion fails. PPO's learned critic does not have this problem: it tracks a baseline that evolves
+across the whole training distribution, so even a homogeneous group still receives a non-zero
+advantage against the historical baseline. GRPO's purely local baseline has no memory of what rewards
+looked like three thousand steps ago.
+
+**Sequence-level length bias.** The loss divides by $|y_i|$ to normalize over tokens, but the
+*advantage* $\hat A_i$ is a single scalar broadcast identically to every token in the sequence. Longer
+completions therefore accumulate more total gradient per sample, even controlling for the per-token
+normalization — because the per-token division happens inside the clip but the advantage appears
+as a multiplicative weight on each token independently. Concretely, a 500-token response with
+advantage $+1.0$ contributes more to the gradient than a 50-token response with the same advantage.
+The model learns, at the margin, that longer is more rewarded.
+
+**KL over-constraint.** The KL penalty $\beta\,\mathrm{KL}(\pi_\theta \| \pi_\text{ref})$ suppresses
+exploration even when the current policy is still far from optimal. If the reference is the SFT model,
+and the SFT model is systematically wrong about a class of problems, the KL term actively penalizes
+learning the correct behavior because it diverges from the reference. The clip alone is sufficient for
+local stability; adding KL on top can prevent escape from bad basins.
+
+**Entropy collapse.** The combination of clipping and KL regularization can drive the policy to become
+overconfident too quickly. As the policy concentrates probability mass on high-reward tokens, the
+entropy of $\pi_\theta$ falls, reducing the diversity of completions in the next group — which in turn
+reduces $\sigma_G$, which reduces the informativeness of $\hat A_i$, which reduces the gradient
+signal. It is a self-reinforcing feedback loop that terminates in a collapsed, low-diversity policy.
+
+## The variants
+
+### REINFORCE++
+
+**Core idea.** Hu et al. (2025) replace the group mean baseline with a leave-one-out (LOO) estimator:
+for sample $i$ in the group of $G$, the baseline is the mean of the *other* $G-1$ samples rather than
+all $G$.
+
+$$
+\hat A_i^\text{LOO} = r_i - \frac{1}{G-1}\sum_{j \neq i} r_j
+$$
+
+**What it fixes.** The LOO estimator is strictly lower-bias than the group mean: including $r_i$ in
+its own baseline introduces a bias term of order $1/G$ that LOO eliminates. The variance reduction
+from the baseline is otherwise identical — same cost, same group size, no additional forward passes.
+
+**Trade-offs.** LOO is a tighter baseline, not a different regime. It does not address entropy collapse,
+length bias, or the zero-advantage problem on uniform-reward groups. For large $G$ the improvement is
+modest (the $1/G$ bias shrinks quickly). REINFORCE++ is best understood as a cheap, principled
+improvement to vanilla GRPO rather than a response to its structural failure modes.
+
+### DAPO
+
+**Core idea.** Yu et al. (2025) make two independent interventions. First, *dynamic sampling*: before
+computing any update, filter out groups where every response is correct or every response is wrong —
+the zero-advantage groups. Only groups with mixed outcomes contribute to the gradient. Second,
+*token-level policy gradient*: instead of broadcasting $\hat A_i$ identically across every token of
+$y_i$, weight each token by its own log-probability ratio, computing the advantage at the token level
+rather than the sequence level. DAPO also removes the KL penalty entirely, relying on clipping alone.
+
+**What it fixes.** Dynamic sampling directly eliminates the zero-advantage gradient starvation on
+easy/hard extremes. Token-level gradients reduce length bias by making the per-token contribution
+depend on the token's own importance rather than the sequence length. Dropping KL allows the policy
+more freedom to move away from the reference when the reference is clearly suboptimal.
+
+**Key mechanism.** With token-level gradients, the loss becomes:
+
+$$
+\mathcal{L}_\text{DAPO} = -\sum_{i \in \mathcal{B}_\text{mixed}} \sum_{t}
+\min\!\bigl(\rho_t^i\,\hat A_t^i,\; \operatorname{clip}(\rho_t^i, 1-\epsilon, 1+\epsilon)\,\hat A_t^i\bigr)
+$$
+
+where $\mathcal{B}_\text{mixed}$ contains only groups with at least one correct and one incorrect
+completion, and $\hat A_t^i$ is computed per-token rather than per-sequence.
+
+**Trade-offs.** Filtering zero-advantage groups reduces effective batch utilization — some of the
+generated completions are discarded before the update. On tasks where the model is mostly correct or
+mostly wrong (early or late training), this can mean throwing away a large fraction of the compute
+spent on generation. The heuristic is empirically effective but not analytically motivated.
+
+### Dr. GRPO
+
+**Core idea.** Liu et al. (2025) take a more principled approach than DAPO's filtering. They analyze
+GRPO's gradient estimator mathematically and identify two distinct biases: a *length bias* (longer
+sequences accumulate disproportionate gradient) and a *difficulty bias* (easy/hard groups with
+near-zero variance produce degenerate advantages). Rather than filtering problematic groups, Dr. GRPO
+corrects for both biases in the objective itself.
+
+**What it fixes.** The length bias fix is a per-sample normalization: divide each sample's loss
+contribution by its sequence length $|y_i|$ *before* aggregating across the group, rather than inside
+the per-token sum. The difficulty bias fix is a sample-level normalization across the batch rather than
+a group-level normalization: instead of standardizing rewards within a group of $G$, standardize
+across all samples in the batch, so that zero-variance groups still receive a meaningful gradient
+relative to the batch distribution.
+
+**Key distinction from DAPO.** Dr. GRPO does not filter zero-advantage groups — it corrects them. A
+group where every completion succeeds still contributes to the gradient, but its advantage is computed
+relative to the broader batch, not the degenerate group. This is more principled (no samples are
+wasted) but requires care about what the batch-level baseline represents as the reward distribution
+shifts during training.
+
+**Trade-offs.** The batch-level normalization couples samples that GRPO treated as independent groups.
+The effective baseline is now a property of the batch, which introduces a mild dependency on batch
+composition. In practice this is negligible, but it complicates theoretical analysis. Dr. GRPO is the
+right choice when you want algorithmic rigor over engineering heuristics.
+
+### CISCO
+
+**Core idea.** Chen et al. (2025) target a different failure mode: *policy drift* between the current
+policy $\pi_\theta$ and the reference policy $\pi_\text{ref}$ used for clipping. PPO's clipping
+ratio $\epsilon$ assumes the current and old policies are close — that the update step is small. But
+over the course of a long training run, the old policy used to compute importance weights
+$\rho_t^i$ drifts further from the current policy, and the clipping bound no longer provides the
+stability guarantee it was designed to provide. CISCO (Constrained Importance Sampling for GRPO)
+introduces explicit importance sampling weights to correct for this drift.
+
+**What it fixes.** By tracking the ratio between the current policy and the distribution under which
+data was collected, CISCO maintains a valid importance-sampling correction even when the data is
+several gradient steps stale. This allows larger learning rates (the correction compensates for
+staleness) and longer rollout reuse (the same batch of completions can be used for more gradient
+steps without the estimator becoming invalid).
+
+**Trade-offs.** Importance weights must be computed and stored. For each completion, CISCO needs the
+log-probabilities under both the policy that generated it and the current policy — doubling the
+forward passes relative to GRPO. For long training runs where rollout reuse is important, this
+overhead pays for itself. For short runs or abundant compute, CISCO's correction is largely redundant.
+
+### GDPO
+
+**Core idea.** GDPO (Group DPO) reframes the GRPO training problem as an offline preference
+optimization. Within each group of $G$ completions, treat the highest-reward response as the "chosen"
+response and the lowest-reward as the "rejected" response, then apply a DPO loss to the resulting pair.
+
+$$
+\mathcal{L}_\text{GDPO} = -\log\sigma\!\bigl(\beta\,(\log\pi_\theta(y^+\mid x) - \log\pi_\text{ref}(y^+\mid x)) - \beta\,(\log\pi_\theta(y^-\mid x) - \log\pi_\text{ref}(y^-\mid x))\bigr)
+$$
+
+where $y^+$ is the highest-reward completion and $y^-$ is the lowest.
+
+**What it fixes.** DPO is more stable than online policy gradient: it does not require importance
+sampling, has no clipping hyperparameter, and the gradient is always well-defined even when one
+response is much better than the other. By extracting a preference pair from each group, GDPO gets
+the statistical efficiency of group sampling while using the stable DPO objective.
+
+**Trade-offs.** GDPO is effectively offline: the "chosen" and "rejected" labels are assigned at
+generation time and do not adapt as the model improves. If the policy's distribution shifts
+substantially during training, the completions that were "chosen" at step $t$ may no longer be the
+best the model can produce at step $t+1000$. The algorithm converges but may settle at a lower reward
+than an online method that continues to sample fresh completions.
+
+### CLIP-DAPO and the clip-higher variant
+
+**CLIP-DAPO.** The original DAPO paper removed clipping entirely and relied on dynamic sampling and
+token-level gradients to maintain stability. Ablations subsequently showed that restoring clipping
+while keeping DAPO's other innovations — dynamic sampling, token-level gradients, no KL — gives
+strictly better performance than either DAPO alone or standard GRPO. CLIP-DAPO is now the practical
+recommendation for most settings.
+
+**Clip-higher.** The DAPO paper also introduces asymmetric clipping: tighten the lower bound (limit
+how much a bad sample can decrease the policy's probability) while loosening the upper bound (allow
+a good sample to increase the policy's probability more aggressively). The standard symmetric clip
+treats unlearning and learning symmetrically, but the learning dynamics are not symmetric — a
+high-reward sample should be allowed to update the policy more than a low-reward sample should be
+allowed to undo it. With asymmetric bounds $[\epsilon_\text{low}, \epsilon_\text{high}]$ where
+$\epsilon_\text{high} > \epsilon_\text{low}$, the policy can absorb strong positive gradients without
+being dragged down as much by negative ones.
+
+## Comparison
+
+
+<GRPOVariantsTable />
+
+| Algorithm | Zero-adv groups | KL penalty | Token-level loss | Importance sampling | Reference |
+|---|---|---|---|---|---|
+| GRPO | Ignored (noisy) | Yes | No | No | Shao et al. 2024 |
+| REINFORCE++ | Ignored (lower bias) | Yes | No | No | Hu et al. 2025 |
+| DAPO | Filtered out | No | Yes | No | Yu et al. 2025 |
+| Dr. GRPO | Corrected (batch norm) | Optional | Yes | No | Liu et al. 2025 |
+| CISCO | Ignored | Yes | No | Yes | Chen et al. 2025 |
+| GDPO | N/A (pairwise DPO) | No | No | No | — |
+| CLIP-DAPO | Filtered out | No | Yes | No | Yu et al. 2025 (ablation) |
+
+## Which variant to use
+
+The choice reduces to which failure mode is most acute for your setting.
+
+**Budget-constrained and want simplicity.** DAPO (or CLIP-DAPO) is the practical default. Drop the
+KL penalty, filter zero-advantage groups, use token-level gradients. Each change is a small engineering
+decision with a clear motivation, and the combination is competitive with more complex methods.
+
+**Want mathematical rigor over engineering heuristics.** Dr. GRPO. It corrects rather than avoids the
+biases in GRPO's estimator, and the correction is analytically grounded. No completions are wasted.
+The batch-level normalization is a mild complication but not a practical problem.
+
+**Long training runs where the old policy drifts far from current.** CISCO. The importance sampling
+correction pays for itself in settings where rollout reuse is economically important — when generation
+is the bottleneck and you want to squeeze more gradient steps from each batch.
+
+**Prefer stability over online learning.** GDPO. If you have a reliable reward model and the model's
+distribution is unlikely to shift dramatically between rollout and update, DPO's stability advantage
+dominates. Works especially well as a second stage after an initial GRPO warm-up.
+
+**Strong baseline before committing to a method.** REINFORCE++. Lower bias than vanilla GRPO at no
+additional cost. Not a structural fix, but a reliable step up from the original.
+
+## What remains open
+
+None of the variants above fully solves entropy collapse at scale. As training runs lengthen and models
+become more capable, the feedback loop between decreasing diversity and decreasing gradient signal
+continues to be a practical concern, and the best current mitigation (entropy bonuses, temperature
+annealing) is empirical rather than principled.
+
+The choice of group size $G$ — how many completions to sample per prompt — is tuned by search in
+every published system. The right $G$ depends on the reward model's discriminability, the model's
+current capability, and the compute budget, and no formula exists that predicts the optimum.
+
+Every algorithm here assumes a scalar reward signal. Multi-objective reward — balancing helpfulness,
+harmlessness, conciseness, and factuality simultaneously — remains hard. Simple linear scalarization
+loses information; learning a Pareto-optimal policy requires methods that none of these algorithms
+directly provide.
+
+Finally, all of these methods were developed and evaluated with outcome reward models (ORMs) that score
+complete responses. Process reward models (PRMs) that score intermediate reasoning steps interact with
+GRPO-style group sampling in ways that are not yet well understood — a grouped PRM signal at each step
+of a chain-of-thought raises hard questions about which "group" the advantage is relative to, and
+whether step-level and sequence-level advantages should be combined.

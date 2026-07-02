@@ -1,0 +1,113 @@
+---
+title: "RL as a Skill Acquisition Engine"
+slug: "rl-for-llms-skill-acquisition"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "rl-for-llms"
+seriesOrder: 4
+tags: ["rl", "reasoning", "code", "llm-training"]
+summary: "The reward signal determines what the model learns to do. Swap the reward, swap the capability. Here's how RL elicits reasoning, code generation, math, and tool use."
+authors:
+  - name: "Admin"
+    url: "https://zeroshotmind.com"
+    affiliation: "Independent"
+---
+
+The lesson from reward hacking is usually told as a warning: optimize a proxy hard enough and the
+model finds the gap between the proxy and what you meant. But Goodhart's Law runs in both directions.
+If the gap is what lets a model cheat a sloppy reward, then closing the gap — writing a reward that
+genuinely measures the thing you care about — turns the same optimization pressure into a
+construction. A faithful reward is not a leash; it is a specification of a capability. Point RL at a
+metric that actually tracks "solves the problem," and the policy will climb toward solving the
+problem. The interesting engineering question stops being *how do we stop the model from gaming the
+reward* and becomes *which capabilities can we even write a reward for*.
+
+The answer hinges on verifiability. RL needs a number at the end of every rollout, and it does not
+care where the number comes from — a human rater, a unit test, a theorem checker, the exit code of a
+process. What it cares about is that the number exists and that it correlates with the goal. So the
+practical question reduces to: can you write a function `score(output) -> float`? Anything with a
+ground truth or a mechanical checker is a candidate, and the cleaner the checker, the less room the
+policy has to find a degenerate shortcut. This is why the most striking RL results of the last few
+years cluster in domains where correctness is decidable rather than judged.
+
+Reasoning is the first such domain, and the crudest version of its reward is almost embarrassingly
+simple: did the final answer match? A model samples a chain of thought, emits an answer, and you
+check it against the key — one if right, zero if wrong. That single bit, backpropagated through the
+[PPO machinery](/papers/ppo), is enough to make a model reason better over time, because the only
+chains of thought that survive are the ones that tend to land on correct answers. The weakness is
+credit assignment: a 400-token derivation gets one scalar at the very end, so a flawed intermediate
+step and the correct steps around it all share the same fate. Process reward models attack exactly
+this. Instead of scoring only the outcome, a PRM grades each step of the trace, and Lightman et al.
+(2023) showed that supervising reasoning step by step substantially outperforms outcome-only rewards
+on hard math — the model is told *where* it went wrong, not merely *that* it did.
+
+The contrast between the two is worth making precise. An outcome reward collapses an entire trace
+$\tau = (s_1, \dots, s_T)$ of reasoning steps into a single terminal scalar tied to the final answer.
+
+$$
+R_\text{outcome}(\tau) = \mathbb{1}\big[\text{answer}(\tau) = y^\star\big]
+$$
+
+Every step inherits the same advantage from that one bit, which is why noisy credit assignment is the
+defining limitation of outcome-only training. A process reward instead sums a verdict over the
+individual steps, so the signal is dense along the sequence.
+
+$$
+R_\text{process}(\tau) = \sum_{t=1}^{T} r(s_t)
+$$
+
+Now a correct prefix can be rewarded even when the trace later derails, and a single bad step can be
+penalized in isolation — the catch is that producing $r(s_t)$ requires step-level labels, which are
+far more expensive to collect than a single answer key. The trade is richer signal against costlier
+supervision, and for long reasoning chains the richer signal usually wins.
+
+<CurriculumLearningDemo />
+
+Code generation gives you the cleanest checker of all, because you can simply run the code. The
+reward is execution: take the model's program, throw it at a suite of unit tests, and let the
+fraction that pass be the score. There is nothing to interpret and nothing for a rater to be talked
+out of — the tests either go green or they do not. AlphaCode and DeepSeek-Coder are built on exactly
+this loop, sampling many candidate programs and letting the test suite filter them. The signal is
+unusually honest precisely because it is mechanical: a program that passes the tests has, by
+construction, done the thing the tests describe, and the only way to hack the reward is to find a bug
+in the tests themselves.
+
+Formal math pushes verifiability to its limit. A proof written in Lean or Isabelle is checked by the
+proof assistant's kernel, and the kernel's verdict is not a judgment call — a proof either typechecks
+as a valid derivation from the axioms or it does not. That makes formal theorem proving one of the
+purest RL targets in existence: the reward is a boolean handed down by a piece of software that
+cannot be sweet-talked, and a model that learns to maximize it is learning, in the strictest possible
+sense, to prove theorems. The difficulty migrates entirely to exploration — valid proofs are rare in
+the space of token sequences — rather than to the reward, which is as faithful as a reward can be.
+
+<SkillEmergenceDemo />
+
+Tool use is where the reward stops being a static function of the output and starts coming from an
+environment. The model emits an action — a tool call, a query, a command — the environment executes
+it and returns a result, and the reward is whether the task got done. The loop is genuinely
+sequential: generate an action, observe the result, condition on it, generate the next action. A
+single arithmetic question answered with a calculator is the trivial case; the same structure extends
+to a model that searches, reads what it finds, refines its query, and only then answers. The reward
+still reduces to a scalar at the end, but the path to that scalar now runs through a series of
+decisions, each of which depends on what the environment said in response to the last.
+
+<SFTvsRLSkillComparison />
+
+Step back and the recipe is uniform. Every one of these capabilities is the same algorithm —
+policy-gradient optimization — pointed at a different `score` function: an answer key for reasoning, a
+test suite for code, a proof kernel for math, an environment for tools. The capability you get out is
+determined almost entirely by the reward you put in, which is why "what can RL teach a model" is
+really the question "what can you write a faithful scorer for." And faithful is the load-bearing
+word. A test suite with a gap, an answer key that accepts the right number for the wrong reason, a
+proof obligation that is weaker than the theorem you meant — each is a door the policy will walk
+through, and you are back to Goodhart, only now it is your scorer rather than your intentions that the
+model is optimizing.
+
+Every example so far has been single-agent and, in spirit, single-turn: one rollout, one reward, one
+gradient step. Even tool use, which strings several actions together, has been a short detour on the
+way to a single terminal score. The real frontier is what happens when the task is long — when a
+trajectory is twenty steps deep, the reward arrives only at the very end, and the model has to make
+decisions whose consequences it will not see for many actions. That is the agentic regime, and it is
+where the next part of this series goes.

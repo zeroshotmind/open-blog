@@ -1,0 +1,174 @@
+---
+title: "RL for Agentic Systems"
+slug: "rl-for-llms-agentic-systems"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "rl-for-llms"
+seriesOrder: 5
+tags: ["rl", "agents", "systems", "llm-training"]
+summary: "Single-turn RL teaches a model to produce good responses. Agentic RL teaches it to complete multi-step tasks in an environment — with delayed rewards, partial observability, and real consequences."
+authors:
+  - name: "Admin"
+    url: "https://zeroshotmind.com"
+    affiliation: "Independent"
+---
+
+A trajectory that ends in a single terminal reward is a comfortable fiction. RLHF trains on
+$(\text{prompt} \to \text{response})$ pairs: the model emits one block of text, a reward model scores
+it, and the gradient flows. The reward arrives exactly once, at a known position, attached to an
+output the model produced in one shot. But the tasks people actually want from a model — ship a
+feature, find an answer buried three clicks deep on the web, run an experiment and interpret the
+result — are not single emissions. They are sequences of actions whose consequences unfold over time,
+where the model must act, see what happened, and act again, and where success or failure is only
+legible at the end of a long chain. The moment you take that seriously, the single-turn picture stops
+being a simplification and starts being the wrong model of the problem.
+
+So the Markov decision process from earlier in this series comes back, and this time it is not a
+teaching device. The state is no longer a bare prompt; it is the whole evolving situation — the
+conversation so far, the outputs of every tool the agent has called, whatever it has chosen to write
+into its memory. The actions are tool calls and text emissions. The reward is sparse: nothing,
+nothing, nothing, and then a single bit at the end of a long trajectory saying the task completed or
+failed. The formal object is identical to the one we started with — a policy maximizing expected
+return — but every quantity in it has inflated, and one in particular becomes the central difficulty.
+
+That quantity is the return, and writing it out shows where the pain is. The value an agent is trying
+to maximize from step $t$ is the discounted sum of all future rewards along the trajectory.
+
+$$
+G_t = \sum_{k=0}^{T-t} \gamma^{k} \, r_{t+k}
+$$
+
+When every $r_{t+k}$ is zero except the last one, this equation is telling you something
+uncomfortable: the only signal in the entire trajectory is a single number at step $T$, and it must
+somehow be apportioned back across every action that led there. If a twenty-step run ends in failure,
+which action was the mistake? The return alone cannot say — it only knows the sum was bad. This is
+the credit assignment problem from Part 2, except the horizon is now long enough that it stops being a
+technicality and becomes the thing that determines whether training works at all.
+
+[Generalized Advantage Estimation](/papers/gae) is the standard tool for propagating that terminal
+signal backward, and with a discount $\gamma$ close to one it will, in principle, carry reward across
+many steps. In practice the signal attenuates: each step of bootstrapping injects a little more
+variance and a little more of the value function's own error, so by the time a sparse terminal reward
+has been pushed back fifteen actions, what reaches the early steps is faint and noisy. This is the
+mechanical reason dense intermediate rewards matter so much for agents. If the environment can say
+something at each step — this edit broke the build, this query returned nothing useful, this subgoal
+is now satisfied — the policy gets a gradient at every action instead of betting everything on one bit
+twenty steps away.
+
+Which is why so much of agentic RL is really the engineering of environments that *can* say something.
+These are the RL gyms for language agents — purpose-built worlds with real reward signals:
+
+- **WebArena** and **MiniWoB++** put the agent in a browser and reward it for actually completing a
+  task: was the form submitted, did the right page load, is the item in the cart.
+- **SWE-bench** hands the agent a real GitHub issue and a repository, and the reward is whether the
+  patch it produces makes the project's test suite pass — execution as ground truth, scaled up to a
+  whole codebase.
+- **ALFWorld** and **TextWorld** are embodied and game environments rendered as text, where the agent
+  navigates and manipulates a world through language and is rewarded for reaching goal states.
+
+The distinction these draw is sharp. A model trained with an outcome reward model on static, one-shot
+outputs has learned to produce text that *looks* like it solves the task. A model trained in a
+SWE-bench-style gym has learned to produce changes that *make the tests pass* — it has been
+optimized against the environment's actual verdict, across a sequence of actions, with the failures
+fed back in. Those are different capabilities wearing the same surface.
+
+None of this works without a structure for interleaving thought and action, and the canonical one is
+ReAct (Yao et al., 2022). Rather than emit a tool call blind, the model first writes a reasoning
+trace — a thought about what it knows and what to do next — then emits an action, then observes the
+result, then reasons again over the updated state. The reasoning is not decoration; it is what lets
+the policy condition each action on an explicit account of the situation, and it gives RL a richer
+intermediate structure to shape. (ReAct gets its own treatment in the [paper explainers](/papers).)
+
+<AgentLoopDemo />
+
+<ToolUseLatencyDemo />
+
+Once the unit of training is an agent acting in an environment, multiplying agents becomes the obvious
+next move. Debate pits two models against each other to argue opposite sides of a question and lets a
+judge decide, turning disagreement into a reward signal. Cooperative setups split a task — one model
+drafts, another critiques — and reward the pair on the joint result. Self-play is the most powerful of
+the three, because a model competing against a copy of itself manufactures its own curriculum: every
+improvement in one player raises the difficulty for the other, and the supply of training signal is
+effectively unlimited and needs no human labels. Where a static reward model eventually gets saturated
+or gamed, self-play keeps producing fresh, appropriately-hard problems for as long as you keep
+training.
+
+<AgentReliabilityDemo />
+
+## Why there is no backpropagation through the environment
+
+A natural question at this point is: if the agent is a PyTorch model, and PyTorch knows how to
+differentiate through sequences, why not just let gradients flow from the terminal reward all the way
+back through every action the model took? The answer is that the environment is not PyTorch. The chain
+of causality runs:
+
+$$
+\underbrace{\pi_\theta(\text{text})}_{\text{inside the model}} \xrightarrow{\text{tool call string}} \underbrace{\text{API / shell / browser}}_{\text{black box}} \xrightarrow{\text{string observation}} \text{next prompt}
+$$
+
+The model emits a string — say, `web_search("Tokyo population")`. That string leaves the computational
+graph entirely. It is decoded from token logits, handed to a Python function or an HTTP client, and
+whatever comes back is just another string that gets concatenated onto the context. There is no
+differentiable path through the web request, the code executor, or the file system. PyTorch's
+autograd has no way to build a graph through a network call, so it does not, and the gradient would
+silently be zero for everything before the environment boundary.
+
+The standard solution is to stop asking for that gradient and use a technique that never needed it.
+The policy gradient theorem says that even when the environment is a complete black box, you can
+estimate the gradient of expected reward by collecting complete trajectories and using only the parts
+of the graph you *do* have — the log-probabilities of the actions you chose inside the model:
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\!\left[ R(\tau) \cdot \sum_{t=1}^{T} \nabla_\theta \log \pi_\theta(a_t \mid s_t) \right]
+$$
+
+The key insight is that $\log \pi_\theta(a_t \mid s_t)$ is fully differentiable — it lives inside the
+language model's softmax and autograd can trace it all the way back to the weights. The reward $R(\tau)$
+is just a scalar that arrived from outside the graph; it is treated as a detached constant, equivalent
+to `.detach()` in PyTorch terms. So the backward pass never touches the environment at all. It runs
+entirely through the LLM, scaling each token's log-probability gradient by whatever reward the
+trajectory received.
+
+In practice, a training step for an agentic RL system looks like this:
+
+1. **Roll out a trajectory** — run the agent in the environment, letting it call tools, receive
+   observations, and continue until the task terminates or a step limit is hit. Every token
+   the model emits is sampled from $\pi_\theta$; its log-probability is stored but no gradient is
+   accumulated yet.
+2. **Score the trajectory** — a verifier, test suite, or reward model evaluates the final state and
+   returns a scalar $R(\tau)$. This is ordinary Python; no grad needed.
+3. **Compute the loss** — multiply $R(\tau)$ by the sum of negative log-probabilities (the REINFORCE
+   loss), or compute per-token advantages with GAE and apply the PPO/GRPO clipped objective. Either
+   way, the loss is a function only of quantities that live in the PyTorch graph.
+4. **Backward and step** — call `.backward()` on the loss. Gradients flow through the LLM's token
+   log-probabilities, skipping the environment entirely because it was never in the graph to begin
+   with.
+
+The elegance of the approach is that the environment's complexity does not affect the backward pass at
+all. A 100-step trajectory through a browser, a code executor, and a file system produces the same
+gradient computation as a 1-step bandit: one backward pass through the token log-probabilities,
+scaled by a scalar reward. What *does* change is variance — longer trajectories with sparse rewards
+produce noisier gradient estimates, which is exactly why the credit assignment discussion above
+matters. REINFORCE works in principle for any environment; making it work in practice at long horizons
+is the engineering challenge that GAE, dense intermediate rewards, and multi-agent curricula are all
+trying to solve.
+
+The honest close is that the hard parts are still hard. Sparse rewards make convergence slow, because
+most trajectories return nothing and the policy spends a great deal of exploration learning from
+silence. Partial observability — the agent never sees the full state, only what its tools have
+surfaced so far — turns the clean MDP into the much harder POMDP it always really was, and credit
+assignment degrades further when the agent cannot even be sure what state it was in. And safety stops
+being abstract: an agent optimizing a proxy reward in a real environment can take real actions with
+real consequences, so every gap in the reward that Part 4 warned about is now a gap with a side
+effect in the world.
+
+Which brings the series back to where it started, because the whole arc has been a single idea viewed
+at five magnifications. Supervised fine-tuning teaches imitation — copy the demonstrations.
+Single-turn RL teaches optimization — produce the output a reward prefers. Skill-specific RL teaches
+capabilities — point a faithful scorer at reasoning, code, or proof and let the policy climb. Agentic
+RL teaches sequential decision-making — act, observe, and act again toward a goal that only resolves
+at the end. Each step is the same mechanism the whole way down: a policy gradient pushing a model
+toward higher reward. What changes is never the engine. It is the richness of the problem you are
+willing to point it at.

@@ -1,0 +1,122 @@
+---
+title: "Inside the FFN: MoE, SwiGLU, and the Architectural Details That Scale"
+slug: "transformer-training-architecture-internals"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "transformer-training"
+seriesOrder: 6
+tags: ["transformers", "moe", "swiglu", "architecture", "llm-training"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "The FFN block consumes most of a transformer's parameters. The choices made there — activation function, gating, expert routing — account for much of the quality gap between model families."
+---
+
+Most of a transformer is not attention. The feed-forward network that follows each attention block — two
+linear projections with a nonlinearity between them — holds roughly two-thirds of the model's parameters,
+because its hidden dimension is conventionally expanded to four times the model dimension before being
+projected back down.
+
+$$
+\text{FFN}(x) = W_2\, \sigma(W_1 x)
+$$
+
+With $W_1$ mapping $d_\text{model}$ up to $4 d_\text{model}$ and $W_2$ mapping it back, this single block per
+layer dwarfs the attention projections in parameter count, which means the design decisions made here — what
+$\sigma$ is, whether there is a gate, whether there is one FFN or many — move more weight than anything in the
+attention stack. Everything that follows is about that block.
+
+## ReLU to GeLU to SwiGLU
+
+<ActivationFunctionEvolution />
+
+The activation $\sigma$ started as ReLU, which is piecewise linear and aggressively sparse — exactly half of
+its outputs are clamped to zero — and moved to GeLU, a smooth gating of the input by its own Gaussian CDF that
+trades the hard cutoff for a soft one and buys a small but consistent improvement on language tasks. The bigger
+jump came from adding a learned, input-dependent gate. SwiGLU splits the up-projection into two parallel maps,
+runs one through a Swish nonlinearity, and multiplies them elementwise.
+
+$$
+\text{SwiGLU}(x) = \big(\text{Swish}(x W_1)\big) \otimes (x V)
+$$
+
+The second branch $xV$ is a learned mask: where it is near zero it suppresses the corresponding activation of
+the first branch, and where it is large it passes it through, so the network learns per-coordinate which of its
+own hidden features deserve to survive. That extra expressivity is not free in parameters — SwiGLU has three
+weight matrices instead of two — so to hold the parameter budget fixed the hidden dimension is shrunk from
+$4 d_\text{model}$ to $\tfrac{8}{3} d_\text{model}$. Even at matched parameters it lands roughly a perplexity
+point ahead of GeLU, which is why LLaMA, PaLM, and most of the current generation use it.
+
+## Mixture of experts: decouple capacity from compute
+
+SwiGLU makes each FFN better; mixture-of-experts changes how many FFNs there are. Instead of one feed-forward
+block per layer, an MoE layer holds $E$ separate expert FFNs and a small router that, for each token, picks the
+top-$k$ experts to run and weights their outputs by the router's softmax scores.
+
+$$
+\text{MoE}(x) = \sum_{i \in \text{top-}k} g_i\, \text{FFN}_i(x)
+$$
+
+The point is that only $k$ of the $E$ experts run for any given token, so the compute per token scales with
+$k$ while the total parameter count — the model's capacity — scales with $E$. A model can carry the knowledge of
+sixty-four experts while paying the FLOPs of two, which is how MoE models reach hundreds of billions of total
+parameters while activating only a small slice on each forward pass.
+
+## Keeping the router honest
+
+<MoELoadBalancingDemo />
+
+The router, left alone, cheats. Early in training a few experts get slightly more traffic, those experts train
+faster, which makes the router prefer them more, and the whole thing collapses onto a handful of overworked
+experts while the rest sit idle. The standard correction is an auxiliary load-balancing loss that penalizes the
+product of how much traffic each expert gets and how confidently the router routes to it.
+
+$$
+\mathcal{L}_\text{aux} = \alpha \sum_{i=1}^{E} f_i\, p_i
+$$
+
+Here $f_i$ is the fraction of tokens dispatched to expert $i$ and $p_i$ is the mean router probability assigned
+to it, and minimizing their product pushes the distribution toward uniform — no expert can be both crowded and
+favored without paying for it. Even with this loss, the dispatch is implemented with a hard cap: each expert has
+a fixed buffer of $C$ token slots per batch, and tokens that overflow that buffer are dropped, skipping the expert
+and passing through the residual unchanged. The slack in that buffer is set by a capacity factor.
+
+$$
+C = \text{CF} \cdot \frac{\text{tokens per batch}}{E}
+$$
+
+A capacity factor of $1.0$ leaves no headroom, so any imbalance immediately drops tokens, while $1.25$ gives each
+expert 25% slack to absorb the lumpiness that the auxiliary loss cannot fully iron out — the trade is wasted
+compute on unused slots against dropped tokens that get no expert processing at all. DeepSeek-MoE pushes on the
+granularity instead: it uses many small experts rather than a few large ones, and reserves a subset as shared
+experts that every token passes through unconditionally, so the routed experts only have to capture what is
+genuinely token-specific rather than re-learning the common transformation each one needs.
+
+## Tying the ends together
+
+<WeightTyingDemo />
+
+One last parameter saving sits at the boundary of the model rather than inside it. The embedding matrix $W_e$ of
+shape $V \times d_\text{model}$ maps token ids into the model, and the unembedding matrix that produces logits maps
+$d_\text{model}$ back out to the vocabulary of size $V$ — and these two are transposes of the same kind of map, so
+they can share weights.
+
+$$
+W_u = W_e^\top
+$$
+
+Tying them removes an entire $V \times d_\text{model}$ matrix from the parameter count, which for a large vocabulary
+is far from negligible, and it reflects a genuine symmetry: the geometry that decides two tokens are similar on the
+way in is the same geometry that should make them competing predictions on the way out. GPT-2 ties these weights —
+its token embedding matrix is reused as the LM head — but the LLaMA models (1, 2, and 3) do not, using separate
+matrices for the input embeddings and the LM head.
+
+Across these six posts the recurring lesson is that none of these choices is decoration. Where you put the
+normalization layer ([Pre-LN](/papers/pre-ln) versus Post-LN, and [RMSNorm](/papers/rmsnorm) over LayerNorm), which
+optimizer drives the update, how the data is packed ([padding versus packing](/blog/padding-vs-packing)) and
+regularized ([dropout](/blog/dropout-in-llms)), how position is encoded, which attention variant holds the KV cache,
+and how the FFN is gated and routed — each one is a specific tradeoff between training stability, convergence speed,
+inference cost, and final quality, and each one took the field years of empirical work to settle into the defaults
+we now copy without thinking.

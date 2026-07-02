@@ -1,0 +1,134 @@
+---
+title: "Memory-Bound vs Compute-Bound: Where LLM Inference Really Spends Its Time"
+slug: "inference-memory-compute-bound"
+date: "2025-01-17"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "inference-systems"
+seriesOrder: 7
+tags: ["inference", "gpu", "roofline", "memory-bound", "compute-bound", "arithmetic-intensity", "performance"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "Every LLM operation is either limited by how fast you can move bytes or how fast you can multiply. The roofline model tells you which — and understanding it explains why decode is slow, why batching helps, why prefill is fast, and why Flash Attention exists."
+---
+
+When a language model generates a token, the GPU is either waiting for weights to arrive from memory or waiting for matrix multiplications to finish. These are different bottlenecks with different remedies, and mixing them up leads to optimizations that fix the wrong thing. The roofline model is the framework that separates the two — it tells you, for any given operation, which resource you've already saturated and which one still has room.
+
+## Two ceilings on every GPU
+
+A GPU has two fundamental limits. The first is **peak compute**: how many floating-point operations it can execute per second. For an H100 SXM5 in fp16 this is 989 TFLOP/s — nearly a quadrillion operations every second. The second is **memory bandwidth**: how fast bytes can move from HBM (the GPU's main memory) into the on-chip registers where arithmetic happens. On the H100 this is 3.35 TB/s.
+
+These two limits give you two candidate answers for how long an operation takes:
+
+$$
+T_{\text{compute}} = \frac{\text{FLOPs}}{\text{peak TFLOP/s}}, \qquad T_{\text{mem}} = \frac{\text{bytes}}{\text{bandwidth}}
+$$
+
+The actual time is whichever is larger — you have to finish both the arithmetic and the data movement, and you cannot overlap them once one is the limiting factor. The operation is:
+
+- **Memory-bound** if $T_{\text{mem}} > T_{\text{compute}}$ — bandwidth is the bottleneck, adding more cores doesn't help
+- **Compute-bound** if $T_{\text{compute}} > T_{\text{mem}}$ — arithmetic throughput is the bottleneck, you're getting good utilisation of the tensor cores
+
+## Arithmetic intensity is the single number that classifies every operation
+
+Rather than computing both times and comparing, it's more useful to collapse them into a single ratio. **Arithmetic intensity** (AI) is the number of floating-point operations performed per byte of memory accessed:
+
+$$
+I = \frac{\text{FLOPs}}{\text{bytes moved}}
+$$
+
+The **ridge point** — the intensity at which compute and bandwidth are exactly balanced — is:
+
+$$
+I^* = \frac{\text{peak TFLOP/s}}{\text{bandwidth TB/s}}
+$$
+
+For the H100: $I^* = 989 / 3.35 \approx 295\ \text{FLOP/byte}$. For the A100: $I^* = 312 / 2.0 = 156\ \text{FLOP/byte}$. Any workload below the ridge point is memory-bound regardless of how many tensor cores the GPU has. Any workload above it is compute-bound — you've saturated the arithmetic units.
+
+The roofline function gives the achievable throughput for any intensity $I$:
+
+$$
+\text{throughput}(I) = \min\!\left(I \cdot \text{BW},\ \text{peak}\right)
+$$
+
+<RooflineExplainer />
+
+## Where LLM decode and prefill land
+
+The two main LLM operations have dramatically different arithmetic intensities, and that difference explains nearly everything about inference performance.
+
+**Decode (autoregressive generation)** processes one token at a time. For each token, the model loads every weight matrix from HBM — roughly $2P$ bytes for a $P$-parameter fp16 model — and performs $2P$ floating-point operations (one multiply-add per weight per token). The arithmetic intensity is:
+
+$$
+I_{\text{decode}} = \frac{2P \cdot B}{2P} = B
+$$
+
+where $B$ is the batch size. At batch size 1, intensity is **1 FLOP/byte** — three orders of magnitude below the H100 ridge point of 295. The GPU is loading weights at 3.35 TB/s and doing almost nothing with each byte it loads. Peak compute utilisation at bs=1 is under 0.5%.
+
+This is not an accident or a bug — it is the fundamental structure of autoregressive decoding. You cannot batch across positions because each token's key and value depend on all previous tokens in that sequence.
+
+**Prefill (prompt processing)** processes all $n$ prompt tokens simultaneously. The same weight matrices are loaded, but now each byte of weight is multiplied against $n$ tokens at once, giving:
+
+$$
+I_{\text{prefill}} \approx n \quad (\text{for large } n)
+$$
+
+For a 2048-token prompt, intensity is ~2048 FLOP/byte — well above the ridge point, firmly compute-bound. Tensor cores are running hot and memory bandwidth has spare capacity. This is why prefill is fast relative to how much work it does.
+
+<LLMOperationIntensity />
+
+## Why batching shifts the operating point
+
+The one lever you can pull on decode to increase arithmetic intensity is **batch size**. If you process $B$ sequences simultaneously, each load of a weight matrix is shared across $B$ tokens, so intensity scales linearly:
+
+$$
+I_{\text{decode, batch}} = B
+$$
+
+At $B = 1$, you're at 1 FLOP/byte. At $B = 32$, you're at 32 FLOP/byte. At $B = I^* \approx 295$ on H100, you cross the ridge point and start becoming compute-bound. Every token in the batch shares the weight load, so total latency per token drops linearly as long as you're below the ridge point — throughput scales at no extra cost.
+
+This is why serving systems target high batch sizes, why continuous batching exists (to keep the batch full even when sequences finish at different times), and why a single-user API that processes one request at a time leaves the GPU nearly idle regardless of how much compute it nominally has.
+
+<DecodeBatchRoofline />
+
+## The KV cache introduces a second memory term
+
+The analysis above treats weight loading as the only memory traffic, which is accurate for small batch sizes with short sequences. But as sequence length grows, the KV cache itself becomes significant. Each forward pass must load, for every attention layer, the cached keys and values for all prior tokens:
+
+$$
+\text{bytes}_{\text{KV}} = 2 \cdot L \cdot n \cdot d_h \cdot h_{kv} \cdot 2
+$$
+
+where the first factor of 2 is for keys and values, $L$ is the number of layers, $n$ is the number of cached tokens, $d_h$ is the head dimension, $h_{kv}$ is the number of KV heads, and the trailing 2 is for fp16. For Llama-3-70B with 8 GQA heads, $d_h = 128$, $L = 80$: a 32K-token context cache is $2 \times 80 \times 32768 \times 128 \times 8 \times 2 \approx 85\ \text{GB}$ — itself a memory bottleneck independent of weights.
+
+This is precisely the problem MLA (Multi-head Latent Attention in DeepSeek-V3) addresses. Instead of caching full key and value tensors per head, MLA caches a compressed latent vector of dimension 512 and decompresses it on the fly. A 512-dim latent per layer vs $h_{kv} \times d_h = 8 \times 128 = 1024$ dims per layer (for GQA) — or $32 \times 128 = 4096$ dims for standard MHA — means the KV cache contribution to memory traffic shrinks by the same factor, directly improving the arithmetic intensity of long-context decode.
+
+## Flash Attention: reordering to escape memory bound
+
+Flash Attention is the clearest example of reordering computation to move a previously memory-bound operation above the ridge point. Standard attention computes:
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_h}}\right) V
+$$
+
+Naively, this materialises the full $n \times n$ attention matrix in HBM, reads it back, applies softmax, then multiplies by $V$ — three HBM round-trips for a matrix whose size grows quadratically with $n$. At $n = 8192$, $d_h = 128$, the attention matrix is $8192^2 \times 4\ \text{bytes} \approx 268\ \text{MB}$ per head per layer.
+
+Flash Attention tiles $Q$, $K$, and $V$ so that each tile fits in SRAM (the GPU's on-chip scratchpad, equivalent to L1/L2 cache but much faster). Within a tile, the entire $\text{softmax}(QK^\top)V$ computation runs in SRAM at register speed — bytes are not re-read from HBM between the matrix multiply and the softmax. The tile is read once from HBM, processed completely, and the result written back once. Total HBM traffic drops from $O(n^2)$ to $O(n)$ in the sequence dimension.
+
+The arithmetic does not change — same FLOPs, same result — but the denominator of the intensity ratio changes: far fewer bytes moved per FLOP. An operation that was memory-bound under naive tiling becomes compute-bound under tiled execution, and the GPU runs at or near peak throughput rather than being throttled by HBM bandwidth.
+
+## Putting it together: what this means for system design
+
+Memory-bound and compute-bound operations call for different interventions:
+
+For **memory-bound decode**: the bottleneck is bytes per second, not arithmetic. Quantisation helps directly — reducing weight precision from fp16 to int8 halves the bytes loaded, doubling intensity and approximately halving latency at the same batch size. Adding more GPUs with tensor-parallel sharding also helps, because each GPU holds a shard of the weights and fetches proportionally fewer bytes, though the communication overhead eats some of the gain. Speculative decoding helps by verifying multiple draft tokens in a single parallel forward pass (essentially a batched prefill), amortising the weight load across more tokens.
+
+For **compute-bound prefill**: the bottleneck is arithmetic throughput. Quantisation helps less here — you load fewer bytes, but that's not the binding constraint; you'd need to reduce FLOPs to go faster, which means changing the algorithm (sparse attention, local window patterns) rather than the number format. Using a GPU with more tensor cores, or distributing the prefill across more GPUs with sequence-parallel attention, is the direct fix.
+
+For **memory-bound attention at long context**: Flash Attention is the right tool — it does not reduce FLOPs but dramatically reduces HBM traffic. For KV cache pressure specifically, GQA and MLA trade a small accuracy cost for large reductions in cache size.
+
+Understanding which bottleneck you're hitting before optimising is what separates effective inference engineering from random flag-twiddling. The roofline model is the diagnostic — a single division problem: compute the arithmetic intensity of your operation, divide peak TFLOP/s by bandwidth, and compare. Everything else follows from which side of the ridge you're on.
+
+The next post in this series covers speculative decoding — specifically how draft-and-verify changes the arithmetic intensity of decode, turning what would be sequential single-token steps into batched verification passes that spend more time on the compute side of the roofline.

@@ -1,0 +1,125 @@
+---
+title: "Loss Functions: What You Optimize Is What You Get"
+slug: "math-llm-loss-functions"
+date: "2024-06-19"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "math-for-llm-training"
+seriesOrder: 4
+tags: ["math", "loss-functions", "llm-training", "alignment"]
+authors:
+  - name: "Admin"
+    orcid: ""
+summary: "The loss function is the specification. Everything the model learns is in service of minimizing it. Here's the math behind every major loss used in LLM training and fine-tuning."
+---
+
+[Part 3](/blog/math-llm-optimization) showed how to descend a loss; this post is about what the loss should
+be, because the loss function is the only thing the optimizer ever sees — it is the complete specification
+of what the model will become. The canonical one, the pretraining objective, is cross-entropy: the negative
+log-probability the model assigns to each true next token, summed across the sequence.
+
+$$
+L_\text{CE} = -\sum_t \log p_\theta(x_t \mid x_{<t})
+$$
+
+<CrossEntropyExplorer />
+
+This is the same cross-entropy from [Part 2](/blog/math-llm-probability), and minimizing it is identical to
+maximizing the likelihood of the training data; the surprising empirical fact is that this single objective,
+applied at sufficient scale, is enough to produce models that generalize far beyond next-token prediction.
+
+How you aggregate that loss across positions is a quieter design choice with real consequences. $L_\text{CE}$
+is usually averaged over token positions, which means a long sequence and a short one contribute differently
+to the gradient — average within a sequence and a ten-token example and a thousand-token example each count
+once, but sum across tokens and the long example dominates by a hundred to one. Most implementations take a
+mean over tokens within each sequence and then a mean over sequences, but the alternative of summing changes
+the effective learning rate as batch composition shifts, which is exactly the kind of subtle interaction
+that surfaces when [debugging a training run](/blog/transformer-training-debugging).
+
+Not every objective is over a vocabulary. For a binary decision — is this response good or bad? — the right
+loss is binary cross-entropy, the two-outcome special case of the same idea.
+
+$$
+L_\text{BCE} = -\big[ y \log p + (1 - y) \log(1 - p) \big]
+$$
+
+The reward model in RLHF is trained with a close relative of this, the Bradley–Terry model, which works on
+*pairs* rather than absolute labels: given a chosen and a rejected response it pushes the chosen one's score
+up and the rejected one's down through $L_\text{RM} = -\log \sigma\big(r(\text{chosen}) -
+r(\text{rejected})\big)$, learning a scalar reward purely from relative preferences.
+
+<BradleyTerryExplorer />
+
+When the target is a continuous vector rather than a label, the natural loss is mean squared error, which
+penalizes the squared distance between prediction and target.
+
+$$
+L_\text{MSE} = \frac{1}{n} \sum_i (y_i - \hat{y}_i)^2
+$$
+
+<MSEvsLossComparison />
+
+This is the loss behind diffusion models, where the network predicts the noise added to an image,
+$L = \mathbb{E}\big[\lVert \epsilon - \epsilon_\theta(x_t, t) \rVert^2\big]$, and behind JEPA-style methods
+that regress predicted representations onto target representations; because the penalty grows
+quadratically, an error of two contributes four times as much as an error of one, so MSE leans hard on
+eliminating the largest mistakes.
+
+The KL divergence from [Part 2](/blog/math-llm-probability) is not only a way to measure distributions — it
+is itself used as a loss term, a leash that ties a policy to a reference.
+
+$$
+L_\text{KL} = \mathrm{KL}(\pi_\theta \,\Vert\, \pi_\text{ref}) = \mathbb{E}_{a \sim \pi_\theta}\!\left[ \log \frac{\pi_\theta(a)}{\pi_\text{ref}(a)} \right]
+$$
+
+<KLDivergenceExplorer />
+
+In RLHF the full PPO objective is the clipped policy term plus this penalty, $L = -L_\text{CLIP} + \beta \,
+\mathrm{KL}(\pi_\theta \,\Vert\, \pi_\text{ref})$, which keeps the fine-tuned model from wandering away from
+the supervised starting point; the same KL term reappears as the regularizer in a variational autoencoder,
+$L_\text{VAE} = L_\text{rec} + \beta \, \mathrm{KL}\big(q(z \mid x) \,\Vert\, p(z)\big)$, pulling the
+learned latent posterior toward a chosen prior.
+
+Self-supervised representation learning needs a different shape of loss entirely, one that has no labels and
+no targets, only the relation between examples. The contrastive NT-Xent loss does this by pulling matched
+pairs together and pushing everything else apart in representation space.
+
+$$
+L = -\log \frac{\exp\big(\mathrm{sim}(z_i, z_j) / \tau\big)}{\sum_k \exp\big(\mathrm{sim}(z_i, z_k) / \tau\big)}
+$$
+
+<ContrastiveLossExplorer />
+
+A positive pair — two augmented views of the same image — is the numerator, all the negatives fill the
+denominator, and the temperature $\tau$ controls how the negatives are weighted: a high temperature treats
+every negative roughly equally, while a low temperature lets the hardest negatives, the ones already most
+similar to the anchor, dominate the gradient and do most of the teaching.
+
+The most elegant recent loss collapses the entire reward-model-plus-PPO pipeline into a single supervised
+objective. Direct preference optimization shows that you can optimize a policy directly on preference pairs
+without ever training a separate reward model.
+
+$$
+L_\text{DPO} = -\mathbb{E}\!\left[ \log \sigma\!\left( \beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_\text{ref}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_\text{ref}(y_l \mid x)} \right) \right]
+$$
+
+<DPOLossExplorer />
+
+The derivation works because the optimal RLHF policy implies a unique reward function, and substituting that
+implied reward back into the Bradley–Terry objective turns the whole thing into this closed-form loss over
+preferred response $y_w$ and dispreferred response $y_l$ — same destination as PPO, none of the
+reinforcement-learning machinery.
+
+Across all of these there is a single warning worth stating directly, because it governs the entire
+practice of loss design. Any measurable proxy for what you actually want will, under enough optimization
+pressure, be driven to extremes that pull it apart from the true goal — this is Goodhart's law, and it is
+not a corner case but the default. Cross-entropy rewards text that *sounds* probable, not text that is true
+or helpful; a reward model's score gets hacked the moment the policy finds outputs it scores highly for the
+wrong reasons. The loss is a contract written in math, and the model will exploit every clause you did not
+mean to include, so the specification deserves at least as much care as the optimization.
+
+Loss functions say what the model should learn. They are silent on how its internals actually represent and
+transform information on the way to minimizing that loss — and the component that gives the network the
+expressive power to do so at all is the nonlinearity, which is where [Part
+5](/blog/math-llm-activation-functions) turns next.
