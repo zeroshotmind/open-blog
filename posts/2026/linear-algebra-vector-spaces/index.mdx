@@ -1,0 +1,125 @@
+---
+title: "Vector Spaces and Subspaces"
+slug: linear-algebra-vector-spaces
+date: "2026-07-02"
+contentType: article
+draft: false
+publishOnZeroShotMind: true
+series: linear-algebra
+seriesOrder: 8
+tags: ["linear-algebra", "vector-spaces", "subspaces", "basis", "dimension"]
+authors:
+  - zeroshotmind
+summary: "A vector space is any set where you can add elements and scale them — not just arrows in 2D. Polynomials, functions, and matrices all form vector spaces, and the same geometric intuition carries over."
+---
+import { SubspaceViz, ColumnNullspaceViz, RankNullityViz } from './LinearAlgebraVectorSpacesVisuals'
+
+The word "vector" conjures arrows in 2D or 3D space. But that intuition is too limiting. **Vector spaces** are an abstract framework that captures the essential algebraic structure—addition and scalar multiplication—shared by many different mathematical objects. Once you prove something about vector spaces in the abstract, it applies to all of them at once.
+
+## Definition: Vector Space
+
+A **vector space** over $\mathbb{R}$ is a set $V$ with two operations—vector addition $(u, v) \mapsto u + v$ and scalar multiplication $(\alpha, v) \mapsto \alpha v$—satisfying eight axioms:
+
+1. **Commutativity:** $u + v = v + u$
+2. **Associativity:** $(u + v) + w = u + (v + w)$
+3. **Zero vector:** there exists $\mathbf{0} \in V$ such that $v + \mathbf{0} = v$
+4. **Additive inverse:** for each $v$ there exists $-v$ such that $v + (-v) = \mathbf{0}$
+5. **Scalar distributivity:** $\alpha(u + v) = \alpha u + \alpha v$
+6. **Vector distributivity:** $(\alpha + \beta)v = \alpha v + \beta v$
+7. **Multiplicative identity:** $1 \cdot v = v$
+8. **Closure:** $u + v \in V$ and $\alpha v \in V$ for all $u, v \in V$, $\alpha \in \mathbb{R}$
+
+## Examples
+
+- $\mathbb{R}^n$: the standard example. Vectors are $n$-tuples of real numbers; operations are componentwise.
+
+- **Polynomials** $P_n(x)$: the set of polynomials of degree $\leq n$. Adding two polynomials of degree $\leq n$ gives another; scaling gives another. The zero vector is the zero polynomial.
+
+- **Continuous functions** $C[a,b]$: the set of continuous functions on $[a,b]$. Addition is pointwise: $(f+g)(x) = f(x)+g(x)$. This is an *infinite-dimensional* vector space.
+
+- **$m \times n$ matrices** $M_{m\times n}$: entry-wise addition and scalar multiplication make this a vector space of dimension $mn$.
+
+The beauty of abstraction: theorems about bases, dimension, and linear maps apply to all of these simultaneously.
+
+## Subspaces
+
+A **subspace** $W \subseteq V$ is a subset that is itself a vector space under the same operations. Equivalently, $W$ is a subspace if:
+
+1. $\mathbf{0} \in W$
+2. $u, v \in W \Rightarrow u + v \in W$ (closed under addition)
+3. $v \in W, \alpha \in \mathbb{R} \Rightarrow \alpha v \in W$ (closed under scalar multiplication)
+
+The zero vector requirement is actually implied by condition 3 (take $\alpha = 0$), but it's a useful quick check.
+
+**Example:** The set $W = \{(x, y) : y = 2x\}$ is a subspace of $\mathbb{R}^2$—it's a line through the origin. The set $\{(x,y): y = 2x + 1\}$ is *not* a subspace (it doesn't contain the origin, and the sum of two elements may not satisfy the equation).
+
+<SubspaceViz />
+
+## Column Space and Null Space
+
+For an $m \times n$ matrix $A$, two subspaces are fundamental:
+
+### Column Space
+
+The **column space** (or range) of $A$ is:
+$$
+\text{col}(A) = \{Ax : x \in \mathbb{R}^n\} = \text{span}\{a_1, a_2, \ldots, a_n\}
+$$
+
+where $a_1, \ldots, a_n$ are the columns of $A$. It lives in $\mathbb{R}^m$.
+
+The system $Ax = b$ has a solution *if and only if* $b \in \text{col}(A)$.
+
+### Null Space
+
+The **null space** (or kernel) of $A$ is:
+$$
+\text{null}(A) = \{x \in \mathbb{R}^n : Ax = \mathbf{0}\}
+$$
+
+It lives in $\mathbb{R}^n$. Verification that this is a subspace: if $Ax = 0$ and $Ay = 0$, then $A(x+y) = 0$ and $A(\alpha x) = 0$.
+
+The null space captures the "ambiguity" in $A$: if $x^*$ solves $Ax = b$, then $x^* + z$ for any $z \in \text{null}(A)$ also solves it.
+
+### Row Space
+
+The **row space** of $A$ is $\text{col}(A^T)$—the span of the rows of $A$, living in $\mathbb{R}^n$. Together with the null space, row space and null space are **orthogonal complements**: $\text{null}(A) \perp \text{row}(A)$, and $\text{null}(A) \oplus \text{row}(A) = \mathbb{R}^n$.
+
+<ColumnNullspaceViz />
+
+## Basis and Dimension
+
+A **basis** for a vector space $V$ is a set of vectors that is:
+1. **Linearly independent**: no vector is a linear combination of the others.
+2. **Spanning**: every vector in $V$ is a linear combination of the basis vectors.
+
+The number of vectors in any basis is always the same—this is the **dimension** of $V$, written $\dim V$.
+
+Examples:
+- $\mathbb{R}^n$ has dimension $n$; the standard basis is $e_1, \ldots, e_n$.
+- $P_n(x)$ has dimension $n+1$; basis $\{1, x, x^2, \ldots, x^n\}$.
+- $M_{m \times n}$ has dimension $mn$.
+- $C[a,b]$ is infinite-dimensional.
+
+The **rank** of $A$ is $\dim(\text{col}(A))$ = number of linearly independent columns = number of pivots in row echelon form.
+
+## The Rank-Nullity Theorem
+
+One of the most elegant results in linear algebra:
+
+$$
+\boxed{\text{rank}(A) + \text{nullity}(A) = n}
+$$
+
+where $n$ is the number of columns of $A$, $\text{rank}(A) = \dim(\text{col}(A))$, and $\text{nullity}(A) = \dim(\text{null}(A))$.
+
+**Intuition:** the $n$ "degrees of freedom" in $x \in \mathbb{R}^n$ split into two parts. The rank tells you how many dimensions of $x$ have an effect on $Ax$; the nullity tells you how many dimensions are "absorbed" (mapped to zero). They must sum to $n$.
+
+**Special cases:**
+- $A$ has full column rank ($r = n$): nullity is 0, $Ax = 0$ only has the trivial solution. Columns are linearly independent.
+- $A$ is a square $n \times n$ invertible matrix: rank $= n$, nullity $= 0$.
+- $A$ is $m \times n$ with $m < n$ (wide matrix): rank $\leq m < n$, so nullity $\geq n - m > 0$. Underdetermined systems always have non-trivial null spaces.
+
+<RankNullityViz />
+
+The rank-nullity theorem is a "conservation law" for dimensions, and it has far-reaching consequences across all of linear algebra.

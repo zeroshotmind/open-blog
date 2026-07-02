@@ -1,0 +1,117 @@
+---
+title: "Linear Systems and Least Squares"
+slug: linear-algebra-least-squares
+date: "2026-07-02"
+contentType: article
+draft: false
+publishOnZeroShotMind: true
+series: linear-algebra
+seriesOrder: 9
+tags: ["linear-algebra", "least-squares", "linear-regression", "normal-equations", "optimization"]
+authors:
+  - zeroshotmind
+summary: "When Ax = b has no exact solution — which is almost always in practice — the least squares solution minimizes ||Ax - b||². This is the foundation of linear regression and many optimization algorithms."
+---
+import { LeastSquaresViz, ProjectionLeastSquaresViz, NormalEquationsViz } from './LinearAlgebraLeastSquaresVisuals'
+
+Real data is never perfectly consistent. Sensors have noise, experiments have error, and systems of equations coming from data almost always have more equations than unknowns. When no exact solution exists, the right question changes: instead of "find $x$ such that $Ax = b$", we ask "find $x$ that comes as close as possible to satisfying $Ax = b$". This is **least squares**.
+
+## When Does Ax = b Have a Solution?
+
+The system $Ax = b$ (with $A \in \mathbb{R}^{m \times n}$) has a solution if and only if $b$ lies in the **column space** of $A$:
+
+$$
+b \in \text{col}(A) = \{Ax : x \in \mathbb{R}^n\}
+$$
+
+For an **overdetermined** system ($m > n$, more equations than unknowns), $\text{col}(A)$ is at most $n$-dimensional inside $\mathbb{R}^m$. A generic vector $b \in \mathbb{R}^m$ will not lie in this subspace, so no exact solution exists.
+
+**Example:** Fitting a line $y = \beta_0 + \beta_1 x$ through 100 data points. This gives 100 equations in 2 unknowns. Unless all 100 points lie exactly on a line (they won't), there is no exact solution.
+
+## Least Squares: Minimize the Residual
+
+Given no exact solution, we minimize the **residual norm**:
+
+$$
+\hat{x} = \underset{x}{\arg\min} \|Ax - b\|^2
+$$
+
+The squared norm is $\|Ax-b\|^2 = \sum_{i=1}^m (a_i^T x - b_i)^2$ — the sum of squared errors between the predictions $Ax$ and the targets $b$.
+
+<LeastSquaresViz />
+
+## Geometric View: Projection
+
+The key geometric insight: among all vectors of the form $Ax$ (which live in $\text{col}(A)$), the closest one to $b$ is the **orthogonal projection** of $b$ onto $\text{col}(A)$.
+
+Call this projection $A\hat{x}$. The **residual** $r = b - A\hat{x}$ must be perpendicular to $\text{col}(A)$:
+
+$$
+r \perp \text{col}(A) \iff A^T r = 0 \iff A^T(b - A\hat{x}) = 0
+$$
+
+<ProjectionLeastSquaresViz />
+
+## The Normal Equations
+
+Expanding $A^T(b - A\hat{x}) = 0$:
+
+$$
+A^T A \hat{x} = A^T b
+$$
+
+These are the **normal equations**. The matrix $A^T A$ is $n \times n$, symmetric, and positive semidefinite. When $A$ has full column rank ($\text{rank}(A) = n$), $A^T A$ is invertible and:
+
+$$
+\hat{x} = (A^T A)^{-1} A^T b
+$$
+
+The matrix $A^+ = (A^T A)^{-1} A^T$ is the **Moore-Penrose pseudoinverse** of $A$ (for full column rank $A$). The projection matrix onto $\text{col}(A)$ is:
+
+$$
+P = A(A^T A)^{-1} A^T
+$$
+
+Note: $P^2 = P$ (projecting twice is the same as projecting once) and $P^T = P$ (symmetric).
+
+## Linear Regression Connection
+
+In statistics and machine learning, linear regression is least squares in disguise. Given data $(x_1, y_1), \ldots, (x_m, y_m)$ with features $x_i \in \mathbb{R}^p$ and scalar responses $y_i$, define the **design matrix**:
+
+$$
+X = \begin{pmatrix} 1 & x_1^T \\ 1 & x_2^T \\ \vdots & \vdots \\ 1 & x_m^T \end{pmatrix} \in \mathbb{R}^{m \times (p+1)}
+$$
+
+The model is $y \approx X\beta$. The least squares estimate:
+
+$$
+\hat{\beta} = (X^T X)^{-1} X^T y
+$$
+
+is exactly the **ordinary least squares (OLS) estimator**. Under the Gauss-Markov theorem, it is the **best linear unbiased estimator (BLUE)** when the errors are uncorrelated and have equal variance.
+
+The prediction for a new point $x_{\text{new}}$ is $\hat{y} = x_{\text{new}}^T \hat{\beta}$.
+
+## Solving the Normal Equations in Practice
+
+Three main approaches:
+
+**1. Direct normal equations:** Compute $A^T A$ and solve via Cholesky (since $A^T A$ is positive definite). Fast but can be numerically unstable if $A$ is ill-conditioned ($\kappa(A^T A) = \kappa(A)^2$).
+
+**2. QR decomposition:** Write $A = QR$. Then $A^T A = R^T Q^T Q R = R^T R$, so the normal equations become $R^T R \hat{x} = R^T Q^T b$, simplifying to $R\hat{x} = Q^T b$—a triangular system. This is more numerically stable.
+
+**3. SVD:** $A = U\Sigma V^T$, so $\hat{x} = V\Sigma^+ U^T b$ where $\Sigma^+$ inverts the nonzero singular values. Most stable, and handles rank-deficient $A$ gracefully.
+
+<NormalEquationsViz />
+
+## Regularization
+
+When $A^T A$ is nearly singular (ill-conditioned), the least squares solution can be huge in magnitude and dominated by noise. **Tikhonov regularization** (ridge regression) modifies the objective:
+
+$$
+\hat{x}_\lambda = \underset{x}{\arg\min} \|Ax - b\|^2 + \lambda \|x\|^2
+$$
+
+Solution: $\hat{x}_\lambda = (A^T A + \lambda I)^{-1} A^T b$. The $\lambda I$ term makes $A^T A + \lambda I$ always invertible and well-conditioned. As $\lambda \to 0$, we recover the ordinary least squares solution; as $\lambda \to \infty$, $\hat{x}_\lambda \to 0$.
+
+Least squares is not just a linear algebra tool—it is the foundation of estimation theory, finite element methods, GPS triangulation, spectral analysis, and modern machine learning.

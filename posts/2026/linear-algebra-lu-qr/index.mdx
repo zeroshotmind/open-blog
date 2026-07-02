@@ -1,0 +1,153 @@
+---
+title: "Matrix Decompositions — LU and QR"
+slug: linear-algebra-lu-qr
+date: "2026-07-02"
+contentType: article
+draft: false
+publishOnZeroShotMind: true
+series: linear-algebra
+seriesOrder: 6
+tags: ["linear-algebra", "lu-decomposition", "qr-decomposition", "gram-schmidt", "numerical"]
+authors:
+  - zeroshotmind
+summary: "LU factorization is Gaussian elimination packaged as a matrix product. QR decomposition builds an orthogonal basis using Gram-Schmidt. Both are workhorses of numerical linear algebra."
+---
+import { GramSchmidtViz, LUStepsViz, QRGeometryViz } from './LinearAlgebraLUQRVisuals'
+
+Matrix decompositions are the cornerstone of numerical linear algebra. Rather than solving problems from scratch each time, we factor a matrix into simpler pieces and exploit those pieces repeatedly. Two of the most important decompositions are **LU** (lower-upper) and **QR**. LU is Gaussian elimination captured as a matrix product; QR builds an orthonormal basis via the Gram-Schmidt process.
+
+## Gaussian Elimination: A Quick Recap
+
+Given a system $Ax = b$, Gaussian elimination transforms the augmented matrix $[A \mid b]$ into row echelon form through a sequence of elementary row operations:
+
+1. **Swap** two rows.
+2. **Scale** a row by a non-zero constant.
+3. **Add** a multiple of one row to another.
+
+The goal is to produce an upper triangular matrix $U$, so that back-substitution solves the system. For a $3 \times 3$ example:
+
+$$
+A = \begin{pmatrix} 2 & 1 & 1 \\ 4 & 3 & 3 \\ 8 & 7 & 9 \end{pmatrix}
+$$
+
+We eliminate the entries below the first pivot (2). Row 2 becomes $R_2 - 2R_1$ and row 3 becomes $R_3 - 4R_1$:
+
+$$
+\begin{pmatrix} 2 & 1 & 1 \\ 0 & 1 & 1 \\ 0 & 3 & 5 \end{pmatrix}
+$$
+
+Then row 3 becomes $R_3 - 3R_2$:
+
+$$
+U = \begin{pmatrix} 2 & 1 & 1 \\ 0 & 1 & 1 \\ 0 & 0 & 2 \end{pmatrix}
+$$
+
+## LU Decomposition
+
+The key insight: the multipliers used in Gaussian elimination form the lower triangular matrix $L$. If $m_{ij}$ is the multiplier used to eliminate the entry in row $i$, column $j$ (i.e., we subtract $m_{ij}$ times row $j$ from row $i$), then:
+
+$$
+L = \begin{pmatrix} 1 & 0 & 0 \\ m_{21} & 1 & 0 \\ m_{31} & m_{32} & 1 \end{pmatrix}
+$$
+
+For our example, $m_{21} = 2$, $m_{31} = 4$, $m_{32} = 3$, giving:
+
+$$
+L = \begin{pmatrix} 1 & 0 & 0 \\ 2 & 1 & 0 \\ 4 & 3 & 1 \end{pmatrix}
+$$
+
+You can verify: $LU = A$. This is the **LU decomposition**: $A = LU$.
+
+### Why Bother?
+
+Once we have $A = LU$, solving $Ax = b$ splits into two triangular systems:
+
+$$
+Ly = b \quad \text{(forward substitution)}
+$$
+$$
+Ux = y \quad \text{(back substitution)}
+$$
+
+Each triangular solve costs $O(n^2)$ operations. More importantly, if we need to solve $Ax = b_1, Ax = b_2, \ldots, Ax = b_k$ for many right-hand sides, we factor $A$ once (at $O(n^3)$ cost) and then each additional $b$ costs only $O(n^2)$. This matters enormously in practice—think of finite element simulations where the stiffness matrix $A$ is fixed but loads $b$ change.
+
+In practice, **partial pivoting** (swapping rows to put the largest pivot on top) is added for numerical stability, giving $PA = LU$ where $P$ is a permutation matrix.
+
+<LUStepsViz />
+
+## The Gram-Schmidt Process
+
+To build the QR decomposition, we need a way to orthogonalize a set of linearly independent vectors. The **Gram-Schmidt process** does exactly this.
+
+Given vectors $v_1, v_2, \ldots, v_n$, we produce orthonormal vectors $q_1, q_2, \ldots, q_n$ spanning the same space.
+
+**Step 1:** Set $u_1 = v_1$. Normalize: $q_1 = u_1 / \|u_1\|$.
+
+**Step 2:** Subtract from $v_2$ its projection onto $q_1$:
+$$
+u_2 = v_2 - (v_2 \cdot q_1)\, q_1
+$$
+The term $(v_2 \cdot q_1)\, q_1$ is the **projection of $v_2$ onto $q_1$**. After subtraction, $u_2 \perp q_1$. Normalize: $q_2 = u_2 / \|u_2\|$.
+
+**Step 3:** Subtract from $v_3$ its projections onto $q_1$ and $q_2$:
+$$
+u_3 = v_3 - (v_3 \cdot q_1)\, q_1 - (v_3 \cdot q_2)\, q_2
+$$
+Normalize: $q_3 = u_3 / \|u_3\|$.
+
+**General formula:**
+$$
+u_k = v_k - \sum_{j=1}^{k-1} (v_k \cdot q_j)\, q_j, \qquad q_k = \frac{u_k}{\|u_k\|}
+$$
+
+The projection formula $\text{proj}_{q}(v) = (v \cdot q)\, q$ removes the component of $v$ in the direction of $q$, leaving the perpendicular remainder.
+
+<GramSchmidtViz />
+
+## QR Decomposition
+
+Expressing Gram-Schmidt as a matrix factorization: the original column vectors $a_1, \ldots, a_n$ can be written in terms of the orthonormal basis $q_1, \ldots, q_n$.
+
+Since $q_j$ are orthonormal, $a_k = \sum_{j=1}^{k} (a_k \cdot q_j)\, q_j$ (the sum only goes to $k$ because $a_k$ has no component beyond $q_k$ by construction). Writing this in matrix form:
+
+$$
+A = QR
+$$
+
+where $Q = [q_1 \mid q_2 \mid \cdots \mid q_n]$ is orthogonal ($Q^T Q = I$) and
+
+$$
+R = \begin{pmatrix} a_1 \cdot q_1 & a_2 \cdot q_1 & a_3 \cdot q_1 \\ 0 & a_2 \cdot q_2 & a_3 \cdot q_2 \\ 0 & 0 & a_3 \cdot q_3 \end{pmatrix}
+$$
+
+is upper triangular (with positive diagonal entries if the $a_j$ are linearly independent). The diagonal entries $r_{kk} = \|u_k\|$ are the lengths of the orthogonalized vectors.
+
+### Geometric Meaning
+
+- **$Q$** is a rotation (or reflection) matrix. Since $Q^T Q = I$, multiplication by $Q$ preserves lengths and angles. The columns of $Q$ form an orthonormal basis aligned with the column space of $A$.
+- **$R$** is upper triangular and encodes how the original columns relate to this orthonormal basis. The entry $r_{jk} = a_k \cdot q_j$ tells you how much of $q_j$ lives in column $k$ of $A$.
+
+### Applications
+
+QR decomposition has three major applications:
+
+1. **Solving least squares:** $Ax = b$ in the overdetermined case. Substituting $A = QR$: $\|Ax - b\|^2 = \|QRx - b\|^2 = \|Rx - Q^T b\|^2$ (since $Q$ is orthogonal). This reduces to a triangular solve.
+
+2. **Eigenvalue algorithms:** The QR algorithm iteratively applies QR decompositions to converge to the Schur form of a matrix—it's how eigenvalues are computed in practice.
+
+3. **Gram-Schmidt orthogonalization in machine learning:** Building orthonormal bases for iterative Krylov solvers (GMRES, Lanczos), which are used in large-scale optimization.
+
+<QRGeometryViz />
+
+## Comparison: LU vs QR
+
+| Property | LU | QR |
+|---|---|---|
+| Cost | $O(n^3)$ | $O(2n^3)$ (2× more expensive) |
+| Stability | Needs pivoting | Inherently stable |
+| Use case | Square systems $Ax = b$ | Least squares, eigenvalues |
+| $L$, $U$ structure | Triangular | Orthogonal + triangular |
+
+LU is faster for square systems with exact solutions. QR is preferred when numerical stability matters or for overdetermined systems. For very large or sparse matrices, iterative methods built on QR (like GMRES) dominate.
+
+Both decompositions are foundational: nearly every matrix computation you encounter in scientific computing, machine learning, and statistics rests on one of them.

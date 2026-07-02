@@ -1,0 +1,119 @@
+---
+title: "The Singular Value Decomposition"
+slug: linear-algebra-svd
+date: "2026-07-02"
+contentType: article
+draft: false
+publishOnZeroShotMind: true
+series: linear-algebra
+seriesOrder: 7
+tags: ["linear-algebra", "svd", "low-rank", "pca", "compression"]
+authors:
+  - zeroshotmind
+summary: "SVD is the most important matrix factorization in applied math. It decomposes any matrix into rotation, scaling, and rotation — and gives the best low-rank approximation of data."
+---
+import { SVDGeometryViz, LowRankApproxViz, SingularValueDecayViz } from './LinearAlgebraSVDVisuals'
+
+If you could only know one matrix decomposition, it should be the **Singular Value Decomposition (SVD)**. It works for *any* matrix—not just square ones—and underlies principal component analysis, image compression, recommendation systems, and the pseudoinverse. Understanding SVD is understanding the geometry of linear maps.
+
+## The Decomposition
+
+Every real $m \times n$ matrix $A$ can be written as:
+
+$$
+A = U \Sigma V^T
+$$
+
+where:
+- $U$ is an $m \times m$ orthogonal matrix ($U^T U = I$). Its columns $u_1, \ldots, u_m$ are the **left singular vectors**.
+- $\Sigma$ is an $m \times n$ diagonal matrix with non-negative entries $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_r > 0$ on the diagonal (and zeros elsewhere). These are the **singular values**.
+- $V$ is an $n \times n$ orthogonal matrix ($V^T V = I$). Its columns $v_1, \ldots, v_n$ are the **right singular vectors**.
+
+The rank of $A$ is $r$, the number of nonzero singular values.
+
+## Geometric Interpretation
+
+Every linear map $x \mapsto Ax$ decomposes into three steps:
+
+1. **Rotate** in the input space: apply $V^T$. This is a rotation (or reflection) of $\mathbb{R}^n$.
+2. **Scale** along coordinate axes: apply $\Sigma$. This stretches axis $i$ by factor $\sigma_i$ (and maps to $\mathbb{R}^m$).
+3. **Rotate** in the output space: apply $U$. Another rotation of $\mathbb{R}^m$.
+
+This gives a beautiful picture: the **unit sphere** in $\mathbb{R}^n$ maps to an **ellipsoid** in $\mathbb{R}^m$ under $A$. The semi-axes of the ellipsoid have lengths $\sigma_1, \sigma_2, \ldots, \sigma_r$, aligned with $u_1, u_2, \ldots, u_r$.
+
+To find singular values: compute $A^T A = V \Sigma^T \Sigma V^T$. The singular values are $\sigma_i = \sqrt{\lambda_i(A^T A)}$, i.e., square roots of eigenvalues of the symmetric positive semidefinite matrix $A^T A$.
+
+<SVDGeometryViz />
+
+## The Best Low-Rank Approximation
+
+An equivalent way to write SVD uses the **outer product form**:
+
+$$
+A = \sigma_1 u_1 v_1^T + \sigma_2 u_2 v_2^T + \cdots + \sigma_r u_r v_r^T
+$$
+
+Each term $\sigma_i u_i v_i^T$ is a rank-1 matrix. SVD decomposes $A$ into a sum of rank-1 matrices, sorted by importance (largest singular values first).
+
+The **rank-$k$ approximation** keeps only the top $k$ terms:
+
+$$
+A_k = \sum_{i=1}^k \sigma_i u_i v_i^T
+$$
+
+The **Eckart-Young theorem** states that $A_k$ is the *best* rank-$k$ approximation to $A$ in both the Frobenius norm and the spectral norm:
+
+$$
+\|A - A_k\|_F = \sqrt{\sigma_{k+1}^2 + \sigma_{k+2}^2 + \cdots + \sigma_r^2}
+$$
+
+No other rank-$k$ matrix is closer to $A$ in Frobenius norm. This is a profound result: it tells us that the singular vectors and values are the "right" coordinate system for understanding the structure of $A$.
+
+**Image compression example:** A grayscale image is a matrix of pixel values. Computing its SVD and keeping only the top $k$ singular triplets gives a compressed representation using $k(m + n + 1)$ numbers instead of $mn$. The compression ratio is $mn / (k(m+n+1))$, which can be enormous for small $k$.
+
+<LowRankApproxViz />
+
+## Connection to PCA
+
+Principal Component Analysis (PCA) on a data matrix $X$ (centered so columns have zero mean, shape $n \times p$ for $n$ samples and $p$ features) is exactly SVD.
+
+The covariance matrix is $C = \frac{1}{n-1} X^T X$. SVD of $X$ gives $X = U \Sigma V^T$, so:
+
+$$
+C = \frac{1}{n-1} V \Sigma^2 V^T
+$$
+
+The columns of $V$ (right singular vectors) are the **principal components**—the directions of maximum variance. The singular values tell us the variance explained: $\text{Var}_i = \sigma_i^2 / (n-1)$.
+
+The fraction of variance explained by the top $k$ components is:
+
+$$
+\frac{\sum_{i=1}^k \sigma_i^2}{\sum_{i=1}^r \sigma_i^2}
+$$
+
+A typical dataset has a **rapidly decaying** singular value spectrum—the first few components explain most of the variance. This is the reason PCA works: data often lives near a low-dimensional subspace, even if nominally high-dimensional.
+
+<SingularValueDecayViz />
+
+## The Pseudoinverse
+
+SVD gives a natural generalization of the matrix inverse. For any matrix $A = U \Sigma V^T$, the **Moore-Penrose pseudoinverse** is:
+
+$$
+A^+ = V \Sigma^+ U^T
+$$
+
+where $\Sigma^+$ replaces each nonzero $\sigma_i$ with $1/\sigma_i$ and leaves zeros in place.
+
+For full-rank square matrices, $A^+ = A^{-1}$. For overdetermined systems, $x^* = A^+ b$ gives the least squares solution. For underdetermined systems, it gives the minimum-norm solution.
+
+## Computing SVD
+
+In practice, SVD is computed via:
+
+1. Bidiagonalization using Householder reflectors ($O(mn^2)$ for $m \geq n$).
+2. QR iteration on the bidiagonal matrix to extract singular values.
+
+This is numerically stable and is the approach used by LAPACK (and thus NumPy, MATLAB, etc.). The full SVD costs $O(m n^2 + n^3)$; for large matrices, **truncated SVD** (computing only the top $k$ singular triplets) via Krylov methods costs $O(mnk)$, which is far more practical.
+
+SVD is not just a theoretical tool—it is computed millions of times daily, powering everything from web search to genome analysis to neural network training.
