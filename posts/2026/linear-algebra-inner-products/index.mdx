@@ -1,0 +1,145 @@
+---
+title: "Inner Products and Cosine Similarity"
+description: "What does it mean for two vectors to be similar? Inner products measure alignment — and cosine similarity is just normalized dot product."
+date: "2026-07-02"
+series: "linear-algebra"
+seriesOrder: 2
+tags: ["linear-algebra", "vectors", "inner-product", "cosine-similarity", "geometry"]
+publishOnZeroShotMind: true
+---
+
+import { DotProductViz, ProjectionViz, CosineSimilarityViz } from './LinearAlgebraInnerProductsVisuals'
+
+In the last post, we saw that word embeddings like "king" and "queen" live in a high-dimensional vector space, and that you could measure their distance. But practitioners don't usually ask *how far apart* two embeddings are. They ask *how similar* they are — which is a different question. Two vectors can be far apart in Euclidean distance simply because one has a larger magnitude. Frequency effects, for instance, can push a word's embedding vector to be much longer than another's, even if the two words are conceptually close.
+
+What we actually care about is the **angle** between the vectors. Two embeddings that point in nearly the same direction are semantically similar, regardless of how long they are. The tool for measuring angles between vectors is the **inner product** — and the normalized version is cosine similarity.
+
+## The Dot Product
+
+The **dot product** (also called the standard inner product on $\mathbb{R}^n$) of two vectors $\mathbf{a} = [a_1, a_2, \ldots, a_n]$ and $\mathbf{b} = [b_1, b_2, \ldots, b_n]$ is:
+
+$$\mathbf{a} \cdot \mathbf{b} = \sum_{i=1}^{n} a_i b_i = a_1 b_1 + a_2 b_2 + \cdots + a_n b_n$$
+
+That is the algebraic definition — multiply corresponding components, sum the results. For $\mathbf{a} = [3, 1]$ and $\mathbf{b} = [2, 4]$:
+
+$$\mathbf{a} \cdot \mathbf{b} = 3 \cdot 2 + 1 \cdot 4 = 6 + 4 = 10$$
+
+A single number comes out. That number encodes something about the relationship between the two vectors — but what, exactly?
+
+## The Geometric View
+
+Here is the more revealing formula. For any two vectors in $\mathbb{R}^n$:
+
+$$\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\| \, \|\mathbf{b}\| \cos\theta$$
+
+where $\theta$ is the angle between $\mathbf{a}$ and $\mathbf{b}$, and $\|\cdot\|$ denotes the Euclidean (L2) norm. This is the **geometric interpretation** of the dot product. It says the dot product is large and positive when the vectors are long and point in the same direction, large and negative when they point in opposite directions, and exactly zero when they are perpendicular.
+
+The two formulas are equivalent — they compute the same thing. The algebraic formula is what you type into code. The geometric formula is what you should picture in your head.
+
+<DotProductViz />
+
+Drag the vector tips and watch how the dot product value tracks the geometry. When $\theta < 90°$ the dot product is positive (green). When $\theta > 90°$ it is negative (red). At exactly $90°$ it is zero (gray) — the vectors are **orthogonal**.
+
+## Why the Two Formulas Agree
+
+It is worth seeing once why $\sum a_i b_i = \|\mathbf{a}\| \|\mathbf{b}\| \cos\theta$. The standard route is through the **law of cosines**. Consider the triangle formed by $\mathbf{a}$, $\mathbf{b}$, and $\mathbf{a} - \mathbf{b}$. The law of cosines says:
+
+$$\|\mathbf{a} - \mathbf{b}\|^2 = \|\mathbf{a}\|^2 + \|\mathbf{b}\|^2 - 2\|\mathbf{a}\|\|\mathbf{b}\|\cos\theta$$
+
+Expanding the left side algebraically:
+
+$$\|\mathbf{a} - \mathbf{b}\|^2 = \sum_i (a_i - b_i)^2 = \sum_i a_i^2 - 2\sum_i a_i b_i + \sum_i b_i^2 = \|\mathbf{a}\|^2 - 2(\mathbf{a} \cdot \mathbf{b}) + \|\mathbf{b}\|^2$$
+
+Setting the two expressions equal and cancelling $\|\mathbf{a}\|^2 + \|\mathbf{b}\|^2$ from both sides:
+
+$$-2(\mathbf{a} \cdot \mathbf{b}) = -2\|\mathbf{a}\|\|\mathbf{b}\|\cos\theta$$
+
+$$\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\|\|\mathbf{b}\|\cos\theta \quad \checkmark$$
+
+The algebra and the geometry are the same thing, as they must be.
+
+## Orthogonality
+
+Two vectors are **orthogonal** if their dot product is zero:
+
+$$\mathbf{a} \cdot \mathbf{b} = 0 \iff \mathbf{a} \perp \mathbf{b}$$
+
+From the geometric formula, $\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\|\|\mathbf{b}\|\cos 90° = 0$. So the algebraic condition $\sum a_i b_i = 0$ is exactly the condition that the two vectors are geometrically perpendicular.
+
+Orthogonality shows up everywhere in machine learning. Gradient descent works best when the gradient direction is roughly orthogonal to the level sets of the loss. In attention mechanisms, queries and keys that are orthogonal produce near-zero attention weights — they do not interact. In PCA, the principal components are orthogonal by construction, so each component captures variance that the others miss entirely.
+
+## Projections
+
+One of the most useful applications of the dot product is **projection**: finding the component of $\mathbf{b}$ that lies along the direction of $\mathbf{a}$.
+
+Geometrically, the projection of $\mathbf{b}$ onto $\mathbf{a}$ is the shadow you would get if you shone a light perpendicular to $\mathbf{a}$ and cast the shadow of $\mathbf{b}$ onto the line through $\mathbf{a}$.
+
+The **scalar projection** (the signed length of the shadow) is:
+
+$$\text{comp}_\mathbf{a}(\mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{a}\|}$$
+
+The **vector projection** (the actual shadow, as a vector) is:
+
+$$\text{proj}_\mathbf{a}(\mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{\mathbf{a} \cdot \mathbf{a}} \, \mathbf{a}$$
+
+Note that $\mathbf{a} \cdot \mathbf{a} = \|\mathbf{a}\|^2$, so dividing by $\mathbf{a} \cdot \mathbf{a}$ normalizes $\mathbf{a}$ without explicitly computing a square root. The formula says: find the scalar multiple of $\mathbf{a}$ that brings you as close as possible to $\mathbf{b}$. The remainder — $\mathbf{b} - \text{proj}_\mathbf{a}(\mathbf{b})$ — is perpendicular to $\mathbf{a}$ by construction.
+
+<ProjectionViz />
+
+Drag $\mathbf{b}$ and watch the green projection vector (its shadow onto $\mathbf{a}$) and the gray perpendicular drop. When $\mathbf{b}$ is directly above the line of $\mathbf{a}$, the projection is longest. When $\mathbf{b}$ is orthogonal to $\mathbf{a}$, the projection collapses to zero.
+
+Projections are the core operation in **Gram-Schmidt orthogonalization** (decomposing a set of vectors into orthogonal components), **least squares regression** (projecting the target vector onto the column space of the design matrix), and the **change of basis** that makes PCA work.
+
+## Cosine Similarity
+
+Now we have all the pieces. From the geometric dot product formula:
+
+$$\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\| \, \|\mathbf{b}\| \cos\theta$$
+
+Divide both sides by $\|\mathbf{a}\| \|\mathbf{b}\|$:
+
+$$\cos\theta = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{a}\| \, \|\mathbf{b}\|}$$
+
+This is **cosine similarity**. It lives in $[-1, 1]$:
+
+- $\cos\theta = 1$: vectors point in exactly the same direction (parallel, perfectly similar)
+- $\cos\theta = 0$: vectors are orthogonal (no similarity in the directional sense)
+- $\cos\theta = -1$: vectors point in exactly opposite directions (anti-parallel)
+
+Why divide by the magnitudes? Because we want to measure *direction*, not *length*. Two vectors can be aligned ($\cos\theta = 1$) whether they are short or long. Dividing by the magnitudes is equivalent to first normalizing both vectors to unit length — computing $\hat{\mathbf{a}} = \mathbf{a} / \|\mathbf{a}\|$ and $\hat{\mathbf{b}} = \mathbf{b} / \|\mathbf{b}\|$ — and then taking their dot product:
+
+$$\cos\theta = \hat{\mathbf{a}} \cdot \hat{\mathbf{b}}$$
+
+Cosine similarity is just the dot product of unit vectors. The dashed arrows in the visualization below show these unit versions.
+
+<CosineSimilarityViz />
+
+Try the presets — "Parallel," "Orthogonal," "Opposite," "45°" — to see the extremes of cosine similarity. Then drag freely. Notice that vectors with very different magnitudes can have cosine similarity close to 1 as long as they point in the same direction.
+
+## The Word Embedding Example, Revisited
+
+Back to language models. If "king" is embedded at $\mathbf{k}$ and "queen" at $\mathbf{q}$, the model has learned that these words appear in similar contexts — surrounded by similar words, filling similar roles in sentences. That shared contextual behavior gets encoded as directional similarity: $\mathbf{k}$ and $\mathbf{q}$ end up pointing in roughly the same region of the embedding space, so $\cos(\mathbf{k}, \mathbf{q})$ is high.
+
+The famous word analogy $\text{king} - \text{man} + \text{woman} \approx \text{queen}$ is a statement about vector arithmetic: you can add and subtract direction vectors and land near another word's embedding. That arithmetic works *because* the geometry of the embedding space is coherent, and cosine similarity is the right way to check where you landed.
+
+Cosine similarity also drives **document retrieval**. A query like "machine learning tutorial" gets embedded into the same vector space as a library of documents. The retrieved documents are those with the highest cosine similarity to the query — those that point in the most similar direction, regardless of document length. A short abstract and a long textbook chapter can both be highly similar to the query if they are about the same topic.
+
+## The General Inner Product
+
+The dot product is one inner product, but not the only one. In general, an **inner product** on a vector space is any function $\langle \cdot, \cdot \rangle$ satisfying three axioms:
+
+1. **Symmetry**: $\langle \mathbf{u}, \mathbf{v} \rangle = \langle \mathbf{v}, \mathbf{u} \rangle$
+2. **Linearity in the first argument**: $\langle \alpha \mathbf{u} + \beta \mathbf{v}, \mathbf{w} \rangle = \alpha \langle \mathbf{u}, \mathbf{w} \rangle + \beta \langle \mathbf{v}, \mathbf{w} \rangle$
+3. **Positive-definiteness**: $\langle \mathbf{v}, \mathbf{v} \rangle \geq 0$, with equality only when $\mathbf{v} = \mathbf{0}$
+
+The standard dot product satisfies all three — symmetry is obvious from $\sum a_i b_i = \sum b_i a_i$; linearity follows from the distributive property of multiplication; positive-definiteness holds because $\sum v_i^2 \geq 0$.
+
+But so does, for example, the **weighted dot product** $\langle \mathbf{a}, \mathbf{b} \rangle_W = \mathbf{a}^\top W \mathbf{b}$ for any positive definite matrix $W$. This shows up in the attention mechanism of transformers: the dot product $\mathbf{q}^\top \mathbf{k}$ between query and key vectors is precisely a dot product, but the learned weight matrices $W_Q$ and $W_K$ mean the model is effectively using a learned inner product to decide which tokens should attend to which.
+
+These axioms also define what it means for an inner product to give you a meaningful notion of angle and orthogonality in any vector space — not just $\mathbb{R}^n$, but also spaces of functions, matrices, or probability distributions. The full theory of **Hilbert spaces** generalizes this to infinite-dimensional settings, where the inner product axioms are the essential structure that makes analysis possible.
+
+## Wrapping Up
+
+The dot product connects two views of the same operation: multiply and sum coordinates, or measure how much two vectors align. Cosine similarity normalizes that alignment to $[-1, 1]$ by stripping out magnitude — it is the dot product of unit vectors, measuring pure direction. And the three inner product axioms abstract both into a general framework that will reappear whenever we need to measure angles in a vector space.
+
+In the next post, we will look at **matrices** — what they are geometrically (linear transformations that stretch, rotate, and project vectors), and how they compose. The dot product will be the key ingredient: a matrix–vector product is just a collection of dot products stacked together.
