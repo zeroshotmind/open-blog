@@ -1,0 +1,157 @@
+---
+title: "Putting It All Together — From Vectors to Transformers"
+slug: "linear-algebra-putting-together"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 13
+tags: ["linear-algebra", "transformers", "pca", "svd", "review", "ml-foundations"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "A tour through the whole series: how vectors, matrices, eigendecomposition, SVD, and least squares combine to explain the mathematical machinery inside modern ML systems — from PCA to attention to gradient descent."
+---
+
+import { MLPipelineViz, ConceptMapViz, ReviewQuizViz } from './LinearAlgebraSynthesisVisuals'
+
+This is the final post in the series. No new math — just synthesis. We'll walk through a complete story from raw data to transformer, with each step grounded in the concepts we've built.
+
+---
+
+## 1. Data Lives in a Vector Space
+
+Every piece of data is a vector. An image with $28 \times 28$ pixels is a vector in $\mathbb{R}^{784}$. A sentence tokenized into $n$ tokens is a sequence of vectors in $\mathbb{R}^d$ (one per token, after embedding).
+
+In [Post 1](/posts/linear-algebra-vectors) we defined vectors, their geometry, and what it means to add them and scale them. In [Post 2](/posts/linear-algebra-vector-spaces) we saw that vector spaces are the natural habitat for data — closed under addition and scaling, spanned by a basis.
+
+The key insight: **the dimension of the space is the number of features**. Working in $\mathbb{R}^{784}$ is conceptually the same as working in $\mathbb{R}^3$ — just with more axes.
+
+---
+
+## 2. Linear Maps Transform the Space
+
+A matrix $W \in \mathbb{R}^{m \times n}$ is a **linear map** from $\mathbb{R}^n$ to $\mathbb{R}^m$. It stretches, rotates, and projects.
+
+In [Post 3](/posts/linear-algebra-matrices) we studied how matrices compose (multiply), what the rank says about a matrix's image, and how to think of column space and null space geometrically.
+
+In [Post 4](/posts/linear-algebra-inner-products) we added the inner product — a way to measure angles and lengths in vector spaces. The inner product $\mathbf{u} \cdot \mathbf{v} = \|\mathbf{u}\| \|\mathbf{v}\| \cos\theta$ lets us define **similarity** as cosine of angle, which is the foundation of attention.
+
+---
+
+## 3. Eigendecomposition: Finding the Natural Axes
+
+Given a matrix $A$, its eigenvectors $\mathbf{q}_i$ are the directions $A$ only scales — not rotates:
+
+$$A\mathbf{q}_i = \lambda_i \mathbf{q}_i$$
+
+For **symmetric** matrices (covariance matrices, graph Laplacians, Hessians), the spectral theorem ([Post 10](/posts/linear-algebra-spectral-theorem)) guarantees:
+
+$$A = Q \Lambda Q^\top$$
+
+with orthogonal $Q$ and real $\Lambda$. The eigenvectors are the **natural coordinate system** of the transformation.
+
+**PCA** is the canonical application. The covariance matrix $C = \frac{1}{n} X^\top X$ is symmetric PSD. Its eigenvectors (principal components) are the directions of maximum variance. Project data onto the top-$k$ eigenvectors to reduce dimensionality while preserving maximum information.
+
+---
+
+## 4. SVD: Eigendecomposition for Non-Square Matrices
+
+Most data matrices are non-square ($m$ samples, $n$ features, rarely $m = n$). The SVD from [Post 9](/posts/linear-algebra-svd) generalizes eigendecomposition:
+
+$$X = U \Sigma V^\top$$
+
+- $V$ columns: directions in **feature space** (right singular vectors = principal components)
+- $\Sigma$ diagonal: singular values = $\sqrt{\text{eigenvalues of } X^\top X}$
+- $U$ columns: directions in **sample space**
+
+SVD gives us:
+- **Low-rank approximation**: keep top-$k$ singular values → compress the matrix
+- **Pseudoinverse**: $X^+ = V \Sigma^+ U^\top$ → solve least-squares even when $X$ is singular
+- **LoRA**: fine-tune only a low-rank delta $W = W_0 + AB$
+
+---
+
+## 5. Solving Systems: Least Squares and Normal Equations
+
+When we train a linear model, we minimize $\|X\mathbf{w} - \mathbf{y}\|^2$. The solution is the **normal equations** ([Post 8](/posts/linear-algebra-least-squares)):
+
+$$X^\top X \mathbf{w} = X^\top \mathbf{y}$$
+
+The matrix $X^\top X$ is symmetric positive semidefinite. If it's invertible (positive definite), the unique solution is:
+
+$$\mathbf{w}^* = (X^\top X)^{-1} X^\top \mathbf{y} = X^+ \mathbf{y}$$
+
+We covered the factorizations that make this numerically tractable in [Post 7](/posts/linear-algebra-lu-qr): LU for general systems, QR for least squares (more stable), Cholesky ([Post 11](/posts/linear-algebra-positive-definite)) for PD systems.
+
+---
+
+## 6. Neural Networks: Composing Linear Maps with Nonlinearities
+
+A neural network layer is $\mathbf{y} = \sigma(W\mathbf{x} + \mathbf{b})$ where $\sigma$ is a nonlinearity.
+
+As we showed in [Post 12](/posts/linear-algebra-neural-networks):
+- Without nonlinearities, deep networks collapse to one linear map
+- Backpropagation is the chain rule applied to matrix operations: gradients flow through $W^\top$
+- The Hessian being positive definite ([Post 11](/posts/linear-algebra-positive-definite)) guarantees a unique minimum
+
+**Attention** in transformers is:
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V$$
+
+$QK^\top$ is a matrix of inner products — measuring similarity between queries and keys. Softmax turns it row-stochastic. The output is a weighted sum of value vectors. Pure linear algebra, with softmax as the only nonlinearity.
+
+---
+
+## 7. The Full ML Pipeline
+
+<MLPipelineViz />
+
+| Step | Math | Post |
+|---|---|---|
+| Raw data | Vectors in $\mathbb{R}^n$ | [1](/posts/linear-algebra-vectors), [2](/posts/linear-algebra-vector-spaces) |
+| Preprocessing | Linear maps, projections | [3](/posts/linear-algebra-matrices), [4](/posts/linear-algebra-inner-products) |
+| Dimensionality reduction | PCA = SVD of covariance | [5](/posts/linear-algebra-eigenvalues), [9](/posts/linear-algebra-svd) |
+| Linear model training | Least squares, normal equations | [8](/posts/linear-algebra-least-squares) |
+| Deep learning forward pass | Matrix multiplications + nonlinearities | [12](/posts/linear-algebra-neural-networks) |
+| Attention mechanism | Inner products + softmax | [12](/posts/linear-algebra-neural-networks) |
+| Fine-tuning (LoRA) | Low-rank matrix decomposition | [9](/posts/linear-algebra-svd), [12](/posts/linear-algebra-neural-networks) |
+| Optimization (Newton) | Hessian = PD matrix → unique min | [11](/posts/linear-algebra-positive-definite) |
+
+---
+
+## Concept Map
+
+<ConceptMapViz />
+
+---
+
+## Quick Review Quiz
+
+Test yourself on the key ideas from the series:
+
+<ReviewQuizViz />
+
+---
+
+## Where to Go Next
+
+You now have a working foundation in the linear algebra that underlies modern ML. Here are natural next steps:
+
+**Differential equations** — Many dynamical systems (RNNs, differential transformers, physics-informed networks) are governed by ODEs/PDEs. The eigenvalues of the system matrix determine stability. Highly recommended: Strang's *Differential Equations and Linear Algebra*.
+
+**Fourier analysis** — The discrete Fourier transform (DFT) is a linear transformation: $\hat{\mathbf{x}} = F\mathbf{x}$ where $F$ is a unitary matrix (orthogonal over $\mathbb{C}$). Convolution in the spatial domain = element-wise multiplication in the Fourier domain. CNNs are intimately related.
+
+**Probability and statistics** — The multivariate Gaussian distribution is entirely described by its mean vector and covariance matrix (symmetric PSD). Maximum likelihood estimation leads to least squares. Bayesian inference involves PD matrices everywhere.
+
+**Numerical linear algebra** — How do you actually compute eigenvalues for a $10^6 \times 10^6$ matrix? Power iteration, Lanczos, randomized SVD. The algorithms matter enormously at scale.
+
+**Convex optimization** — Gradient descent, Newton's method, proximal methods — all build on the linear algebra of Hessians, gradients (vectors), and constraint matrices. Boyd & Vandenberghe's *Convex Optimization* is the standard reference.
+
+---
+
+## Closing Thought
+
+Linear algebra is the operating system of machine learning. Every tensor operation, every gradient update, every attention pattern is a linear algebraic object. Understanding *what the matrices are doing* — geometrically, not just numerically — is what separates someone who can train models from someone who can design them.
+
+Thanks for following along. The math is only the beginning.

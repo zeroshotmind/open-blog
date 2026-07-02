@@ -1,0 +1,149 @@
+---
+title: "The Spectral Theorem"
+slug: "linear-algebra-spectral-theorem"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 10
+tags: ["linear-algebra", "spectral-theorem", "symmetric-matrices", "diagonalization", "pca"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Symmetric matrices can always be diagonalized by an orthogonal matrix — their eigenvectors form a natural coordinate system for the data. This is the spectral theorem, and it underlies PCA, kernel methods, and graph Laplacians."
+---
+
+import { SpectralDecompositionViz, EigenbasisViz, MatrixPowerViz } from './LinearAlgebraSpectralVisuals'
+
+In [Post 5](/posts/linear-algebra-eigenvalues) we found that symmetric matrices have a special property: their eigenvalues are always real and their eigenvectors are always orthogonal. This isn't a coincidence — it's the consequence of one of the deepest results in linear algebra.
+
+**The Spectral Theorem** says that every real symmetric matrix can be decomposed as:
+
+$$A = Q \Lambda Q^\top$$
+
+where $Q$ is an **orthogonal** matrix (its columns are the eigenvectors) and $\Lambda$ is a **diagonal** matrix of eigenvalues.
+
+This factorization is called the **eigendecomposition** or **spectral decomposition**, and it unlocks a clean geometric story.
+
+---
+
+## The Three-Step Geometry
+
+Think of multiplying a vector $\mathbf{x}$ by $A$:
+
+$$A\mathbf{x} = Q \Lambda Q^\top \mathbf{x}$$
+
+This happens in three steps:
+
+1. **$Q^\top \mathbf{x}$** — rotate $\mathbf{x}$ into the eigenbasis (the coordinate system defined by eigenvectors)
+2. **$\Lambda (Q^\top \mathbf{x})$** — scale each coordinate independently by the corresponding eigenvalue
+3. **$Q(\cdots)$** — rotate back to the original frame
+
+The eigenvectors are the **natural axes** of the transformation. In that coordinate system, $A$ is just a scaling operation — diagonal. No rotation, no mixing.
+
+<SpectralDecompositionViz />
+
+---
+
+## Formal Statement
+
+**Theorem (Spectral Theorem for real symmetric matrices).** Let $A \in \mathbb{R}^{n \times n}$ with $A = A^\top$. Then there exists an orthogonal matrix $Q \in \mathbb{R}^{n \times n}$ and a diagonal matrix $\Lambda = \text{diag}(\lambda_1, \ldots, \lambda_n)$ such that:
+
+$$A = Q \Lambda Q^\top$$
+
+The columns $\mathbf{q}_1, \ldots, \mathbf{q}_n$ of $Q$ are orthonormal eigenvectors of $A$, and $\lambda_i$ is the eigenvalue for $\mathbf{q}_i$.
+
+Since $Q$ is orthogonal, $Q^\top = Q^{-1}$, so this is equivalent to:
+
+$$Q^\top A Q = \Lambda$$
+
+That is, $Q$ **diagonalizes** $A$.
+
+---
+
+## The Eigenbasis
+
+Any vector $\mathbf{x}$ can be expressed in terms of the eigenvectors:
+
+$$\mathbf{x} = c_1 \mathbf{q}_1 + c_2 \mathbf{q}_2 + \cdots + c_n \mathbf{q}_n$$
+
+The coordinates $c_i = \mathbf{q}_i^\top \mathbf{x}$ are just dot products (projections), because the eigenvectors are orthonormal.
+
+Then:
+
+$$A\mathbf{x} = c_1 \lambda_1 \mathbf{q}_1 + c_2 \lambda_2 \mathbf{q}_2 + \cdots + c_n \lambda_n \mathbf{q}_n$$
+
+Each eigenvector direction is scaled independently. This is the key insight: in the eigenbasis, $A$ is trivially diagonal.
+
+<EigenbasisViz />
+
+---
+
+## Matrix Powers Made Easy
+
+One of the most practical consequences is that repeated matrix multiplication becomes trivial.
+
+From the spectral decomposition:
+
+$$A^2 = (Q \Lambda Q^\top)(Q \Lambda Q^\top) = Q \Lambda^2 Q^\top$$
+
+because $Q^\top Q = I$. By induction:
+
+$$A^n = Q \Lambda^n Q^\top$$
+
+And $\Lambda^n$ is just a diagonal matrix with entries $\lambda_i^n$ — raising each eigenvalue to the $n$-th power.
+
+This means: **the long-term behavior of $A^n \mathbf{x}$ is dominated by the largest eigenvalue**. The eigenvector with $|\lambda_1|$ largest grows fastest; directions with $|\lambda_i| < 1$ shrink to zero.
+
+<MatrixPowerViz />
+
+---
+
+## Applications
+
+### PCA (Principal Component Analysis)
+
+Given a data matrix $X \in \mathbb{R}^{m \times n}$, the covariance matrix is:
+
+$$C = \frac{1}{m} X^\top X$$
+
+$C$ is symmetric positive semidefinite. The spectral theorem gives $C = Q \Lambda Q^\top$. The columns of $Q$ are the **principal components** — the natural axes of variance. The eigenvalues $\lambda_i$ are the variance along each axis.
+
+### Graph Laplacians
+
+Given an undirected graph $G$ with adjacency matrix $W$, the **graph Laplacian** is $L = D - W$ where $D$ is the degree matrix. $L$ is symmetric positive semidefinite.
+
+Its eigenvectors are the **graph Fourier basis** — the natural frequencies of signals on the graph. The smallest non-zero eigenvalue (the **Fiedler value**) measures how well-connected the graph is.
+
+### Kernel Matrices
+
+In kernel methods (like SVMs), the kernel matrix $K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$ is symmetric positive semidefinite. Its spectral decomposition gives the **feature space** implicitly defined by the kernel.
+
+---
+
+## Positive Definite Matrices
+
+A symmetric matrix is **positive definite** (PD) if all its eigenvalues are strictly positive:
+
+$$\lambda_i > 0 \quad \forall i$$
+
+Equivalently, $\mathbf{x}^\top A \mathbf{x} > 0$ for all $\mathbf{x} \neq \mathbf{0}$. Covariance matrices are positive semidefinite ($\lambda_i \geq 0$); kernel matrices are typically positive definite. We'll explore these in detail in [Post 11](/posts/linear-algebra-positive-definite).
+
+---
+
+## Summary
+
+The spectral theorem is a complete characterization of symmetric matrices:
+
+| Property | Result |
+|---|---|
+| Eigenvalues | All real |
+| Eigenvectors | Orthogonal (orthonormal if normalized) |
+| Decomposition | $A = Q\Lambda Q^\top$ |
+| Inverse | $A^{-1} = Q\Lambda^{-1}Q^\top$ (if $\lambda_i \neq 0$) |
+| Matrix power | $A^n = Q\Lambda^n Q^\top$ |
+
+Every symmetric matrix is, in its own coordinate system, just a scaling operation. The spectral theorem tells us what that coordinate system is.
+
+In [Post 11](/posts/linear-algebra-positive-definite) we'll focus on the positive definite case and see why it's the natural setting for optimization problems.

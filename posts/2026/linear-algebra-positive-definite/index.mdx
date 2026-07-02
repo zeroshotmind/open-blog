@@ -1,0 +1,147 @@
+---
+title: "Positive Definite Matrices and the Geometry of Optimization"
+slug: "linear-algebra-positive-definite"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 11
+tags: ["linear-algebra", "positive-definite", "quadratic-forms", "optimization", "convexity"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Positive definite matrices define 'bowl-shaped' quadratic forms with a unique minimum. They show up everywhere optimization problems have unique solutions — from least squares to neural network loss landscapes."
+---
+
+import { QuadraticFormViz, PDeigenvalueViz, CholeskyViz } from './LinearAlgebraPositiveDefiniteVisuals'
+
+In [Post 10](/posts/linear-algebra-spectral-theorem) we saw that a symmetric matrix's eigenvalues determine its behavior. When all eigenvalues are positive, something special happens: the matrix defines a **bowl-shaped energy landscape** with a unique minimum. This is the world of **positive definite matrices**.
+
+---
+
+## The Definition
+
+A symmetric matrix $A \in \mathbb{R}^{n \times n}$ is **positive definite** (PD) if:
+
+$$\mathbf{x}^\top A \mathbf{x} > 0 \quad \text{for all } \mathbf{x} \neq \mathbf{0}$$
+
+The expression $f(\mathbf{x}) = \mathbf{x}^\top A \mathbf{x}$ is called a **quadratic form**. In 2D with $A = \begin{pmatrix} a & b \\ b & d \end{pmatrix}$:
+
+$$f(x, y) = ax^2 + 2bxy + dy^2$$
+
+This is a surface over the $(x, y)$ plane. Whether it's bowl-shaped, flat, or saddle-shaped depends entirely on $A$.
+
+<QuadraticFormViz />
+
+---
+
+## Equivalent Conditions
+
+There are several equivalent ways to check if $A$ is positive definite:
+
+**1. Eigenvalue condition:** All eigenvalues $\lambda_i > 0$.
+
+From the spectral theorem $A = Q\Lambda Q^\top$, the quadratic form becomes:
+$$\mathbf{x}^\top A \mathbf{x} = \mathbf{y}^\top \Lambda \mathbf{y} = \sum_i \lambda_i y_i^2$$
+where $\mathbf{y} = Q^\top \mathbf{x}$. This is positive iff all $\lambda_i > 0$.
+
+**2. Sylvester's criterion:** All **leading principal minors** are positive.
+
+For a $2 \times 2$ matrix $\begin{pmatrix} a & b \\ b & d \end{pmatrix}$:
+- $a > 0$
+- $ad - b^2 > 0$ (the determinant)
+
+**3. Cholesky factorization:** $A = L L^\top$ for some invertible lower-triangular $L$.
+
+If such an $L$ exists (with positive diagonal), $A$ is PD.
+
+**4. Square root:** $A = B^\top B$ for some invertible $B$.
+
+This follows from the spectral theorem: let $B = \Lambda^{1/2} Q^\top$.
+
+---
+
+## The Geometry of Quadratic Forms
+
+The level sets of $f(\mathbf{x}) = \mathbf{x}^\top A \mathbf{x} = c$ are:
+
+- **PD**: ellipses centered at the origin — each axis aligned with an eigenvector, with length $1/\sqrt{\lambda_i}$
+- **PSD** (some $\lambda_i = 0$): degenerate ellipses (flat in some directions)
+- **Indefinite** (mixed signs): hyperbolas — no minimum, but a saddle point
+
+<PDeigenvalueViz />
+
+The **condition number** $\kappa(A) = \lambda_{\max} / \lambda_{\min}$ describes the eccentricity of the ellipse. When $\kappa \gg 1$, the ellipse is very elongated — gradient descent has to bounce back and forth in the narrow direction, making optimization slow. This is why preconditioning matters.
+
+---
+
+## Connection to Convex Optimization
+
+In optimization, we often minimize a function $f: \mathbb{R}^n \to \mathbb{R}$. The second derivative test generalizes to:
+
+$$\nabla^2 f(\mathbf{x}) \succ 0 \quad \Longrightarrow \quad f \text{ is strictly convex at } \mathbf{x}$$
+
+where $\nabla^2 f$ is the **Hessian matrix** of second partial derivatives.
+
+If $\nabla^2 f(\mathbf{x}) \succ 0$ everywhere, then $f$ has a **unique global minimum** — and gradient descent converges to it.
+
+For linear regression with loss $f(\mathbf{w}) = \|X\mathbf{w} - \mathbf{y}\|^2$:
+$$\nabla^2 f = 2 X^\top X$$
+
+$X^\top X$ is always positive semidefinite, and positive definite if $X$ has full column rank. This is why the normal equations have a unique solution when $X^\top X$ is invertible.
+
+### The Newton Step
+
+Newton's method uses the Hessian directly:
+$$\mathbf{w}_{t+1} = \mathbf{w}_t - (\nabla^2 f(\mathbf{w}_t))^{-1} \nabla f(\mathbf{w}_t)$$
+
+When the Hessian is PD, this step accounts for the curvature — it converges much faster than gradient descent. The Hessian being PD ensures the Newton step is a descent direction.
+
+---
+
+## Cholesky Decomposition
+
+For a PD matrix $A$, the **Cholesky decomposition** computes $A = LL^\top$ where $L$ is lower triangular with positive diagonal entries.
+
+The algorithm proceeds column by column:
+
+$$L_{11} = \sqrt{A_{11}}$$
+$$L_{i1} = \frac{A_{i1}}{L_{11}} \quad \text{for } i > 1$$
+$$L_{jj} = \sqrt{A_{jj} - \sum_{k=1}^{j-1} L_{jk}^2}$$
+$$L_{ij} = \frac{1}{L_{jj}}\left(A_{ij} - \sum_{k=1}^{j-1} L_{ik} L_{jk}\right) \quad \text{for } i > j$$
+
+If the algorithm hits a negative value under a square root, the matrix is **not** positive definite — this is how Cholesky serves as a PD test.
+
+<CholeskyViz />
+
+Cholesky is roughly **twice as fast** as LU decomposition for PD matrices and is the standard solver for symmetric PD systems (normal equations, covariance matrix inversions, etc.).
+
+---
+
+## Positive Semidefinite (PSD)
+
+A matrix is **positive semidefinite** if $\mathbf{x}^\top A \mathbf{x} \geq 0$ (with equality possible for $\mathbf{x} \neq 0$).
+
+PSD matrices have $\lambda_i \geq 0$. They arise naturally as:
+
+- **Covariance matrices**: $\Sigma = \frac{1}{n} X^\top X$ (PSD; PD if $X$ has full rank)
+- **Gram matrices**: $G_{ij} = \mathbf{x}_i \cdot \mathbf{x}_j$ (always PSD)
+- **Kernel matrices**: $K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$ for valid kernels
+
+The set of $n \times n$ PSD matrices forms a **convex cone** — a closed, convex set in the space of matrices. This makes PSD constraints tractable in semidefinite programming (SDP).
+
+---
+
+## Summary
+
+| Class | Eigenvalues | Quadratic form | Geometry |
+|---|---|---|---|
+| Positive definite | All $> 0$ | Always $> 0$ | Elliptic bowl |
+| Positive semidefinite | All $\geq 0$ | Always $\geq 0$ | Flat bowl (degenerate) |
+| Indefinite | Mixed signs | Can be $< 0$ | Saddle |
+| Negative definite | All $< 0$ | Always $< 0$ | Inverted bowl |
+
+Positive definiteness is the matrix condition that guarantees unique minima, stable decompositions, and well-conditioned optimization. Whenever a problem is easy to solve, there's usually a PD matrix hiding behind it.
+
+In [Post 12](/posts/linear-algebra-neural-networks) we'll apply all this to neural networks — where weight matrices, attention patterns, and gradient updates are all just linear algebra in action.
