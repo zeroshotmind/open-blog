@@ -1,0 +1,140 @@
+---
+title: "Determinants and Invertibility"
+slug: "linear-algebra-determinants"
+date: "2026-07-02"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "linear-algebra"
+seriesOrder: 4
+tags: ["linear-algebra", "determinants", "invertibility", "geometry", "transformations"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "The determinant measures how much a matrix stretches or squishes space — and whether it flips orientation. When it's zero, information is lost and the matrix can't be inverted."
+---
+
+import { DeterminantViz, InvertibilityViz, InverseViz } from './LinearAlgebraDeterminantsVisuals'
+
+When a matrix acts on a region of space, it can stretch it, squish it, rotate it, or flatten it entirely. The **determinant** is the number that captures exactly how much area (or volume) changes — and whether orientation flips. It's also the gatekeeper of invertibility: a matrix can be undone if and only if its determinant is nonzero.
+
+---
+
+## The 2×2 Determinant
+
+Take a matrix
+
+$$
+A = \begin{bmatrix} a & b \\ c & d \end{bmatrix}
+$$
+
+Its determinant is:
+
+$$
+\det(A) = ad - bc
+$$
+
+To see why this formula makes geometric sense, think of the two columns $\mathbf{u} = \begin{bmatrix} a \\ c \end{bmatrix}$ and $\mathbf{v} = \begin{bmatrix} b \\ d \end{bmatrix}$ as vectors in the plane. They span a parallelogram. The area of that parallelogram is exactly $|ad - bc|$.
+
+The signed version $ad - bc$ carries orientation: positive means the pair $(\mathbf{u}, \mathbf{v})$ has the same "handedness" as the standard basis, negative means they've been flipped.
+
+<DeterminantViz />
+
+Drag the two vectors and watch the parallelogram and determinant value update live. Notice that when the vectors become parallel, the parallelogram collapses and $\det \to 0$.
+
+---
+
+## What It Means When det = 0
+
+When $\det(A) = 0$, the two columns lie along the same line — they are **linearly dependent**. The transformation $A$ squashes the entire plane onto a line (or a point). This is catastrophic for one reason: **information is permanently lost**.
+
+If $A\mathbf{x}_1 = A\mathbf{x}_2$ for two distinct $\mathbf{x}_1 \neq \mathbf{x}_2$, you can't tell them apart after the transformation. No matter how hard you try, there's no way to reconstruct which input produced a given output.
+
+Formally, $\ker(A) \neq \{\mathbf{0}\}$ — there are nonzero vectors that get mapped to zero.
+
+---
+
+## Sign of the Determinant
+
+- $\det(A) > 0$: the transformation **preserves orientation**. A counterclockwise loop stays counterclockwise.
+- $\det(A) < 0$: the transformation **reverses orientation** — like a reflection. A counterclockwise loop becomes clockwise.
+- $\det(A) = 0$: the transformation collapses space to a lower dimension.
+
+Pure rotations always have $\det = 1$ (they preserve area and orientation). Reflections have $\det = -1$. A uniform scaling by factor $k$ gives $\det = k^2$ for 2D.
+
+---
+
+## det(AB) = det(A) · det(B)
+
+When you compose two linear maps, their scaling factors multiply:
+
+$$
+\det(AB) = \det(A) \cdot \det(B)
+$$
+
+Intuitively: if $A$ doubles area and $B$ triples it, then $AB$ multiplies area by six. This multiplicativity is what makes determinants so powerful — they turn composition (a complex operation) into ordinary multiplication.
+
+A direct consequence: $\det(A^{-1}) = 1/\det(A)$ (since $\det(A) \cdot \det(A^{-1}) = \det(I) = 1$).
+
+---
+
+## Invertibility: det(A) ≠ 0
+
+**A square matrix $A$ is invertible if and only if $\det(A) \neq 0$.**
+
+The logic flows directly from geometry: if $\det(A) \neq 0$, the transformation preserves dimension — no information is lost, so there's a unique input for every output, meaning we can reverse it. If $\det(A) = 0$, distinct inputs collide and no reversal is possible.
+
+<InvertibilityViz />
+
+Use the sliders to see how rotation alone keeps $\det = 1$, while a squish factor $s < 1$ shrinks the determinant — and at $s = 0$ the square collapses to a line, making the transformation irreversible.
+
+---
+
+## The 2×2 Inverse Formula
+
+For an invertible 2×2 matrix, the inverse has a clean closed form:
+
+$$
+A^{-1} = \frac{1}{\det(A)} \begin{bmatrix} d & -b \\ -c & a \end{bmatrix}
+$$
+
+You can verify this directly: $A \cdot A^{-1} = I$. The $1/\det(A)$ factor undoes the scaling, while swapping $a \leftrightarrow d$ and negating $b, c$ reverses the rotation and shear.
+
+Geometrically: the matrix $\begin{bmatrix} d & -b \\ -c & a \end{bmatrix}$ maps each column of $A$ to the corresponding standard basis vector (it "undoes" the parallelogram), and dividing by $\det(A)$ corrects the scale.
+
+<InverseViz />
+
+Watch as $A$ transforms the grid, then $A^{-1}$ brings it back exactly.
+
+---
+
+## The 3×3 Determinant
+
+For a $3 \times 3$ matrix, the determinant is computed by **cofactor expansion** along the first row:
+
+$$
+\det \begin{bmatrix} a_{11} & a_{12} & a_{13} \\ a_{21} & a_{22} & a_{23} \\ a_{31} & a_{32} & a_{33} \end{bmatrix}
+= a_{11} \det \begin{bmatrix} a_{22} & a_{23} \\ a_{32} & a_{33} \end{bmatrix}
+- a_{12} \det \begin{bmatrix} a_{21} & a_{23} \\ a_{31} & a_{33} \end{bmatrix}
++ a_{13} \det \begin{bmatrix} a_{21} & a_{22} \\ a_{31} & a_{32} \end{bmatrix}
+$$
+
+Each $2 \times 2$ minor is the determinant of the submatrix obtained by deleting that element's row and column. The alternating signs ($+, -, +$) come from the checkerboard pattern of cofactors.
+
+The 3D geometric interpretation: $|\det(A)|$ equals the volume of the parallelepiped spanned by the three column vectors, and the sign captures orientation in 3D (right-handed vs left-handed).
+
+---
+
+## Summary
+
+| Concept | Key Fact |
+|---------|----------|
+| $\det(A)$ | Signed area/volume scaling factor |
+| $\det = 0$ | Columns dependent; transformation collapses dimension |
+| $\det > 0$ | Orientation preserved |
+| $\det < 0$ | Orientation flipped |
+| $\det(AB)$ | $= \det(A) \cdot \det(B)$ |
+| Invertibility | $A$ invertible $\iff \det(A) \neq 0$ |
+| 2×2 inverse | $\frac{1}{\det(A)}\begin{bmatrix}d&-b\\-c&a\end{bmatrix}$ |
+
+The determinant is one of the most information-dense numbers in linear algebra. Next, we'll use these ideas to understand eigenvalues — another place where the determinant plays a starring role.
