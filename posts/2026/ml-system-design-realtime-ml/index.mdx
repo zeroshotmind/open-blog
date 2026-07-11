@@ -1,0 +1,55 @@
+---
+title: "ML System Design: Real-Time ML"
+slug: ml-system-design-realtime-ml
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 4
+tags: ["ml-system-design", "fraud-detection", "anomaly-detection", "streaming", "real-time"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Fraud, anomaly detection, and real-time bidding share three enemies: a tight latency SLA, concept drift, and extreme class imbalance. How production systems handle all three at once."
+---
+
+import { LatencyTradeoffViz, StreamProcessingViz, Quiz } from './MLSystemDesignRealtimeMLVisuals'
+
+Fraud detection, anomaly detection, and real-time bidding feel like different products, but as ML systems they're the same animal. Each must decide in milliseconds, on data whose distribution is actively shifting, where the thing you care about is rare. Get any one of those three wrong and the system fails in a specific, predictable way.
+
+## The three constraints
+
+**Latency.** A fraud check sits in the payment path — the user is waiting, and every added millisecond is abandoned carts and timeouts. Real-time bidding is more brutal: the ad auction gives you roughly 10ms *total*, network included, to return a bid or forfeit the impression. This isn't a soft target you optimize toward; it's a hard wall. Miss it and your prediction is worthless because the moment is gone.
+
+**Concept drift.** Fraudsters adapt to your model — that's their job. A model trained last month degrades not because your code rotted but because the adversary moved. Normal behavior drifts too: shopping patterns shift around holidays, traffic shifts with product launches. A static model is a depreciating asset here in a way it isn't for, say, image classification.
+
+**Class imbalance.** Fraud might be 0.1% of transactions. A model that predicts "not fraud" every time is 99.9% accurate and completely useless. Accuracy is the wrong metric; you live in precision/recall, PR-AUC, and the cost of a false positive (a declined legitimate purchase, an angry customer) versus a false negative (money lost).
+
+## Latency vs accuracy is a dial, not a fixed point
+
+<LatencyTradeoffViz />
+
+Every real-time system chooses where to sit on this curve, and the choice is per-decision, not global. The core techniques for buying latency:
+
+- **Precompute aggressively.** Anything not dependent on the current event — a user's 30-day spend profile, a merchant's fraud rate — is computed ahead and read from a fast store. At request time you assemble features and run one forward pass.
+- **Tiered models.** A cheap model scores everything; only ambiguous cases escalate to a heavier model or an async deep check. Most traffic is obviously fine and shouldn't pay for the expensive model.
+- **Async where you can.** Not every decision must be synchronous. Block the obviously-fraudulent inline; flag the borderline for a slower review that doesn't sit in the user's path.
+
+## Stream processing is the backbone
+
+<StreamProcessingViz />
+
+Real-time features come from a streaming pipeline, and the canonical shape is Kafka → a stream processor (Flink, Spark Streaming) → a feature store → the model. Events land on the log, the processor maintains windowed aggregates ("transactions from this card in the last 5 minutes"), and those land in an online store the model reads under budget.
+
+The subtle trap here is **training/serving skew.** Your offline training features are computed in a batch job over historical data; your online features are computed by a streaming job. If those two code paths compute "5-minute transaction count" even slightly differently — different windowing, different late-event handling — the model sees one distribution in training and another in production, and quietly underperforms. The mature answer is a single feature-definition layer that generates both paths, so the logic can't drift between them.
+
+## Handling drift and imbalance in practice
+
+For **drift**, the system has to assume the model will go stale and build for continuous retraining: monitor the live score distribution and the feature distributions, alert when they move, and retrain on a cadence measured in days, not quarters. Some setups do online/incremental updates. The monitoring *is* the design — a fraud model without drift detection is a fraud model with a shelf life nobody's tracking.
+
+For **imbalance**, you rebalance training (undersample the majority, oversample or synthesize the minority) or weight the loss toward the rare class, and — critically — you evaluate on metrics that survive imbalance. You also usually tune the decision **threshold** against business cost rather than defaulting to 0.5, because the cost of the two error types is wildly asymmetric and product-specific.
+
+The unifying frame for all three problems: you're defending a decision boundary that a rare signal must cross, under a stopwatch, against a distribution that won't hold still. Name those three pressures explicitly and the design writes itself.
+
+<Quiz />

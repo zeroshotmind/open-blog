@@ -1,0 +1,57 @@
+---
+title: "ML System Design: Search & Feed Ranking"
+slug: ml-system-design-search-ranking
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 3
+tags: ["ml-system-design", "learning-to-rank", "search", "feed-ranking", "bert"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Learning to rank — pointwise, pairwise, listwise — plus query understanding with BERT and what feed ranking adds: engagement prediction and diversity."
+---
+
+import { LearningToRankViz, FeedRankingViz, Quiz } from './MLSystemDesignSearchRankingVisuals'
+
+Search and feed ranking look like the same problem — order a set of items for a user — but they differ in one decisive way. Search has a **query**: an explicit statement of intent you must understand and match. A feed has no query; the "query" is the user's entire history and context, and the intent is latent. That difference drives everything downstream.
+
+Both, though, are **learning-to-rank** problems, and the first thing to get right in an interview is which flavor you're using and why.
+
+## Pointwise, pairwise, listwise
+
+<LearningToRankViz />
+
+**Pointwise** treats ranking as regression or classification: predict a relevance score for each item independently, then sort. Simple, and it's what most production rankers actually do because the scores are reusable and the training data (a click, a relevance grade) is per-item. The weakness: the loss doesn't know that ranking is relative. Getting item A's absolute score wrong is penalized even if A is still correctly above B.
+
+**Pairwise** learns from preferences: for a pair (A, B) where A should outrank B, penalize the model when it scores B higher. This directly optimizes relative order, which is what you actually care about. RankNet and LambdaRank live here, and pairwise is the sweet spot for a lot of search systems — it targets order without the cost of full-list objectives.
+
+**Listwise** optimizes a metric over the entire ranked list (NDCG, MAP) directly. Most faithful to the objective, most expensive and finicky to train. LambdaMART — gradient-boosted trees with a listwise-flavored gradient — remains a genuinely strong production baseline that new candidates routinely underrate.
+
+The honest interview answer: pointwise to ship, pairwise/listwise when the metric gap justifies the complexity. Don't claim listwise is "best" without acknowledging its training cost.
+
+## Query understanding
+
+For search, half the work is understanding the query before you rank anything. Tokenization and spell correction are table stakes. The modern layer is a transformer — a BERT-family model — that produces a query embedding for semantic matching and powers intent classification (is "jaguar" the animal, the car, or the football team?).
+
+The serving tension: BERT is expensive. You cannot run a large cross-encoder over every candidate document at query time. The standard resolution is a **two-stage** design that mirrors recommendations — cheap retrieval (BM25 lexical + a bi-encoder for semantic recall) fetches candidates, then an expensive cross-encoder reranks the top few dozen where the latency is affordable. Naming that split is the signal that you've served a ranking model, not just trained one.
+
+## Real-time signals vs precomputed features
+
+Ranking features fall on a freshness spectrum. Precomputed features (a document's historical CTR, PageRank-style authority, its embeddings) are cheap and stale. Real-time signals (query-time personalization, what's trending this minute, the user's last few actions) are what make results feel alive but demand a low-latency feature path. The design question is never "which one" — it's which features earn a real-time pipeline and which are fine at yesterday's freshness.
+
+## What feed ranking adds
+
+<FeedRankingViz />
+
+Strip the query and two new problems appear.
+
+**Engagement prediction becomes the objective.** With no stated intent, you rank by predicted engagement — the probability the user clicks, likes, comments, reshares, dwells. As in recommendations, single-signal optimization is a trap: rank on click alone and you get outrage bait; rank on a weighted blend of engagement signals (with negatives like "hide" and "report" pulling down) and you get something defensible. These weights are a product decision, tuned via A/B tests, not a modeling constant.
+
+**Diversity and integrity become first-class.** The raw top-N of an engagement model is repetitive and can amplify borderline content. Feed systems apply a reranking pass for diversity (don't show five posts from one source), freshness decay, and integrity filters (demote misinformation, spam, borderline policy). This is why "just predict engagement and sort" is a junior answer — the reranking layer is where feeds are actually governed.
+
+The through-line across both systems: **retrieve cheap, rank expensive, rerank for the constraints the ranker ignores.** Search adds query understanding at the front; feeds replace the query with predicted engagement and lean harder on the integrity pass at the back.
+
+<Quiz />

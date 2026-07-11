@@ -1,0 +1,59 @@
+---
+title: "ML System Design: Applied Systems"
+slug: ml-system-design-applied
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 7
+tags: ["ml-system-design", "content-moderation", "eta", "visual-search", "multimodal"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Five applied systems — content moderation, ETA, visual search, document extraction, multimodal search — each reduced to its one interesting design decision."
+---
+
+import { ModerationPipelineViz, EmbeddingSearchViz, Quiz } from './MLSystemDesignAppliedVisuals'
+
+The systems in this post don't share a single template — they share a discipline. For each, there's one design decision that carries the answer, and a survey of all the model options is the wrong instinct. Find the hard part, commit to a choice, and defend it.
+
+## Content moderation: precision, recall, and who pays for errors
+
+The defining fact is that the two error types have wildly asymmetric, *context-dependent* costs. Missing violent content is catastrophic; wrongly removing a legitimate post is a censorship complaint. And it changes by category — you tune spam aggressively (false positives are cheap) but child-safety at maximum recall regardless of false-positive cost.
+
+That asymmetry forces a **tiered** architecture rather than a single classifier.
+
+<ModerationPipelineViz />
+
+Cheap models filter the obvious firehose. Uncertain cases escalate to heavier multimodal models, and only the genuinely ambiguous reach human reviewers — the scarce, expensive resource you route deliberately. The system's real objective isn't raw accuracy; it's spending limited human review where it changes outcomes most, while keeping latency low enough to catch virality before it spreads. Adversarial drift (users evade filters) makes this the fraud problem in disguise, so continuous retraining is mandatory.
+
+## Uber ETA: it's a graph problem with an ML correction
+
+The naive answer — regress travel time from features — misses the structure. Roads are a graph; a trip is a path of segments. The strong design predicts per-segment traversal time (a graph neural network over the road network is the modern approach) and composes them, rather than treating each trip as an opaque point. Live traffic enters as real-time features on segments.
+
+The subtlety interviewers probe: the target isn't a point estimate, it's a **distribution**. "12 minutes" that's occasionally 40 is worse than a calibrated "12–15 minutes," because downstream dispatch and pricing consume the uncertainty. Quantile regression or predicting an interval beats squared-error-to-the-mean here.
+
+## Visual search (Pinterest Lens): embeddings + ANN, and the index is the system
+
+Conceptually simple: embed the query image with a vision model, find nearest neighbors in an embedding space of catalog images. The model is the easy part.
+
+<EmbeddingSearchViz />
+
+The system challenge is the **index** — billions of image embeddings, sub-second search, constant additions. This is an ANN problem (HNSW, IVF-PQ), and the interesting decisions are quantization to fit the index in memory, the recall/latency tradeoff of the ANN parameters, and how you keep the index fresh as the catalog grows. The embedding model choice matters far less than the retrieval infrastructure around it — the same lesson as RAG.
+
+## Document extraction: layout is signal, and you must handle "I don't know"
+
+Pulling structured fields (totals, dates, line items) from invoices and forms. Plain OCR-then-NLP throws away the thing that matters — **spatial layout**. A total is defined as much by its position on the page as by its text, so the modern approach uses layout-aware models (LayoutLM-style) that fuse text, position, and image.
+
+The design decision that separates production from demo: this feeds downstream automation (payments, records), so a confidently wrong extraction is worse than an abstention. The system needs **calibrated confidence** and a human-in-the-loop path for low-confidence fields. "Extract everything and hope" fails the moment a malformed invoice arrives; the honest design routes uncertain fields to review.
+
+## Multimodal search: the fusion decision is the whole question
+
+Search where queries and documents span modalities — text finding images, images finding products. The one decision that defines the system is **where fusion happens**.
+
+*Shared embedding space* (CLIP-style): project all modalities into one space and do cross-modal nearest-neighbor directly. Elegant, scalable, enables text→image out of the box — but it can blur fine-grained, modality-specific detail. *Late fusion*: retrieve per modality, combine results downstream. More faithful per modality, more moving parts. The right pick depends on whether your queries are genuinely cross-modal (favor shared space) or modality-specific with a fusion step at the end (favor late fusion). Naming that tradeoff *is* the answer; picking one without stating why is the miss.
+
+The pattern across all five: locate the one decision that determines the design — error-cost asymmetry, distributional targets, the index, calibrated abstention, fusion point — and build outward from it. That instinct is what these questions actually test.
+
+<Quiz />

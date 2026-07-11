@@ -1,0 +1,57 @@
+---
+title: "ML System Design: Infrastructure"
+slug: ml-system-design-infrastructure
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 5
+tags: ["ml-system-design", "feature-store", "distributed-training", "ab-testing", "mlops"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Feature stores (online/offline duality), data vs model parallelism for distributed training, and why A/B testing ML models is harder than product A/B tests."
+---
+
+import { FeatureStoreViz, TrainingParallelismViz, Quiz } from './MLSystemDesignInfrastructureVisuals'
+
+Products get the interview glory, but infrastructure is what makes the products possible — and what most candidates handle vaguely. Three pieces come up constantly: the feature store, distributed training, and A/B testing for models. Each exists to solve a problem that only appears at scale.
+
+## Feature store: the online/offline duality
+
+A feature store exists to solve one specific bug: **training/serving skew.** You compute a feature one way in a training pipeline (batch, over history) and another way at serving time (online, low-latency). When those disagree, your model silently underperforms. The feature store's job is to make both come from a single source of truth.
+
+<FeatureStoreViz />
+
+The architecture is a duality. The **offline store** (a warehouse or columnar files) holds full feature history and serves training with point-in-time-correct joins — critically, it must give you the feature value *as it was at label time*, not the current value, or you leak the future into training. The **online store** (Redis, DynamoDB, a KV store) holds only the latest feature value per entity, optimized for single-digit-millisecond reads at serving.
+
+The two stay consistent because feature definitions are written once and materialized into both. That single-definition property is the entire point; a feature store that lets the two paths drift is just two databases with a logo. Also expect questions on point-in-time correctness (the most common data leak in ML) and on feature freshness SLAs per feature.
+
+## Distributed training: data vs model parallelism
+
+When a model or dataset outgrows one GPU, you split the work — and *how* you split determines everything.
+
+<TrainingParallelismViz />
+
+**Data parallelism** is the default and the one to reach for first. Every GPU holds a full copy of the model and processes a different shard of the batch. After each step, gradients are averaged across GPUs (all-reduce) so every replica stays in sync. It scales throughput near-linearly until communication overhead dominates. The constraint: the whole model must fit on one GPU. For most models, that's fine, and data parallelism is the right answer.
+
+**Model parallelism** is what you use when the model itself doesn't fit. You split the model across GPUs — tensor parallelism splits individual layers across devices, pipeline parallelism puts different layers on different devices and streams micro-batches through. It's more complex and communication-heavy, and pipeline parallelism introduces "bubble" idle time you fight with micro-batching. Large models combine all of it (data + tensor + pipeline), which is why the honest answer to "how would you train a 100B model" is *3D parallelism*, not one axis.
+
+The interview tell: reach for data parallelism first and only invoke model parallelism when you've established the model won't fit on a device. Candidates who open with model parallelism for a model that fits fine are over-engineering.
+
+## A/B testing ML models is not product A/B testing
+
+The trap: "we'll A/B test it" as if it's a solved product process. ML A/B tests have failure modes product tests don't.
+
+**Metric sensitivity.** Model improvements are often small (a 0.5% lift in a business metric is a big deal in ranking). Detecting that requires large samples and long runs — the effect is buried in noise that a UI-color test never has to fight.
+
+**Network and interference effects.** In a marketplace or social graph, treating some users changes the experience of control users (a better recommender for you shifts what content is available to me). Naive user-level randomization violates the independence A/B testing assumes; you may need cluster-based or geo randomization.
+
+**Long-term vs short-term.** A model can lift clicks this week and degrade retention next quarter (the clickbait trap again). Short experiments miss it, so mature orgs run **long-term holdout** groups — a slice of users kept on an old model or no personalization for months — to measure cumulative effect and guard against metric erosion the weekly tests can't see.
+
+**Counterfactual logging.** To evaluate a new ranking policy offline before shipping, you need the propensity scores from the policy that generated your logged data, or your offline estimate is biased. Logging those at serving time is a design decision you make *before* you need it.
+
+None of this means A/B testing is optional — it's the ground truth. It means "just A/B test it" is a starting point, and the senior signal is naming which of these traps applies to the system in front of you.
+
+<Quiz />

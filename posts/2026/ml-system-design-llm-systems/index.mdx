@@ -1,0 +1,62 @@
+---
+title: "ML System Design: LLM Systems"
+slug: ml-system-design-llm-systems
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 6
+tags: ["ml-system-design", "llm-serving", "rag", "fine-tuning", "kv-cache"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Serving LLMs (KV cache, continuous batching, speculative decoding), building enterprise RAG (chunking, hybrid retrieval, reranking), and the fine-tuning pipeline."
+---
+
+import { KVCacheViz, RAGPipelineViz, Quiz } from './MLSystemDesignLLMSystemsVisuals'
+
+LLM systems break the assumptions the rest of this series was built on. Inference isn't one forward pass — it's a loop that generates one token at a time, each conditioned on all previous tokens. Latency isn't a single number — there's time-to-first-token and time-per-output-token, and they trade off. Throughput and cost are dominated by memory bandwidth, not FLOPs. Get those framings right and the three canonical questions — serving, RAG, fine-tuning — follow.
+
+## Serving: the KV cache is everything
+
+Generation has two phases. **Prefill** processes the whole prompt in parallel — compute-bound, fast. **Decode** generates tokens one at a time, and here's the trap: naively, generating token N re-attends over all N-1 previous tokens, redoing work every step. The fix is the **KV cache** — you store the key and value tensors for every past token and reuse them, so each new token only computes attention against the cache instead of recomputing it.
+
+<KVCacheViz />
+
+That makes decode fast but memory-hungry: the KV cache grows with sequence length × batch size and often dwarfs the model weights in memory. So LLM serving is largely a memory-management problem, which is why **PagedAttention** (vLLM) — managing the cache in fixed pages like OS virtual memory to kill fragmentation — was such a step change.
+
+Two more techniques you should name:
+
+- **Continuous batching.** Requests finish at different times (different output lengths). Static batching wastes the GPU waiting for the slowest request. Continuous batching swaps finished sequences out and new ones in at the token level, keeping utilization high. This is the single biggest throughput lever in production serving.
+- **Speculative decoding.** A small draft model proposes several tokens; the big model verifies them in one parallel pass, accepting the prefix that matches. When the draft is often right, you get multiple tokens per expensive forward pass — latency down, output identical to the target model.
+
+## RAG: retrieval is the hard part, not generation
+
+Enterprise document search over your own corpus. The generation is the easy 20%; retrieval quality determines whether the answer is grounded or hallucinated.
+
+<RAGPipelineViz />
+
+The decisions that actually matter:
+
+**Chunking.** Too large and you dilute the embedding and blow the context budget; too small and you sever the context a passage needs. Fixed-size chunking is the naive baseline; semantic or structure-aware chunking (by section, with overlap) is what production uses. This unglamorous choice moves retrieval quality more than the embedding model does.
+
+**Hybrid retrieval.** Dense embeddings capture semantic similarity but miss exact terms — part numbers, error codes, names. Sparse retrieval (BM25) nails those and misses paraphrase. Enterprise search needs both, fused (reciprocal rank fusion), because real queries contain both an exact identifier and a fuzzy intent.
+
+**Reranking.** First-stage retrieval optimizes recall cheaply; a cross-encoder reranker then reorders the top candidates for precision before they enter the prompt. Same retrieve-cheap/rerank-expensive pattern as recommendations and search — it recurs because it's the only shape that scales.
+
+The failure mode to preempt: garbage retrieval that the LLM confidently dresses up. Your evaluation has to measure retrieval (are the right chunks in context?) separately from generation (is the answer faithful to them?), or you can't tell which half is broken.
+
+## Fine-tuning: a pipeline, not a training run
+
+"Fine-tune a model" is a data and evaluation problem wearing a training costume.
+
+**Data curation** is 80% of the outcome — a few thousand high-quality, deduplicated, correctly-formatted examples beat a noisy pile. The interview signal is talking about data quality and eval before talking about the training method.
+
+**Method: LoRA vs full fine-tuning.** LoRA trains small low-rank adapters, freezing the base weights — cheap, fast, and you can host many adapters over one base model. It's the default. Reach for full fine-tuning only when you need a large behavioral shift LoRA can't reach, and be ready to justify the cost. (For alignment specifically, this is where preference methods like DPO enter — but scope that to when it's asked.)
+
+**Evaluation** is the part that separates a working pipeline from a vibe. You need a held-out eval set and, for generative quality, an LLM-as-judge or human eval with real rubrics — and a guard against regressions on general capability, because narrow fine-tuning routinely degrades everything you didn't fine-tune on. Then it's the same serving story as above.
+
+Across all three: LLM systems reward candidates who reason about memory and data quality, and who resist the pull to make it about model architecture. The architecture is fixed; the systems and data around it are the design.
+
+<Quiz />

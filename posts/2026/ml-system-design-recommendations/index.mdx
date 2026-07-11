@@ -1,0 +1,68 @@
+---
+title: "ML System Design: Recommendation Systems"
+slug: ml-system-design-recommendations
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 2
+tags: ["ml-system-design", "recommendations", "two-tower", "ranking", "candidate-generation"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "Candidate generation, ranking, and reranking — the three-stage funnel behind YouTube and Spotify. Two-tower retrieval, why the funnel exists, and how cold start is actually solved."
+---
+
+import { TwoTowerViz, RecommendationPipelineViz, Quiz } from './MLSystemDesignRecommendationsVisuals'
+
+Ask someone to "design YouTube recommendations" and the weak answer reaches for a single model that scores every video. There are billions of videos and you have tens of milliseconds. No model scores a billion items per request. The entire design is organized around that impossibility.
+
+The answer is a funnel: **candidate generation → ranking → reranking**. Each stage trades recall for precision, cutting the item space by orders of magnitude so the next stage can afford a heavier model.
+
+<RecommendationPipelineViz />
+
+## Candidate generation: recall over precision
+
+The first stage takes billions of items down to hundreds. It cannot afford per-item feature computation, so it leans on precomputed embeddings and approximate nearest-neighbor (ANN) search. You want *recall* here — missing a great video at this stage means it can never be recommended, no matter how good the ranker is. A false positive, by contrast, gets filtered downstream.
+
+In practice you run **several candidate generators in parallel** and union their outputs: a two-tower retrieval model, a "watched next" co-occurrence source, trending-in-your-region, fresh-uploads-from-subscriptions. Diversity of sources is what keeps the funnel from collapsing into a feedback loop.
+
+## The two-tower model
+
+The workhorse of modern retrieval. One tower embeds the user (history, context, demographics), a separate tower embeds the item (content features, ID embedding, metadata). Relevance is the dot product of the two embeddings.
+
+<TwoTowerViz />
+
+The reason this architecture dominates: the towers are independent. You embed all items **offline** and load them into an ANN index. At request time you compute *one* user embedding and do an ANN lookup. The expensive item tower never runs online. Contrast this with a cross-feature model that jointly consumes user and item — expressive, but it forces a full scan because there's no item embedding to precompute. That model is fine for ranking a few hundred candidates; it is impossible for retrieval over billions.
+
+Training uses in-batch negatives: for a batch of positive (user, item) pairs, every other item in the batch is a negative for that user. Cheap, and it scales the effective negative count with batch size. The catch is sampling bias toward popular items, which you correct with a logQ or popularity-based correction on the logits.
+
+## Ranking: precision over recall
+
+Now you have a few hundred candidates and a much larger latency budget per item. This is where the heavy model lives — a deep network consuming hundreds of features: user-item cross features, real-time signals (what you watched in the last five minutes), and dense embeddings from upstream.
+
+The key modeling decision is **what you predict**. "Probability of click" optimizes for clickbait. Mature systems predict a *vector* of engagement signals — watch time, completion, likes, shares, "not interested" — and combine them with a weighted objective the product team tunes. Multi-task models with shared bottoms and per-task heads are standard here; the shared representation regularizes the sparse-signal tasks (a share is far rarer than a click).
+
+## Reranking: the constraints the ranker ignores
+
+The ranker scores items independently, so its top-N is often near-duplicates — five clips from the same creator, or five takes on the same news event. Reranking imposes **list-level** properties: diversity, freshness, business rules, and policy filters. This is also where you inject exploration so the system keeps learning about items it's unsure of instead of exploiting a narrow slice forever.
+
+## Real-time vs batch features
+
+A recurring interview axis. Batch features (a user's 30-day watch history, an item's lifetime CTR) are computed in a pipeline and served from a store — cheap, stale by hours. Real-time features (the last three videos in this session) capture intent that batch misses entirely but cost you a low-latency feature pipeline and a serving path that can assemble them under budget. The honest answer is that you use both, and the interesting design work is the freshness/cost tradeoff per feature, not picking one camp.
+
+## Cold start, as actually solved
+
+The textbook answer is "use content features." True but incomplete. In practice:
+
+- **New items** lean on content embeddings (title, thumbnail, audio, transcript) so they're retrievable on day zero without any interaction history, plus a deliberate exploration budget that guarantees new uploads get *some* impressions to gather signal.
+- **New users** get context-only personalization (device, locale, referrer) plus popularity priors, and the system updates aggressively within the first session — early clicks are worth far more than steady-state ones.
+
+The unifying idea: cold start is an *exploration* problem, not just a features problem. If your reranker never surfaces uncertain items, no amount of content features saves you.
+
+## Spotify vs YouTube
+
+Same funnel, different physics. Music has a smaller catalog (tens of millions of tracks, not billions of videos) but far higher repeat consumption — you replay songs, you don't replay videos. That pushes Spotify toward sequence models over listening sessions and toward audio-content embeddings for the long tail. The candidate/rank/rerank skeleton is identical; the feature emphasis and the objective (session completion, saves) differ.
+
+<Quiz />

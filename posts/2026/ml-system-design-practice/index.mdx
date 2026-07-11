@@ -1,0 +1,43 @@
+---
+title: "ML System Design: The 20-Question Practice Set"
+slug: ml-system-design-practice
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 8
+tags: ["ml-system-design", "interviews", "practice", "preparation"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "All 20 canonical ML system design questions as an interview prep set — what makes each hard, the anchoring design decision, and what a strong answer includes. Prompts, not solutions."
+---
+
+import { QuestionExplorerViz, AnswerFrameworkViz, Quiz } from './MLSystemDesignPracticeVisuals'
+
+The rest of this series taught patterns. This post is the drill. Below are the twenty questions that come up, each stripped to three things: **what makes it hard**, the **one design decision** to anchor your answer, and **what a strong answer includes**. No full solutions — a memorized solution is worthless the moment the interviewer changes a constraint, which they will. What transfers is the instinct to find the hard part and build outward from it.
+
+Filter by category and work through them. For each, give yourself two minutes to name the anchor decision *before* you read it.
+
+<QuestionExplorerViz />
+
+## How to actually use this
+
+Don't read passively. For each card, run the framework from Post 1 out loud — requirements, ML task, data, features, model, serving, monitoring — and notice where you go vague. That vague spot is your gap. Most candidates are strong on modeling and thin on serving and monitoring; if that's you, spend your prep there, because that's where the differentiation is.
+
+Then practice the opening, because the first three minutes set the tone. A strong opening is always the same shape: restate the problem, ask the two or three clarifying questions that most change the design (scale, latency, the true objective), state your assumptions, and only then start designing. It sounds mechanical written down; under pressure it's what keeps you from the most common failure, which is confidently designing the wrong system.
+
+<AnswerFrameworkViz />
+
+## A few things that read as senior
+
+- **Baseline before sophistication.** "I'd ship logistic regression on these features, then justify a two-tower model against it" beats opening with the fanciest architecture every time.
+- **Name the proxy-label gap.** State what you're optimizing and where it diverges from what you actually want. Almost no junior candidate does this.
+- **Own the serving story.** Feature assembly under budget, the retrieval/ranking split, and the fallback when the model is down. This is half the interview and the half most people skip.
+- **Close the loop with monitoring.** Drift, training/serving skew, feature null-rates, the feedback loop. "Then we deploy it" is where weak answers stop.
+- **State tradeoffs, don't hide them.** "Shared embedding space is simpler and enables cross-modal retrieval but blurs fine detail; late fusion is the opposite" shows judgment. Picking silently shows memorization.
+
+The interviewer is not scoring whether you know the one right architecture — there usually isn't one. They're scoring whether you can navigate an underspecified problem to a defensible system and reason honestly about what breaks. Everything in this series was aimed at that. Now go run the cards.
+
+<Quiz />

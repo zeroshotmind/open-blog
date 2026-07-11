@@ -1,0 +1,76 @@
+---
+title: "ML System Design: A Framework That Actually Works"
+slug: ml-system-design-framework
+date: "2026-07-10"
+contentType: "blog-post"
+draft: false
+publishOnZeroShotMind: true
+series: "ml-system-design"
+seriesOrder: 1
+tags: ["ml-system-design", "interviews", "framework", "mlops"]
+authors:
+  - name: "Swastik Roy"
+    orcid: ""
+summary: "The universal seven-step framework for any ML system design problem — and the specific mistakes that make interviewers fail strong candidates."
+---
+
+import { FrameworkFlowViz, RequirementsViz, Quiz } from './MLSystemDesignFrameworkVisuals'
+
+Most ML system design failures aren't technical. The candidate knows two-tower models and knows what a feature store is, then spends forty minutes describing a model architecture for a problem nobody scoped. The interviewer isn't testing whether you can name a model. They're testing whether you can turn a vague product ask into a system with a defined objective, a data path, and a serving story that survives contact with production.
+
+This series works through the twenty questions that come up again and again. This first post is the scaffolding every one of them hangs on.
+
+## The seven steps
+
+<FrameworkFlowViz />
+
+The order matters and the early steps matter most. Time spent on requirements pays back tenfold; time spent prematurely on model architecture is usually wasted, because the architecture is downstream of decisions you haven't made yet.
+
+## 1. Clarify requirements
+
+Split them cleanly, because they drive different parts of the design.
+
+<RequirementsViz />
+
+**Functional**: what does the system do, for whom, when? "Recommend videos" is not a spec. *Recommend videos on the home feed, for logged-in users, refreshed each session, optimizing long-term watch time* — that is a spec, and every word of it constrains the design. Nail down scale (QPS, item count, user count), the latency budget, and how fresh predictions must be.
+
+**Non-functional**: latency, throughput, availability, cost. A 10ms budget rules out entire model classes. A billion items rules out scoring them all. These constraints do more to shape your architecture than any modeling choice.
+
+## 2. Frame the ML task
+
+Translate the product goal into a precise learning problem: what's the input, what's the label, what's the prediction. This is where the strongest signal shows up in an interview.
+
+The subtle part is the **proxy label**. You want "long-term user satisfaction," but you can only train on what you can log — clicks, watch time, a thumbs-up. Choosing a proxy that's cheap to collect but misaligned with the real goal is how you build a clickbait engine. Say out loud what you're optimizing and where it diverges from what you actually want.
+
+## 3. Data
+
+Where do labels come from, and how much can you get? Distinguish explicit feedback (ratings, reports) from implicit (clicks, dwell) — implicit is abundant and biased; explicit is sparse and cleaner. Name the biases you'll inherit: position bias, presentation bias, the feedback loop where the model's own outputs become tomorrow's training data. If you don't mention the feedback loop, a good interviewer will.
+
+## 4. Features
+
+Group them: user, item, context, and cross features. Flag which are **real-time** (this session's clicks) versus **batch** (30-day history) — this decision propagates all the way to your serving infrastructure and is worth naming explicitly. Mention the store early even if you detail it later.
+
+## 5. Model
+
+*Now* you pick an architecture — and usually you pick a progression. Start with a simple, shippable baseline (logistic regression, gradient-boosted trees) that gets a pipeline end-to-end, then justify added complexity against it. "I'd start with GBDT on these features, then move to a two-tower model once retrieval scale demands it" reads as far more senior than opening with the fanciest model you know.
+
+## 6. Serving
+
+The step candidates skip and interviewers care about most. Batch or real-time inference? Where do features get assembled under budget? What's your fallback when the model service is down — a cache, a popularity baseline, the previous model? How do retrieval and ranking split across the funnel? This is systems design, and it's half the interview.
+
+## 7. Monitoring
+
+You are not done at deploy. What breaks silently? Data drift, feature pipeline bugs (a feature that goes all-null), training/serving skew, model staleness. Name the metrics you'd alert on and separate model-quality metrics from system metrics. "I'd monitor prediction distribution and feature null-rates, and alert on drift" closes the loop.
+
+## The mistakes interviewers actually flag
+
+- **Jumping to the model.** Thirty seconds of scoping first. Always.
+- **No baseline.** Reaching for a transformer when logistic regression would ship and teach you the data.
+- **Ignoring serving constraints.** A brilliant model you can't run in 10ms is a failed design.
+- **Proxy-label blindness.** Optimizing clicks and calling it satisfaction, without acknowledging the gap.
+- **"Then we deploy it."** No monitoring, no feedback-loop awareness, no fallback path.
+- **One-way doors.** Not stating assumptions, so the interviewer can't redirect you when you drift off-scope.
+
+Treat the framework as a checklist you narrate, not a script you recite. The value is that it keeps you from leaving a whole dimension of the system unaddressed — which is exactly what separates a hire from a no-hire.
+
+<Quiz />
