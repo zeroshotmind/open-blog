@@ -1,0 +1,94 @@
+---
+title: "Reward Model Benchmarks: RewardBench Is Saturated, RewardBench 2 Isn't"
+date: "2026-07-17"
+slug: "llm-eval-reward-models"
+series: "LLM Evaluation & Benchmarks"
+order: 5
+tags: ["llm-evaluation", "benchmarks", "reward-models", "rlhf"]
+publishOnZeroShotMind: true
+draft: false
+excerpt: "RewardBench v1's top-6 spread is 5.7 points — small specialist models now dominate it. RewardBench 2 drops scores by 20 points and actually correlates with downstream RLHF. RM-Bench finds that style bias can push SOTA models below random performance."
+---
+
+import { SaturationViz, RB2Viz, Quiz } from './LLMEvalRewardModelsVisuals'
+
+A reward model (RM) is trained to predict which of two responses a human prefers. It's the signal source for RLHF: during training, the RM scores responses, and the policy is optimized to get high scores. During inference, RMs power best-of-N sampling — generate N responses, return the one the RM scores highest.
+
+If the RM is bad, everything downstream is bad. Which makes RM evaluation one of the highest-leverage places to look for failures in the alignment pipeline. The benchmarks for this are in active flux.
+
+---
+
+## RewardBench v1: saturated
+
+RewardBench (Allen AI, arXiv 2403.13787) was the first systematic RM benchmark. It covers 2,985 tasks across four categories — Chat, Chat-Hard, Safety, and Reasoning — and measures pairwise preference accuracy: does the RM score the chosen response above the rejected one?
+
+<SaturationViz />
+
+The top-6 spread is 5.7 points, below the 8-point saturation threshold. More telling: the top two models (Skywork-V2-Llama-8B-40M at 97.8 and Skywork-V2-Llama-8B at 96.4) have at most 8 billion parameters. Tiny specialist models are outcompeting large general-purpose ones.
+
+The Skywork-V2 paper made the stagnation explicit: among the top 20 models on RewardBench v1, 16 directly or indirectly use the same base model, or are fine-tuned on highly similar training data. Progress on the leaderboard had flatlined since September 2024. Labs were converging on the same model and data recipe that happened to work well on v1's fixed format, not on genuine alignment quality.
+
+When leaderboard optimization and real quality diverge, the benchmark loses its purpose.
+
+---
+
+## RewardBench 2: harder, correlated with outcomes
+
+RewardBench 2 (arXiv 2506.01937, ICLR 2026) was built to fix what v1 revealed. Two structural changes:
+
+**Best-of-4 format.** v1 asked: does the RM prefer the chosen response over one rejected response? v2 asks: can the RM identify the best response from four candidates? This compresses the distance between top models and random performance, making the benchmark harder to saturate.
+
+**New human prompts.** v2 sources most prompts from WildChat — real user conversations, not repurposed downstream evaluation sets. This reduces the risk that model developers inadvertently train against the benchmark.
+
+The benchmark also adds three new domains: **factuality** (does the RM prefer accurate responses?), **precise instruction following** (does it reward constraint compliance?), and **ties** (is it calibrated enough to give similar scores to genuinely equivalent responses?).
+
+<RB2Viz />
+
+Models score roughly 20 points lower than on v1. The top-6 spread of 8.3 points is real signal. Crucially, RewardBench 2 scores correlate strongly with downstream performance: Pearson correlation of ~0.87 against best-of-N (BoN) sampling on GSM8K, MATH, HumanEval+, and BBH. v1 had weaker downstream correlation, meaning it was testing something adjacent to, but not quite the same as, "will this RM help my model improve?"
+
+---
+
+## RM-Bench: style bias can flip the result
+
+RM-Bench (THU, arXiv 2410.16184) tests a different failure mode: sensitivity to style rather than content.
+
+The setup: present an RM with two responses that differ in both quality and style. One response is better in content but shorter/less polished. The other is worse in content but longer, uses more sophisticated vocabulary, and presents itself more confidently. Does the RM prefer the better response or the more impressive-looking one?
+
+The answer, for many RMs: the impressive-looking one.
+
+The headline finding is stark: when facing style bias interference, SOTA models achieve only 46.6% average accuracy — below random (50%). The RM is actively choosing the worse response more than half the time, purely because of surface-level stylistic signals.
+
+Selected RM-Bench scores from the Skywork-V2 paper:
+
+| Model | RM-Bench |
+|-------|----------|
+| Skywork-V2-Llama-8B | 92.8 |
+| Skywork-V2-Qwen3-8B | 82.6 |
+| INF-ORM-Llama3.1-70B | 75.4 |
+| ArmoRM-Llama3-8B | 69.2 |
+
+The RM-Bench scores and RewardBench v1 scores for these models can diverge substantially. A model that looks strong on v1 (where style is partially correlated with quality in the training distribution) may fail on RM-Bench when style and quality are deliberately decorrelated.
+
+Style bias in RMs has a direct consequence in training: if the RM rewards verbose, confident-sounding text regardless of accuracy, RLHF will produce models that are verbose and confident. This is one plausible mechanism for reward hacking in deployed systems.
+
+---
+
+## Cross-benchmark correlation
+
+The Skywork-V2 paper evaluated 31 top open reward models across seven benchmarks: RewardBench v1, RewardBench v2, PPE Pref, PPE Corr, RMB, RM-Bench, and JudgeBench. The cross-benchmark Pearson correlation was mixed — some pairs correlate well, others don't.
+
+This matters because if two RM benchmarks don't agree on which model is better, at least one of them is measuring something different from real alignment quality. The goal of the field is to identify which benchmarks correlate with downstream RLHF outcomes (RewardBench 2 was specifically designed for this) rather than which ones produce flattering leaderboard numbers.
+
+A separate concern: self-preference bias in RM evaluation (related to arXiv 2410.21819). An RM based on a language model inherits stylistic preferences from its pretraining distribution. When it judges responses, it may score text that resembles its training distribution higher, regardless of quality. This means the same base-model bias that affects creative writing judges (see post 3 in this series) also affects reward models used in RLHF.
+
+---
+
+## What the numbers mean
+
+RewardBench v1 is not useful for distinguishing frontier reward models — it's a floor test now. RewardBench 2 is the current best benchmark for reward models that will be used in RLHF or inference-time scaling, because it was explicitly validated against those downstream uses.
+
+RM-Bench reveals a specific failure mode — style over substance — that RewardBench's format doesn't expose. Both should be used: v2 for overall quality, RM-Bench to check that the RM isn't being fooled by length and polish.
+
+The field is still developing. None of these benchmarks measure everything. But the combination of a saturated v1, a validated v2, and a specialized style-bias test is substantially better than running any one of them in isolation.
+
+<Quiz />

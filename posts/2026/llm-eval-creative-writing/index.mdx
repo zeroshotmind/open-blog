@@ -1,0 +1,127 @@
+---
+title: "Creative Writing Benchmarks: When the Rubric Runs Out of Signal"
+date: "2026-07-17"
+slug: "llm-eval-creative-writing"
+series: "LLM Evaluation & Benchmarks"
+order: 3
+tags: ["llm-evaluation", "benchmarks", "creative-writing"]
+publishOnZeroShotMind: true
+draft: false
+excerpt: "EQ-Bench CW v3 rubric scores are already saturated at the top — a 0.35-point spread across 10 models. Elo still discriminates. Here's what that gap reveals about how we evaluate creative writing."
+---
+
+import { SaturationViz, EloVsRubricTable, Quiz } from './LLMEvalCreativeWritingVisuals'
+
+Creative writing is the hardest thing to evaluate automatically. There's no ground truth, quality is partly subjective, and the best models are producing work that even skilled human readers struggle to rank. So benchmark designers have two choices: use a rubric (consistent but eventually saturates) or use pairwise preference voting (more sensitive but harder to run).
+
+EQ-Bench CW v3 runs both, and that's where things get interesting.
+
+---
+
+## The leaderboard at a glance
+
+EQ-Bench CW v3 (n=111 items, judge = Claude Sonnet 4.6) gives each response a rubric score out of 20 and an Elo derived from pairwise comparisons. The table shows why you need both:
+
+<EloVsRubricTable />
+
+The highest rubric scorer — gpt-5.5 at 17.01 — sits fourth by Elo. gpt-5.6-sol leads on Elo by 52 points over claude-fable-5, but trails it on rubric by 0.03 points. These two measures are not tracking the same thing.
+
+---
+
+## The saturation problem
+
+<SaturationViz />
+
+The top-10 rubric spread is 0.35 points — comfortably below the 1.0-point saturation threshold. At this resolution, random noise from the judge swamps any real signal between, say, claude-fable-5 (16.81) and gpt-5.6-sol (16.78). The rubric tells you the bottom of the leaderboard is worse, but it can't rank the top.
+
+Elo doesn't have this problem — it's derived from many pairwise comparisons, so small consistent quality differences accumulate into real separation. The 313-point spread between gpt-5.6-sol (2208) and o3 (1732) is statistically meaningful even if the rubric scores for those two models (16.78 vs 16.28) barely differ.
+
+---
+
+## Why v2 was retired
+
+This isn't the first time EQ-Bench hit saturation. The v2 top-10 rubric spread was 3.83 points — still usable — but a telling failure emerged: a 9B community fine-tune (gemma-2-Ifable-9B) tied GPT-4o exactly. When a compact fine-tune matches a frontier model, either the small model has genuinely caught up, or the benchmark has a ceiling problem. The maintainer cited saturation explicitly as the redesign motivation.
+
+v3 was rebuilt to push that ceiling higher. The rubric has already re-saturated at the top — not because the benchmark failed, but because the models improved faster than the benchmark predicted.
+
+---
+
+## EQ-Bench 3: general creative quality
+
+EQ-Bench 3 (judge = Claude Opus 4.6, n=79) covers broader creative quality rather than story writing specifically:
+
+- **claude-fable-5**: Elo 2050, Rubric 82.6, CI 1977–2122
+- **claude-opus-4-8**: Elo 2030, Rubric 83.3, CI 1973–2086
+
+The confidence intervals overlap substantially. These two models are not statistically separated on this benchmark — the uncertainty is larger than the gap.
+
+---
+
+## Human votes: LMArena Creative Writing
+
+LMArena runs live human pairwise voting. Votes are real, but they bring their own problems.
+
+| Rank | Model | Elo | Votes |
+|------|-------|-----|-------|
+| #1 | claude-fable-5 | 1512 ±16 | 1,631 |
+| #2 | claude-opus-4-6-thinking | 1500 ±7 | 10,411 |
+| #4 | gemini-3-pro | 1485 ±8 | — |
+| #9 | gemini-3.1-pro-preview | 1478 ±7 | 13,642 |
+| #26 | gpt-5.5-high | 1448 ±8 | — |
+
+The top 9 models have overlapping confidence intervals — none are statistically resolved from each other. claude-fable-5 sits #1 with only 1,631 votes; its wide CI (±16) means it could plausibly rank anywhere in the top 4. claude-opus-4-6-thinking has 6× more votes and a narrower CI, but sits 12 Elo points lower.
+
+More votes tighten the CI. The arena needs at minimum tens of thousands of votes per model before rankings stabilize.
+
+---
+
+## Longform: where the gap widens
+
+EQ-Bench Longform (n=120) exposes a different split:
+
+| Model | Score | Slop/1k |
+|-------|-------|---------|
+| claude-fable-5 | 83.0 | 8.31 |
+| claude-opus-4-7 | 81.8 | 9.06 |
+| gemini-3-pro-preview | 68.8 | 38.54 |
+| o3 | 62.7 | 33.03 |
+
+The gap between the top two and the bottom two is 14–20 points — far larger than on CW v3. Longform writing amplifies weak tendencies. Reasoning models (o3) fare particularly badly: their tendency toward explicit structure and hedged language shows as slop at scale.
+
+---
+
+## Slop: the metric that still moves
+
+Slop counts overused LLM phrases per 1,000 words. The human baseline is 6.90. Most models score 10–40. Only one anti-slop-tuned model has beaten the human baseline.
+
+The "not X but Y" construction (e.g., "not a coincidence but a consequence") tells a similar story: humans average 0.04 per 1k characters; LLMs run 0.09–0.81, a 2–20× excess.
+
+Slop isn't a quality score — you can write good prose with some clichés. But it correlates with generic, interchangeable writing: text that doesn't surprise. The models with high slop on the longform benchmark (gemini-3-pro-preview at 38.54, o3 at 33.03) are also the ones with low longform scores.
+
+---
+
+## What the research papers say
+
+Several 2025 papers poked at creative writing evaluation from different angles:
+
+**LitBench** (Stanford, arXiv 2507.00769): evaluated automated judges against human literary professionals. The best off-the-shelf judge reached 73% agreement with human consensus — a useful ceiling to keep in mind.
+
+**WQ benchmark** (Salesforce, arXiv 2504.07532): tested SOTA LLMs on formal writing quality as assessed by writing professionals. Finding: models "barely outperform random baselines." Not because the models write poorly in an absolute sense, but because writing professionals apply criteria (specificity, risk-taking, voice distinctiveness) that rubric-based evaluation systematically underweights.
+
+**WritingBench** (Alibaba, arXiv 2503.05244): top-6 spread 0.40 → SATURATED. More troublingly, a fine-tuned 7B model beat GPT-4o on its own benchmark. When the benchmark is designed by the same lab that fine-tunes against it, the fine-tune wins. This is a form of benchmark contamination that automated rubric evaluation can't detect.
+
+**Self-preference bias** (arXiv 2410.21819): LLM judges prefer "texts more familiar to them, regardless of whether outputs were self-generated." A judge model with stylistic affinities will systematically overrate stylistically similar text. EQ-Bench's maintainer acknowledged this isn't controlled for in the current setup.
+
+---
+
+## What to take away
+
+Rubric-based creative writing evaluation saturates quickly once frontier models converge on competent prose. The rubric can tell you a model is bad; it can't tell you which of several good models is better.
+
+Elo from pairwise comparisons keeps discriminating, but needs volume. Human-vote arenas (LMArena) require tens of thousands of votes per model before CIs stop overlapping.
+
+Slop remains the most actionable single metric: it measures a known failure mode, it has a human baseline to compare against, and it doesn't require a judge at all.
+
+The structural problem is deeper: judges have stylistic preferences, rubrics can be fine-tuned against, and the dimension that actually matters — genuine originality — doesn't reduce to any measurable proxy anyone has found yet.
+
+<Quiz />

@@ -1,0 +1,107 @@
+---
+title: "Formatting & Output Validation Benchmarks: IFEval Is Saturated, IFBench Isn't"
+date: "2026-07-17"
+slug: "llm-eval-formatting"
+series: "LLM Evaluation & Benchmarks"
+order: 4
+tags: ["llm-evaluation", "benchmarks", "formatting", "structured-output"]
+publishOnZeroShotMind: true
+draft: false
+excerpt: "IFEval's top-5 span fewer than 2 percentage points — frontier models have converged on its constraint set. IFBench exposes a 29pp gap between Grok and Claude on out-of-distribution constraints. And SOB shows that JSON schema compliance is not the same as correct field values."
+---
+
+import { IFBenchViz, SOBViz, Quiz } from './LLMEvalFormattingVisuals'
+
+Formatting benchmarks test a question that sounds simple: can the model do what you told it to do? Write exactly 400 words. Include the keyword "luminous" three times. Return valid JSON matching this schema. The question matters because practical applications break when the format is wrong — the JSON parser crashes, the downstream step receives garbage, the constraint is silently violated.
+
+The benchmarks in this space have split into two problems: verifiable format constraints (IFEval family) and structured output accuracy (JSON/schema benchmarks). They've reached very different saturation states.
+
+---
+
+## IFEval: verifiable constraints, saturated at the top
+
+IFEval (Google, arXiv 2311.07911) defines 25 types of verifiable instructions across ~500 prompts. Verifiable means automatically checkable: word count, keyword inclusion, sentence count, forbidden words, capitalization rules. No judge required.
+
+The benchmark was useful when it launched in 2023. By mid-2026, the top of the leaderboard has converged:
+
+| Rank | Model | IFEval Score |
+|------|-------|-------------|
+| 1 | Qwen3.5-27B | 95.0% |
+| 2 | Qwen3.7-Plus | 94.6% |
+| 3 | Qwen3.6 Plus | 94.3% |
+| 3 | Qwen3.7 Max | 94.3% |
+| 5 | o3-mini | 93.9% |
+| 7 | Claude 3.7 Sonnet | 93.2% |
+
+The top-5 spread is 1.1pp. The top-10 spread is around 1.8pp. At this density, measurement noise dominates — re-running with different random seeds would likely reorder the top cluster. IFEval still useful as a floor check, but it can't tell you which frontier model follows instructions better.
+
+The Qwen3.5 family has six entries in the top 12. This likely reflects deliberate optimization against the benchmark's fixed constraint set, not genuine general instruction-following ability.
+
+---
+
+## IFBench: generalization, not saturated
+
+IFBench (Allen AI, arXiv 2507.02833) was built specifically because IFEval's 25 constraint types can be learned. It introduces 58 novel, diverse, verifiable constraints that are out-of-distribution relative to IFEval — things the training pipeline never specifically targeted.
+
+<IFBenchViz />
+
+The distribution flips. Toggle between the two benchmarks to see it:
+
+- On IFEval, the top cluster sits at 93–95%, with most capable models within 2pp of each other.
+- On IFBench, Grok 4.3 leads at 83.3%; Claude models cluster at 54–59%. A 29pp gap separates the top from capable mid-tier models.
+
+GPT-4.1 scored above 87% on IFEval but below 50% on IFBench when it was first evaluated. This is the key finding: strong IFEval performance doesn't transfer to out-of-distribution constraints. Models overfit to the constraint vocabulary, not to the underlying instruction-following skill.
+
+Reasoning-augmented models (Grok 4 series) show a large advantage on IFBench. This suggests explicit reasoning at inference time helps with novel constraints, whereas standard instruction-tuning mostly memorizes the known ones.
+
+---
+
+## FollowBench: multi-level constraint difficulty
+
+FollowBench (ACL 2024) tests multi-constraint following with five difficulty levels. Each level adds one more constraint to the prompt. The headline metric is Hard Satisfaction Rate (HSR): a prompt scores 1 only if ALL constraints are satisfied simultaneously.
+
+HSR is deliberately harsh. A model satisfying 4 of 5 constraints scores 0. This measures whether models can handle constraint conjunction — a problem that gets harder combinatorially as constraint count increases.
+
+Evaluated on 13 models at release, the benchmark showed most LLMs degrading substantially as difficulty level increases. Per-constraint accuracy stays reasonable; HSR drops much faster. The failure mode is constraint forgetting: the model satisfies the first three constraints then quietly drops the fourth.
+
+---
+
+## InFoBench: decomposed requirements
+
+InFoBench measures following via the Decomposed Requirements Following Ratio (DRFR). Complex instructions get broken into atomic YES/NO subchecks, each evaluated independently. The overall score is the fraction of sub-requirements met.
+
+DRFR gives partial credit that IFEval's binary pass/fail doesn't. It's more useful for debugging — you can see exactly which requirement types trip a model — but it's also more forgiving: a model that satisfies 9/10 sub-requirements looks nearly perfect even if it misses the same critical one every time.
+
+The two metrics complement each other. DRFR for diagnostic analysis; HSR (FollowBench) for deployment readiness.
+
+---
+
+## Structured output: the JSON gap
+
+When models must return structured JSON matching a schema, two things can go wrong: the JSON doesn't parse, or the JSON parses but the values are wrong.
+
+Schema-only benchmarks like JSONSchemaBench (arXiv 2501.10868) focus on the first problem. JSONSchemaBench uses 10K real-world schemas of varying complexity. On simple schemas (GlaiveAI), all frameworks score above 86%. On GitHub-Hard schemas with multi-level nesting and complex pattern constraints, Guidance drops to 41%, Llamacpp to 39%, XGrammar to 28%. Constrained decoding frameworks fail on complexity, not on the basic task.
+
+But the harder problem is value accuracy — correct structure, wrong values. SOB (Structured Output Benchmark, arXiv 2604.25359) measures this directly across 21 models:
+
+<SOBViz />
+
+JSON Pass Rate (emerald bars) and Value Accuracy (violet bars) track separately. Every model clears 84% on JSON parsing. No model clears 80.4% on field-level value accuracy. The gap — structurally valid JSON with wrong leaf values — is invisible to schema-only evaluation.
+
+Drop to image source: value accuracy falls to 67.2%. On audio transcripts: 23.7%. The model produces valid JSON that confidently states incorrect facts extracted from non-text inputs.
+
+This is a class of hallucination that's particularly dangerous in data pipelines: the response parses, validates, and looks correct. The wrong value propagates silently.
+
+StructEval (arXiv 2505.20139) tests 18 structured formats across 44 task types. Even o1-mini only reaches a 75.58 average. Forcing models into rigid output formats doesn't prevent reasoning failures; it just makes them harder to detect.
+
+---
+
+## The bottom line
+
+IFEval is saturated at the frontier. It's still a useful sanity check — a model that scores below 85% isn't ready — but it can no longer rank the best models against each other.
+
+IFBench restores discriminatory power by using out-of-distribution constraints. The 29pp gap between Grok and Claude shows these models are genuinely different in instruction-following generalization, which IFEval hid.
+
+For structured output: JSON schema compliance is necessary but insufficient. SOB's value accuracy metric reveals the real failure rate. A pipeline that only validates schemas will miss the most common structured-output failure.
+
+<Quiz />
