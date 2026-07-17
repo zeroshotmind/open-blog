@@ -14,7 +14,7 @@ authors:
 summary: "IFEval's top-5 span fewer than 2 percentage points — frontier models have converged on its constraint set. IFBench exposes a 29pp gap between Grok and Claude on out-of-distribution constraints. And SOB shows that JSON schema compliance is not the same as correct field values."
 ---
 
-import { IFBenchViz, SOBViz, Quiz } from './LLMEvalFormattingVisuals'
+import { IFBenchViz, SOBViz, SampleTasks, Quiz } from './LLMEvalFormattingVisuals'
 
 Formatting benchmarks test a question that sounds simple: can the model do what you told it to do? Write exactly 400 words. Include the keyword "luminous" three times. Return valid JSON matching this schema. The question matters because practical applications break when the format is wrong — the JSON parser crashes, the downstream step receives garbage, the constraint is silently violated.
 
@@ -107,5 +107,11 @@ IFEval is saturated at the frontier. It's still a useful sanity check — a mode
 IFBench restores discriminatory power by using out-of-distribution constraints. The 29pp gap between Grok and Claude shows these models are genuinely different in instruction-following generalization, which IFEval hid.
 
 For structured output: JSON schema compliance is necessary but insufficient. SOB's value accuracy metric reveals the real failure rate. A pipeline that only validates schemas will miss the most common structured-output failure.
+
+## What IFEval's verifiable constraints actually look like
+
+Each IFEval prompt embeds one or more mechanically-checkable constraints. Here are four real prompts from the dataset, covering the main formatting constraint categories — JSON, capitalization, sections, postscript, and forbidden words:
+
+<SampleTasks />
 
 <Quiz />

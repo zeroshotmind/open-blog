@@ -95,4 +95,10 @@ RM-Bench reveals a specific failure mode — style over substance — that Rewar
 
 The field is still developing. None of these benchmarks measure everything. But the combination of a saturated v1, a validated v2, and a specialized style-bias test is substantially better than running any one of them in isolation.
 
+## What RewardBench triplets look like
+
+RewardBench structures its data as (prompt, chosen, rejected) triplets across four categories: Chat, Chat-Hard, Safety, and Reasoning. The RM scores both responses and the benchmark checks whether it ranks `chosen` above `rejected`.
+
+The actual triplet data from the dataset (allenai/reward-bench, 2,985 filtered rows) was not directly fetchable at time of writing — the Parquet files are hosted on Hugging Face but timed out during fetch. The dataset is publicly available at [huggingface.co/datasets/allenai/reward-bench](https://huggingface.co/datasets/allenai/reward-bench) under Apache 2.0. The RewardBench 2 dataset (arXiv 2506.01937) sources prompts from WildChat and adds Factuality, Instruction Following, and Ties categories.
+
 <Quiz />

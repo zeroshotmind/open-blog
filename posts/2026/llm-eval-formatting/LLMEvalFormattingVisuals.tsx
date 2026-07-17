@@ -175,6 +175,101 @@ export function SOBViz() {
   )
 }
 
+// ─── SampleTasks ─────────────────────────────────────────────────────────────
+// Real IFEval prompts (formatting-focused) from google-research/instruction_following_eval
+
+const FORMAT_SAMPLES = [
+  {
+    key: '1075',
+    prompt:
+      "Can you help me make an advertisement for a new product? It's a diaper that's designed to be more comfortable for babies and I want the entire output in JSON format.",
+    constraints: ['detectable_format:json_format'],
+    note: 'The entire response must be valid JSON — no surrounding text allowed.',
+  },
+  {
+    key: '1021',
+    prompt:
+      'Write a 2 paragraph critique of the following sentence in all capital letters, no lowercase letters allowed: "If the law is bad, you should not follow it". Label each paragraph with PARAGRAPH X.',
+    constraints: [
+      'change_case:english_capital',
+      'detectable_format:multiple_sections (PARAGRAPH, 2)',
+    ],
+  },
+  {
+    key: '1219',
+    prompt:
+      'Which one is a better brand for sneakers: Prada or Nike? Your entire response should be in English, and in all capital letters. At the end of your response, please explicitly add a postscript starting with P.S. The word sneaker should appear 10 or more times in your response.',
+    constraints: [
+      'change_case:english_capital',
+      'detectable_content:postscript (marker=P.S.)',
+      'keywords:frequency (sneaker ≥10)',
+    ],
+  },
+  {
+    key: '1132',
+    prompt:
+      'Write the lyrics to a hit song by the rock band \'The Gifted and The Not Gifted\'. To make it rocky, the response should be in all capital letters. The word "rock" should not appear in your response.',
+    constraints: [
+      'change_case:english_capital',
+      'keywords:forbidden_words (rock)',
+    ],
+    note: 'Three simultaneously verifiable constraints: case, format, and forbidden word.',
+  },
+]
+
+export function SampleTasks() {
+  return (
+    <div className="my-6 flex flex-col gap-4">
+      <div className="flex items-center gap-2 mb-1">
+        <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          What IFEval constraints actually look like
+        </p>
+        <span className="text-xs text-slate-400 dark:text-slate-500">
+          — 4 real prompts from the dataset (google-research/instruction_following_eval)
+        </span>
+      </div>
+      {FORMAT_SAMPLES.map((task) => (
+        <div
+          key={task.key}
+          className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4"
+        >
+          <div className="text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wide mb-2">
+            key {task.key}
+          </div>
+          <pre className="text-xs text-slate-700 dark:text-slate-200 whitespace-pre-wrap font-mono bg-slate-50 dark:bg-slate-800 rounded-lg p-3 overflow-x-auto leading-relaxed">
+            {task.prompt}
+          </pre>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {task.constraints.map((c, ci) => (
+              <span
+                key={ci}
+                className="text-xs bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 rounded px-2 py-0.5 font-mono"
+              >
+                {c}
+              </span>
+            ))}
+          </div>
+          {task.note && (
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400 italic">{task.note}</p>
+          )}
+        </div>
+      ))}
+      <p className="text-xs text-slate-400 dark:text-slate-500">
+        Source:{' '}
+        <a
+          href="https://github.com/google-research/google-research/tree/master/instruction_following_eval"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline"
+        >
+          google-research/instruction_following_eval
+        </a>{' '}
+        · input_data.jsonl · Apache 2.0
+      </p>
+    </div>
+  )
+}
+
 // ─── Quiz ────────────────────────────────────────────────────────────────────
 
 type QItem = { q: string; options: string[]; answer: number; explanation: string }

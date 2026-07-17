@@ -14,7 +14,7 @@ authors:
 summary: "IFEval's top-10 spread is 2.9pp — six of the top 12 spots go to Qwen3.5 variants. IFBench then shows a 29pp gap between reasoning models and standard instruction-tuned ones on constraints none of them trained against."
 ---
 
-import { SaturationViz, IFBenchLeaderboard, Quiz } from './LLMEvalInstructionFollowingVisuals'
+import { SaturationViz, IFBenchLeaderboard, SampleTasks, Quiz } from './LLMEvalInstructionFollowingVisuals'
 
 The core question in instruction-following evaluation is simple: did the model do what it was told? Answering it turns out to be hard. Human evaluation is slow and inconsistent. LLM judges introduce bias and circularity. The field's solution has been to focus on *verifiable* instructions — constraints you can check with a rule rather than a judge. That bet has paid off and created a new problem: models have learned to optimize against the specific constraint vocabulary that evaluators use.
 
@@ -90,5 +90,11 @@ The four benchmarks measure different things and have different saturation state
 IFEval is the floor test: fail it and you're not ready. IFBench is the current frontier discriminator. FollowBench and InFoBench are diagnostic tools — they tell you *how* a model fails, not just *whether* it does.
 
 For production decisions: if your use case involves structured, predictable constraints (format rules, JSON, word limits), IFEval and InFoBench are sufficient signals. If you're shipping agents that receive arbitrary natural language constraints from users, IFBench is the evaluation that actually predicts real-world failure.
+
+## What IFEval actually looks like
+
+Each IFEval prompt bundles one or more verifiable constraints into a natural-language request. The checker runs a rule against the model's output — no judge needed. Here are four real prompts from the dataset:
+
+<SampleTasks />
 
 <Quiz />

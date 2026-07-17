@@ -178,6 +178,109 @@ export function BenchmarkStatusTable() {
   )
 }
 
+// ─── SampleTasks ─────────────────────────────────────────────────────────────
+// Real MT-Bench questions from lm-sys/FastChat mt_bench/question.jsonl
+
+const MT_BENCH_SAMPLES = [
+  {
+    id: 81,
+    category: 'writing',
+    turn1:
+      'Compose an engaging travel blog post about a recent trip to Hawaii, highlighting cultural experiences and must-see attractions.',
+    turn2: 'Rewrite your previous response. Start every sentence with the letter A.',
+  },
+  {
+    id: 101,
+    category: 'reasoning',
+    turn1:
+      'Imagine you are participating in a race with a group of people. If you have just overtaken the second person, what\'s your current position? Where is the person you just overtook?',
+    turn2:
+      'If the "second person" is changed to "last person" in the above question, what would the answer be?',
+    note: 'Reference: Turn 1 = "You are in second place." · Turn 2 = "Uncertain."',
+  },
+  {
+    id: 111,
+    category: 'math',
+    turn1:
+      'The vertices of a triangle are at points (0, 0), (-1, 1), and (3, 3). What is the area of the triangle?',
+    turn2: "What's area of the circle circumscribing the triangle?",
+    note: 'Reference: Turn 1 = Area is 3 · Turn 2 = 5π',
+  },
+  {
+    id: 121,
+    category: 'coding',
+    turn1:
+      'Develop a Python program that reads all the text files under a directory and returns top-5 words with the most number of occurrences.',
+    turn2: 'Can you parallelize it?',
+  },
+]
+
+const CATEGORY_COLORS: Record<string, string> = {
+  writing: 'bg-violet-50 dark:bg-violet-950/40 text-violet-700 dark:text-violet-300 border-violet-200 dark:border-violet-800',
+  reasoning: 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800',
+  math: 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800',
+  coding: 'bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800',
+}
+
+export function SampleTasks() {
+  return (
+    <div className="my-6 flex flex-col gap-4">
+      <div className="flex items-center gap-2 mb-1">
+        <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          What MT-Bench actually looks like
+        </p>
+        <span className="text-xs text-slate-400 dark:text-slate-500">
+          — 4 real questions from question.jsonl (lm-sys/FastChat)
+        </span>
+      </div>
+      {MT_BENCH_SAMPLES.map((task) => (
+        <div
+          key={task.id}
+          className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4"
+        >
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs font-mono text-slate-400 dark:text-slate-500">Q{task.id}</span>
+            <span
+              className={`text-xs font-semibold border rounded px-2 py-0.5 ${CATEGORY_COLORS[task.category] ?? ''}`}
+            >
+              {task.category}
+            </span>
+          </div>
+          <div className="flex flex-col gap-2">
+            <div>
+              <div className="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">Turn 1</div>
+              <pre className="text-xs text-slate-700 dark:text-slate-200 whitespace-pre-wrap font-mono bg-slate-50 dark:bg-slate-800 rounded-lg p-3 overflow-x-auto leading-relaxed">
+                {task.turn1}
+              </pre>
+            </div>
+            <div>
+              <div className="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">Turn 2</div>
+              <pre className="text-xs text-slate-700 dark:text-slate-200 whitespace-pre-wrap font-mono bg-slate-50 dark:bg-slate-800 rounded-lg p-3 overflow-x-auto leading-relaxed">
+                {task.turn2}
+              </pre>
+            </div>
+          </div>
+          {task.note && (
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400 italic">{task.note}</p>
+          )}
+        </div>
+      ))}
+      <p className="text-xs text-slate-400 dark:text-slate-500">
+        Source:{' '}
+        <a
+          href="https://github.com/lm-sys/FastChat/blob/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline"
+        >
+          lm-sys/FastChat · mt_bench/question.jsonl
+        </a>{' '}
+        · Apache 2.0
+      </p>
+    </div>
+  )
+}
+
 // ─── Quiz ────────────────────────────────────────────────────────────────────
 
 type QItem = { q: string; options: string[]; answer: number; explanation: string }

@@ -172,6 +172,97 @@ export function IFBenchLeaderboard() {
   )
 }
 
+// ─── SampleTasks ─────────────────────────────────────────────────────────────
+// Real IFEval prompts from google-research/instruction_following_eval input_data.jsonl
+
+const IFEVAL_SAMPLES = [
+  {
+    key: '1300',
+    prompt:
+      'Write a short proposal for a new research project that investigates how language evolves over time. I want to make it challenging, so:\n1. Do not include any commas in your response.\n2. Do not include the letter "c" anywhere in your response.\n3. Your response should contain at least 250 words.',
+    constraints: [
+      'punctuation:no_comma',
+      'keywords:letter_frequency (letter="c", count<1)',
+      'length_constraints:number_words (≥250)',
+    ],
+  },
+  {
+    key: '1127',
+    prompt:
+      'Write a poem about how I am missing my classes. The poem must have 4 sections marked with SECTION X. Finish the poem with this exact phrase: "Can I get my money back for the classes I missed?"',
+    constraints: [
+      'detectable_format:multiple_sections (SECTION, 4)',
+      'startend:end_checker (exact closing phrase)',
+    ],
+  },
+  {
+    key: '1082',
+    prompt:
+      'Write a story of exactly 2 paragraphs about a man who wakes up one day and realizes that he\'s inside a video game. Separate the paragraphs with the markdown divider: ***',
+    constraints: ['length_constraints:number_paragraphs (2)'],
+  },
+  {
+    key: '1000',
+    prompt:
+      'Write a 300+ word summary of the wikipedia page "https://en.wikipedia.org/wiki/Raymond_III,_Count_of_Tripoli". Do not use any commas and highlight at least 3 sections that has titles in markdown format, for example *highlighted section part 1*, *highlighted section part 2*, *highlighted section part 3*.',
+    constraints: [
+      'punctuation:no_comma',
+      'detectable_format:number_highlighted_sections (≥3)',
+      'length_constraints:number_words (≥300)',
+    ],
+  },
+]
+
+export function SampleTasks() {
+  return (
+    <div className="my-6 flex flex-col gap-4">
+      <div className="flex items-center gap-2 mb-1">
+        <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          What IFEval actually looks like
+        </p>
+        <span className="text-xs text-slate-400 dark:text-slate-500">
+          — 4 real prompts from the dataset (google-research/instruction_following_eval)
+        </span>
+      </div>
+      {IFEVAL_SAMPLES.map((task) => (
+        <div
+          key={task.key}
+          className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4"
+        >
+          <div className="text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wide mb-2">
+            key {task.key}
+          </div>
+          <pre className="text-xs text-slate-700 dark:text-slate-200 whitespace-pre-wrap font-mono bg-slate-50 dark:bg-slate-800 rounded-lg p-3 overflow-x-auto leading-relaxed">
+            {task.prompt}
+          </pre>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {task.constraints.map((c, ci) => (
+              <span
+                key={ci}
+                className="text-xs bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 rounded px-2 py-0.5 font-mono"
+              >
+                {c}
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+      <p className="text-xs text-slate-400 dark:text-slate-500">
+        Source:{' '}
+        <a
+          href="https://github.com/google-research/google-research/tree/master/instruction_following_eval"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline"
+        >
+          google-research/instruction_following_eval
+        </a>{' '}
+        · input_data.jsonl · Apache 2.0
+      </p>
+    </div>
+  )
+}
+
 // ─── Quiz ────────────────────────────────────────────────────────────────────
 
 type QItem = { q: string; options: string[]; answer: number; explanation: string }

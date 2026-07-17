@@ -14,7 +14,7 @@ authors:
 summary: "MT-Bench's frontier models cluster above 9.0 — the scale is out of room. AlpacaEval 2.0's length-controlled win rate is now saturated above 95% for top models. LMArena Elo keeps separating models as long as votes keep coming in — and they do."
 ---
 
-import { ArenaEloViz, BenchmarkStatusTable, Quiz } from './LLMEvalChatArenaVisuals'
+import { ArenaEloViz, BenchmarkStatusTable, SampleTasks, Quiz } from './LLMEvalChatArenaVisuals'
 
 Verifiable instruction benchmarks (covered in post 1 of this series) have a built-in ceiling: once models satisfy the constraint set reliably, there's nowhere to go. Chat benchmarks try a different approach — measure what humans actually prefer, in the kind of open-ended conversation that fills most real LLM usage. This solves the ceiling problem but creates its own: preference evaluation is expensive, slow, noisy, and hard to make reproducible.
 
@@ -108,5 +108,11 @@ If you're evaluating smaller models (7B–70B open-source):
 - MT-Bench still discriminates in the 7–8.5 range.
 - AlpacaEval 2.0 still has headroom below ~80% LC win rate.
 - Arena scores from specialized hosting setups give the most reliable signal, but require vote volume that takes time to accumulate.
+
+## What MT-Bench actually looks like
+
+MT-Bench uses 80 two-turn questions across 8 categories. Each question is scored by GPT-4 on a 1–10 scale. The multi-turn format is what distinguishes it from single-shot evals — the second turn often requires the model to apply or transform what it said in turn 1. Here are four real questions spanning four different categories:
+
+<SampleTasks />
 
 <Quiz />
